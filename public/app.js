@@ -138,43 +138,37 @@ function renderGenres() {
 }
 
 function openDetail(movie) {
-  const t = (movie.torrents || []).filter(x => x.seeds > 0)
   $('#detail').innerHTML = `
     <div class="hero" style="background-image:url('${movie.background || movie.poster || ''}')"></div>
     <div class="dbody">
       <h1></h1>
       <div class="dmeta"></div>
       <div class="dsum"></div>
-      <div class="sec">Fontes disponiveis (${t.length})</div>
-      <div id="srcList"></div>
-      <div class="sec">Outras fontes</div>
-      <button class="alt" id="more">Buscar no indice extra</button>
-      <div id="extraList"></div>
+      <div class="sec">Reproduzir com magnet</div>
+      <p class="magnet-help">Cole o link magnet de um conteúdo que você tenha autorização para acessar.</p>
+      <form id="magnetForm" class="magnet-form">
+        <input id="magnetInput" type="text" autocomplete="off" spellcheck="false" placeholder="magnet:?xt=urn:btih:..." required>
+        <button class="play" type="submit">Assistir</button>
+      </form>
+      <div id="magnetError" class="magnet-error" role="status"></div>
     </div>`
   $('#detail h1').textContent = `${movie.title || ''} ${movie.year ? '(' + movie.year + ')' : ''}`
-  $('#detail .dmeta').textContent = `${(movie.genres || []).join(' | ')} ${movie.rating ? '| Nota ' + movie.rating : ''} ${movie.runtime ? '| ' + movie.runtime + ' min' : ''}`
+  $('#detail .dmeta').textContent = `${(movie.genres || []).join(' | ')} ${movie.rating ? '| Nota ' + Number(movie.rating).toFixed(1) : ''} ${movie.runtime ? '| ' + movie.runtime + ' min' : ''}`
   $('#detail .dsum').textContent = movie.summary || ''
 
-  const list = $('#srcList')
-  if (!t.length) list.innerHTML = '<div class="dsum">Nenhuma fonte com seed agora.</div>'
-  t.forEach(x => list.appendChild(srcRow(x, movie)))
-
-  $('#more').onclick = async (e) => {
-    e.target.disabled = true
-    e.target.textContent = 'Buscando...'
-    try {
-      const r = await fetch(`/api/extra?title=${encodeURIComponent(movie.title)}&year=${movie.year || ''}`)
-      const j = await r.json()
-      const ex = $('#extraList')
-      ex.innerHTML = ''
-      if (!j.results?.length) ex.innerHTML = '<div class="dsum">Nada encontrado.</div>'
-      ;(j.results || []).forEach(x => ex.appendChild(srcRow(x, movie)))
-      e.target.remove()
-    } catch {
-      e.target.disabled = false
-      e.target.textContent = 'Tentar novamente'
+  $('#magnetForm').addEventListener('submit', event => {
+    event.preventDefault()
+    const value = $('#magnetInput').value.trim()
+    const match = /^magnet:\\?[^#]*xt=urn:btih:([a-f0-9]{40})(?:&|$)/i.test(value)
+      ? value.match(/xt=urn:btih:([a-f0-9]{40})/i)
+      : null
+    if (!value.startsWith('magnet:?') || !match) {
+      $('#magnetError').textContent = 'Magnet inválido. É necessário um infohash hexadecimal de 40 caracteres.'
+      return
     }
-  }
+    $('#magnetError').textContent = ''
+    play({ hash: match[1].toLowerCase(), quality: 'Magnet', source: 'Magnet informado pelo usuário' }, movie)
+  })
 
   $('#modal').classList.remove('hidden')
 }
@@ -237,19 +231,18 @@ $('#q').oninput = e => {
     if (!q) return loadCatalog()
     rowsEl.innerHTML = '<div class="loading">Buscando...</div>'
     try {
-      const j = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json()
+      const response = await fetch('/api/search?q=' + encodeURIComponent(q))
+      const j = await response.json()
       rowsEl.innerHTML = ''
+      if (!response.ok) {
+        rowsEl.innerHTML = '<div class="loading">' + (j.error || 'Erro ao pesquisar filmes.') + '</div>'
+        return
+      }
       const g = document.createElement('div')
       g.className = 'grid'
       ;(j.results || []).forEach(m => g.appendChild(card(m)))
-      ;(j.extra || []).forEach(x => {
-        g.appendChild(card({
-          title: x.title.slice(0, 60), year: '', poster: '',
-          torrents: [x], genres: [], summary: `Fonte extra | ${x.seeds} seeds | ${x.size}`
-        }))
-      })
       rowsEl.appendChild(g)
-      if (!g.children.length) rowsEl.innerHTML = '<div class="loading">Nada encontrado.</div>'
+      if (!g.children.length) rowsEl.innerHTML = '<div class="loading">Nenhum filme encontrado.</div>'
     } catch {
       rowsEl.innerHTML = '<div class="loading">Erro ao pesquisar. Tente novamente.</div>'
     }
