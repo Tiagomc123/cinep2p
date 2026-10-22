@@ -10,7 +10,7 @@ const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), 'downl
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
 const SUBS_DIR = path.join(DATA_DIR, 'subs')
 const METADATA_TIMEOUT = Math.max(20, Number(process.env.METADATA_TIMEOUT || 120)) * 1000
-const IDLE_MINUTES = Math.max(1, Number(process.env.IDLE_MINUTES || 5))
+const IDLE_MINUTES = Math.max(1, Number(process.env.IDLE_MINUTES || 1))
 const PRESET = process.env.TRANSCODE_PRESET || 'veryfast'
 const CRF = process.env.TRANSCODE_CRF || '23'
 const PROBE_BYTES = Number(process.env.PROBE_BYTES || 8 * 1024 * 1024)
@@ -476,6 +476,6 @@ setInterval(() => {
       client.remove(key, { destroyStore: true }).catch(() => {})
     }
   }
-}, 60e3).unref()
+}, 15e3).unref()
 
 export function destroyClient() { try { client.destroy() } catch {} }
