@@ -9,8 +9,48 @@ import { ensureTorrent, serveFile, status, stop } from './src/streamer.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app = express()
 const PORT = Number(process.env.PORT || 3000)
+const posterCache = new Map()
+const posterPending = new Map()
 
 app.use(express.static(path.join(__dirname, 'public')))
+
+// Busca um cartaz YTS para resultados de fontes que nao fornecem imagem.
+// Cacheia tambem resultados vazios para evitar consultas repetidas.
+app.get('/api/poster', async (req, res) => {
+  const title = String(req.query.title || '').trim().slice(0, 180)
+  if (!title) return res.json({ poster: '' })
+
+  const key = title.toLocaleLowerCase('pt-BR')
+  if (posterCache.has(key)) return res.json({ poster: posterCache.get(key) })
+
+  try {
+    if (!posterPending.has(key)) {
+      posterPending.set(key, searchMovies(title)
+        .then(movies => {
+          const wanted = title.toLocaleLowerCase('pt-BR')
+          const ranked = [...movies].sort((a, b) => {
+            const score = m => {
+              const candidate = String(m.title || '').toLocaleLowerCase('pt-BR')
+              if (candidate === wanted) return 3
+              if (candidate.startsWith(wanted) || wanted.startsWith(candidate)) return 2
+              return 1
+            }
+            return score(b) - score(a)
+          })
+          return ranked.find(m => m.poster)?.poster || ''
+        })
+        .catch(() => '')
+        .then(poster => {
+          posterCache.set(key, poster)
+          posterPending.delete(key)
+          return poster
+        }))
+    }
+    res.json({ poster: await posterPending.get(key) })
+  } catch {
+    res.json({ poster: '' })
+  }
+})
 
 app.get('/api/catalog', async (req, res) => {
   try {
