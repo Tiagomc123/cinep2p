@@ -23,6 +23,20 @@ let activeGenre = ''
 let onlyDub = localStorage.getItem('cinep2p.dub') === '1'
 let health = { ffmpeg: false }
 const state = { progressByHash: {} }
+const LOCAL_PROGRESS_KEY = 'cinep2p.progress.v1'
+
+function readLocalProgress() {
+  try { return JSON.parse(localStorage.getItem(LOCAL_PROGRESS_KEY) || '{}') || {} }
+  catch { return {} }
+}
+function saveLocalProgress(item) {
+  try {
+    const all = readLocalProgress()
+    all[item.key] = { ...item, ts: Date.now() }
+    const kept = Object.entries(all).sort((a, b) => (b[1].ts || 0) - (a[1].ts || 0)).slice(0, 100)
+    localStorage.setItem(LOCAL_PROGRESS_KEY, JSON.stringify(Object.fromEntries(kept)))
+  } catch {}
+}
 
 const fmtTime = s => {
   s = Math.max(0, Math.floor(s || 0))
@@ -173,6 +187,9 @@ function card(movie, opts = {}) {
     const bar = document.createElement('div'); bar.className = 'bar'
     const i = document.createElement('i'); i.style.width = Math.min(100, (p.t / p.d) * 100) + '%'
     bar.appendChild(i); d.appendChild(bar)
+    const label = document.createElement('div'); label.className = 'progress-label'
+    label.textContent = (p.t >= p.d * 0.92 || p.d - p.t <= 90) ? 'Assistido' : 'Parou em ' + fmtTime(p.t)
+    d.appendChild(label)
   }
   d.onclick = () => opts.direct ? openPlayer(movie.source, movie, movie.file) : openDetail(movie)
   d.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); d.click() } }
@@ -206,25 +223,41 @@ async function loadCatalog() {
 }
 
 async function refreshContinue() {
-  let items = []
-  try { items = (await api('/api/progress')).items || [] } catch {}
-  items = items.filter(i => i.d && i.t > 30)
-  state.progressByHash = Object.fromEntries(items.map(i => [i.hash, i]))
-  const cont = $('#contRow')
-  cont.innerHTML = ''
-  if (!items.length) return
-  const row = document.createElement('div'); row.className = 'row'
-  const h = document.createElement('h2'); h.textContent = 'Continuar assistindo'
-  const s = document.createElement('div'); s.className = 'strip'
-  for (const i of items) {
-    s.appendChild(card({
-      title: i.title || i.name, year: i.year, poster: i.poster,
-      hash: i.hash, progressKey: i.key,
-      source: { hash: i.hash, title: i.title, source: 'retomar', quality: '' },
-      file: i.file
-    }, { direct: true }))
+  let remote = []
+  try { remote = (await api('/api/progress')).items || [] } catch {}
+  const local = Object.values(readLocalProgress())
+  const merged = new Map()
+  for (const item of [...remote, ...local]) {
+    if (!item?.key || !item.hash) continue
+    const prev = merged.get(item.key)
+    if (!prev || Number(item.ts || 0) >= Number(prev.ts || 0)) merged.set(item.key, item)
   }
-  row.append(h, s); cont.appendChild(row)
+  const items = [...merged.values()]
+    .filter(i => i.d && i.t > 30)
+    .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
+    .slice(0, 100)
+  state.progressByHash = Object.fromEntries(items.map(i => [i.hash, i]))
+  const watched = items.filter(i => i.t >= i.d * 0.92 || i.d - i.t <= 90)
+  const continuing = items.filter(i => !watched.includes(i))
+  const renderRow = (containerId, title, list) => {
+    const cont = $(containerId)
+    cont.innerHTML = ''
+    if (!list.length) return
+    const row = document.createElement('div'); row.className = 'row'
+    const h = document.createElement('h2'); h.textContent = title
+    const s = document.createElement('div'); s.className = 'strip'
+    for (const i of list) {
+      s.appendChild(card({
+        title: i.title || i.name, year: i.year, poster: i.poster,
+        hash: i.hash, progressKey: i.key,
+        source: { hash: i.hash, title: i.title, source: 'retomar', quality: '' },
+        file: i.file
+      }, { direct: true }))
+    }
+    row.append(h, s); cont.appendChild(row)
+  }
+  renderRow('#contRow', 'Continuar assistindo', continuing)
+  renderRow('#watchedRow', 'Já assistidos', watched)
 }
 
 function renderGenres() {
@@ -497,6 +530,8 @@ async function resumeOrStart() {
   state.key = key
   let p = null
   try { p = await api('/api/progress/' + encodeURIComponent(key)) } catch {}
+  const local = readLocalProgress()[key]
+  if (!p?.t || Number(local?.ts || 0) > Number(p?.ts || 0)) p = local || p
   const t = Number(p?.t || 0)
   const d = Number(p?.d || state.duration || 0)
   const resume = (t > 30 && d && t < d - 60) ? t : 0
@@ -536,6 +571,7 @@ function saveProgress(force) {
     title: state.movie?.title || state.label, year: state.movie?.year || '',
     poster: state.movie?.poster || '', name: state.label
   }
+  saveLocalProgress(body)
   const blob = new Blob([JSON.stringify(body)], { type: 'application/json' })
   if (force && navigator.sendBeacon && navigator.sendBeacon('/api/progress', blob)) return
   fetch('/api/progress', {
@@ -592,6 +628,7 @@ video.onloadedmetadata = () => {
 video.oncanplay = () => { clearTimeout(watchdog); $('#pmsg').classList.remove('err') }
 video.onplay = () => { $('#pplay').textContent = 'Pausar'; requestWakeLock() }
 video.onpause = () => { $('#pplay').textContent = 'Tocar'; saveProgress() }
+video.onended = () => { saveProgress(true); refreshContinue() }
 video.ontimeupdate = () => {
   const d = total()
   $('#ptime').textContent = fmtTime(position())
