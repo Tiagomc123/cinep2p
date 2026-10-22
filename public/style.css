@@ -66,3 +66,5 @@ main { padding: 10px 0 20px; }
   .magnet-form { flex-direction: column; }
   .magnet-form .play { width: 100%; }
 }
+
+.attribution { padding: 24px 22px; color: var(--mut); font-size: 11px; text-align: center; border-top: 1px solid var(--line); }
