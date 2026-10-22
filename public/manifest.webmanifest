@@ -1,0 +1,18 @@
+{
+  "id": "cinep2p",
+  "name": "cinep2p",
+  "short_name": "cinep2p",
+  "description": "Catalogo e streaming P2P",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["fullscreen", "standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#0b0b11",
+  "theme_color": "#0b0b11",
+  "categories": ["video", "entertainment"],
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>cinep2p</title>
+<meta name="theme-color" content="#0b0b11">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">cine<span>p2p</span></div>
+  <input id="q" type="search" placeholder="Buscar filme ou serie..." enterkeyhint="search">
+  <div class="hbtns">
+    <button class="chip" id="dubChip" title="So resultados dublados">Dublado</button>
+    <button class="chip" id="tvBtn" title="Aumentar interface">TV</button>
+    <button class="chip" id="installBtn" title="Instalar como aplicativo">Instalar app</button>
+    <span class="badge" id="badge">0 ativos</span>
+  </div>
+</header>
+
+<nav id="genres"></nav>
+
+<main>
+  <div id="contRow"></div>
+  <div id="rows"><div class="loading">Carregando catalogo...</div></div>
+</main>
+
+<div id="modal" class="hidden">
+  <div class="sheet">
+    <button class="close" id="closeModal">x</button>
+    <div id="detail"></div>
+  </div>
+</div>
+
+<div id="diagModal" class="hidden">
+  <div class="sheet">
+    <button class="close" id="closeDiag">x</button>
+    <div class="dbody">
+      <h1>Diagnostico</h1>
+      <div class="dsum" id="diagText">Rodando...</div>
+      <button class="alt focusable" id="diagCopy">Copiar</button>
+    </div>
+  </div>
+</div>
+
+<div id="player" class="hidden">
+  <video id="video" tabindex="0" playsinline preload="auto"></video>
+
+  <div class="ptop hidden" id="ptop">
+    <div class="ptitle" id="ptitle"></div>
+    <div class="pacts">
+      <button id="pAudio">Audio</button>
+      <button id="pSubs">Legenda</button>
+      <button id="pMode">Modo</button>
+      <button id="pDiag">Diagnostico</button>
+      <button id="pLink">Copiar link</button>
+      <button id="pFs">Tela cheia</button>
+      <button id="pClose">Fechar</button>
+    </div>
+  </div>
+
+  <div class="pctl hidden" id="pctl">
+    <button id="pplay">Pausar</button>
+    <span id="ptime">0:00</span>
+    <input type="range" id="pseek" min="0" max="1000" step="1" value="0">
+    <span id="pdur">0:00</span>
+    <button id="pvolD">Vol -</button>
+    <button id="pvolU">Vol +</button>
+  </div>
+
+  <div class="pmsg" id="pmsg"></div>
+  <div class="pspin" id="pspin"><div class="spin"></div></div>
+  <div class="pmenu hidden" id="pmenu"></div>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
