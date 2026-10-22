@@ -403,6 +403,21 @@ let wakeLock = null
 let hideTopTimer = null
 let watchdog = null
 
+function startStatusPolling() {
+  clearInterval(poll)
+  if (!state.hash) return
+  poll = setInterval(async () => {
+    try {
+      const s = await api('/api/status/' + state.hash)
+      if (s.state === 'metadata') $('#pmsg').textContent = `Procurando peers... ${s.peers || 0} conectados`
+      else if (s.state === 'ready' && !$('#pmsg').classList.contains('err')) {
+        $('#pmsg').textContent = `${s.peers} peers | ${(s.downloadSpeed / 1e6).toFixed(1)} MB/s | ${(s.progress * 100).toFixed(1)}% em cache`
+        $('#badge').textContent = s.peers + ' ativos'
+      }
+    } catch {}
+  }, 1000)
+}
+
 function setSrc(posFrac) {
   const p = new URLSearchParams({ name: state.label })
   if (state.fileIndex != null) p.set('file', state.fileIndex)
@@ -455,17 +470,7 @@ async function openPlayer(source, movie, fileIndex) {
   requestWakeLock()
   try { $('#player').requestFullscreen?.().catch(() => {}) } catch {}
 
-  clearInterval(poll)
-  poll = setInterval(async () => {
-    try {
-      const s = await api('/api/status/' + state.hash)
-      if (s.state === 'metadata') $('#pmsg').textContent = `Procurando peers... ${s.peers || 0} conectados`
-      else if (s.state === 'ready' && !$('#pmsg').classList.contains('err')) {
-        $('#pmsg').textContent = `${s.peers} peers | ${(s.downloadSpeed / 1e6).toFixed(1)} MB/s | ${(s.progress * 100).toFixed(1)}% em cache`
-        $('#badge').textContent = s.peers + ' ativos'
-      }
-    } catch {}
-  }, 1000)
+  startStatusPolling()
 
   try {
     const j = await api(`/api/prepare/${state.hash}?name=${encodeURIComponent(state.label)}${state.fileIndex != null ? '&file=' + state.fileIndex : ''}`)
@@ -626,9 +631,9 @@ video.onloadedmetadata = () => {
   if (state.pendingSeek && state.mode === 'direct') { video.currentTime = state.pendingSeek; state.pendingSeek = null }
 }
 video.oncanplay = () => { clearTimeout(watchdog); $('#pmsg').classList.remove('err') }
-video.onplay = () => { $('#pplay').textContent = 'Pausar'; requestWakeLock() }
+video.onplay = () => { $('#pplay').textContent = 'Pausar'; requestWakeLock(); if (!poll && state.open) startStatusPolling() }
 video.onpause = () => { $('#pplay').textContent = 'Tocar'; saveProgress() }
-video.onended = () => { saveProgress(true); refreshContinue() }
+video.onended = () => { saveProgress(true); clearInterval(poll); poll = null; refreshContinue() }
 video.ontimeupdate = () => {
   const d = total()
   $('#ptime').textContent = fmtTime(position())
