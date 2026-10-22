@@ -38,6 +38,24 @@ function saveLocalProgress(item) {
   } catch {}
 }
 
+async function clearWatchHistory() {
+  if (!confirm('Apagar todo o historico de reproducao? Essa acao nao pode ser desfeita.')) return
+  clearInterval(saveTimer)
+  saveTimer = null
+  state.key = null
+  try {
+    await api('/api/progress', { method: 'DELETE' })
+    localStorage.removeItem(LOCAL_PROGRESS_KEY)
+    state.progressByHash = {}
+    await refreshContinue()
+    alert('Historico apagado.')
+  } catch {
+    localStorage.removeItem(LOCAL_PROGRESS_KEY)
+    state.progressByHash = {}
+    alert('O historico local foi apagado, mas nao foi possivel apagar o historico do servidor. Verifique a conexao e tente novamente.')
+  }
+}
+
 const fmtTime = s => {
   s = Math.max(0, Math.floor(s || 0))
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60
@@ -244,7 +262,11 @@ async function refreshContinue() {
     cont.innerHTML = ''
     if (!list.length) return
     const row = document.createElement('div'); row.className = 'row'
+    const head = document.createElement('div'); head.className = 'history-head'
     const h = document.createElement('h2'); h.textContent = title
+    const clear = document.createElement('button'); clear.className = 'history-clear'; clear.textContent = 'Apagar histórico'
+    clear.onclick = clearWatchHistory
+    head.append(h, clear)
     const s = document.createElement('div'); s.className = 'strip'
     for (const i of list) {
       s.appendChild(card({
@@ -254,7 +276,7 @@ async function refreshContinue() {
         file: i.file
       }, { direct: true }))
     }
-    row.append(h, s); cont.appendChild(row)
+    row.append(head, s); cont.appendChild(row)
   }
   renderRow('#contRow', 'Continuar assistindo', continuing)
   renderRow('#watchedRow', 'Já assistidos', watched)
