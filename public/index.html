@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cinep2p</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">cine<span>p2p</span></div>
+  <input id="q" type="search" placeholder="Buscar filme...">
+  <div class="badge" id="badge">0 ativos</div>
+</header>
+
+<nav id="genres"></nav>
+
+<main id="rows"><div class="loading">Carregando catalogo...</div></main>
+
+<div id="modal" class="hidden">
+  <div class="sheet">
+    <button class="close" id="closeModal">x</button>
+    <div id="detail"></div>
+  </div>
+</div>
+
+<div id="player" class="hidden">
+  <video id="video" controls autoplay playsinline></video>
+  <div class="pbar">
+    <span id="pinfo">Conectando aos peers...</span>
+    <button id="closePlayer">Fechar</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
