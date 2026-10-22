@@ -2,8 +2,7 @@ import express from 'express'
 import path from 'node:path'
 import os from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { listMovies, searchMovies } from './src/yts.js'
-import { searchApibay, rank } from './src/apibay.js'
+import { listMovies, searchMovies } from './src/catalog.js'
 import { ensureTorrent, serveFile, status, stop } from './src/streamer.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -62,31 +61,36 @@ app.get('/api/catalog', async (req, res) => {
 })
 
 app.get('/api/search', async (req, res) => {
-  const q = String(req.query.q || '').trim()
+  const q = String(req.query.q || '').trim().slice(0, 100)
   if (!q) return res.json({ results: [], extra: [] })
-  const [yts, bay] = await Promise.all([
-    searchMovies(q).catch(() => []),
-    searchApibay(q).catch(() => [])
-  ])
-  res.json({ results: yts, extra: rank(bay).slice(0, 15) })
-})
 
-app.get('/api/extra', async (req, res) => {
-  const q = `${req.query.title || ''} ${req.query.year || ''}`.trim()
-  if (!q) return res.json({ results: [] })
   try {
-    res.json({ results: rank(await searchApibay(q)).slice(0, 15) })
+    const results = await searchMovies(q)
+    res.json({ results, extra: [], source: 'TMDB' })
   } catch (e) {
-    res.status(502).json({ error: e.message })
+    res.status(e.status || 502).json({ error: e.message || 'Falha ao pesquisar filmes.' })
   }
 })
 
+app.get('/api/extra', (_req, res) => {
+  res.json({
+    results: [],
+    message: 'Adicione um magnet de uma fonte que você tenha autorização para acessar.'
+  })
+})
+
 app.get('/api/stream/:hash', async (req, res) => {
+  const hash = String(req.params.hash || '').trim().toLowerCase()
+  if (!/^[a-f0-9]{40}$/.test(hash)) {
+    return res.status(400).json({ error: 'Infohash inválido. Use um magnet com hash hexadecimal de 40 caracteres.' })
+  }
+
   try {
-    const torrent = await ensureTorrent(req.params.hash, String(req.query.name || ''))
+    const torrent = await ensureTorrent(hash, String(req.query.name || '').slice(0, 180))
     serveFile(torrent, req, res)
   } catch (e) {
-    if (!res.headersSent) res.status(504).json({ error: e.message })
+    console.error('[stream]', e.message || e)
+    if (!res.headersSent) res.status(502).json({ error: 'Não foi possível abrir este torrent.' })
   }
 })
 
