@@ -16,7 +16,7 @@ const NAMES = {
 export const langName = c => NAMES[String(c || '').toLowerCase()] || String(c || '').toUpperCase() || 'Desconhecido'
 
 const PT = /(dublado|dublada|pt[-_ .]?br|ptbr|portugu[eê]s|portugues|nacional|brazilian|br[-_ ]?dub)/i
-const DUAL = /(dual[ ._-]?[aá]udio|dual|multi[ ._-]?[aá]udio|multi)/i
+const DUAL = /(dual[ ._-]?[aá]udio|dual)/i
 const LEG = /(legendado|legendad[ao]|subbed)/i
 
 const LANGS = [
@@ -33,7 +33,7 @@ export function detectAudio(name) {
   const dub = PT.test(s)
   const dual = DUAL.test(s)
   if (dub) langs.push('ptbr')
-  if (dual) langs.push('ptbr', 'eng')
+  // "Dual" e "Multi" indicam varias faixas, nao quais idiomas elas contem.
   for (const [re, code] of LANGS) if (re.test(s)) langs.push(code)
   return { dub, dual, subs: LEG.test(s), langs: [...new Set(langs)] }
 }
