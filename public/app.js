@@ -161,7 +161,12 @@ function card(movie, opts = {}) {
   }
   const t = document.createElement('div'); t.className = 't'; t.textContent = movie.title || 'Sem titulo'
   const m = document.createElement('div'); m.className = 'm'
-  m.textContent = [movie.year || '', movie.rating ? 'Nota ' + movie.rating : '', movie.dub ? 'Dublado' : ''].filter(Boolean).join(' | ')
+  const languageLabels = []
+  if (movie.dub) languageLabels.push('Dublado')
+  else if (movie.dual) languageLabels.push('Dual audio')
+  else if ((movie.langs || []).includes('ptbr')) languageLabels.push('Português')
+  if (movie.subs) languageLabels.push('Legendado')
+  m.textContent = [movie.year || '', movie.rating ? 'Nota ' + movie.rating : '', ...languageLabels].filter(Boolean).join(' | ')
   d.append(img, t, m)
   const p = progressFor(movie)
   if (p && p.d) {
@@ -263,11 +268,18 @@ async function runSearch(q) {
     const j = await api(`/api/search?q=${encodeURIComponent(q)}${onlyDub ? '&dub=1' : ''}`)
     rowsEl.innerHTML = ''
     const g = document.createElement('div'); g.className = 'grid'
-    ;(j.results || []).forEach(m => g.appendChild(card(m)))
-    ;(j.extra || []).forEach(x => g.appendChild(card({
-      title: x.title.slice(0, 70), year: '', dub: x.dub, imdb: x.imdb,
+    const extras = j.extra || []
+    const portuguese = extras.filter(x => x.dub || x.dual || (x.langs || []).includes('ptbr'))
+    const others = extras.filter(x => !x.dub && !x.dual && !(x.langs || []).includes('ptbr'))
+    const addExtra = x => g.appendChild(card({
+      title: x.title.slice(0, 70), year: '', dub: x.dub, dual: x.dual,
+      subs: x.subs, langs: x.langs, imdb: x.imdb,
       torrents: [x], genres: [], summary: `Fonte extra | ${x.seeds} seeds | ${x.size}`
-    })))
+    }))
+    // Exibe fontes em português antes do catálogo geral e das versões sem idioma identificado.
+    portuguese.forEach(addExtra)
+    ;(j.results || []).forEach(m => g.appendChild(card(m)))
+    others.forEach(addExtra)
     rowsEl.appendChild(g)
     if (!g.children.length) rowsEl.innerHTML = '<div class="loading">Nada encontrado.</div>'
   } catch (e) {
