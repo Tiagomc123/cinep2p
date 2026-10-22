@@ -56,7 +56,7 @@ app.get('/api/catalog', async (req, res) => {
     const { genre = '', sort = 'year', order = 'desc', page = '1' } = req.query
     res.json(await listMovies({ genre, sort, order, page: Number(page) }))
   } catch (e) {
-    res.status(502).json({ error: e.message })
+    res.status(e.status || 502).json({ error: e.message || 'Falha ao carregar o catálogo.' })
   }
 })
 
