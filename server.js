@@ -171,6 +171,7 @@ app.get('/api/subs/:hash', wrap(async (req, res) => {
 
 app.get('/api/progress', (_req, res) => res.json({ items: progress.recent(24) }))
 app.get('/api/progress/:key', (req, res) => res.json(progress.get(req.params.key) || {}))
+  app.delete('/api/progress', (_req, res) => { progress.clear(); res.json({ ok: true }) })
 app.post('/api/progress', (req, res) => {
   const b = req.body || {}
   if (!b.key) return res.status(400).json({ error: 'key obrigatoria' })
