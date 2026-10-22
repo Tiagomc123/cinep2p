@@ -159,9 +159,7 @@ function openDetail(movie) {
   $('#magnetForm').addEventListener('submit', event => {
     event.preventDefault()
     const value = $('#magnetInput').value.trim()
-    const match = /^magnet:\\?[^#]*xt=urn:btih:([a-f0-9]{40})(?:&|$)/i.test(value)
-      ? value.match(/xt=urn:btih:([a-f0-9]{40})/i)
-      : null
+    const match = value.match(/xt=urn:btih:([a-f0-9]{40})/i)
     if (!value.startsWith('magnet:?') || !match) {
       $('#magnetError').textContent = 'Magnet inválido. É necessário um infohash hexadecimal de 40 caracteres.'
       return
