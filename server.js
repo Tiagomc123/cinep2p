@@ -13,7 +13,7 @@ const posterPending = new Map()
 
 app.use(express.static(path.join(__dirname, 'public')))
 
-// Busca um cartaz YTS para resultados de fontes que nao fornecem imagem.
+// Busca um cartaz no catálogo TMDB para títulos sem imagem.
 // Cacheia tambem resultados vazios para evitar consultas repetidas.
 app.get('/api/poster', async (req, res) => {
   const title = String(req.query.title || '').trim().slice(0, 180)
