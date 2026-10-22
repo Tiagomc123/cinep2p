@@ -42,14 +42,17 @@ Enter no video abre os botoes. O botao "TV" aumenta a interface.
   fallback automatico quando o navegador recusa o formato
 - Botao Diagnostico: mostra peers, arquivo, codec, leitura e decisao
 
-## Cache e limpeza
+## Cache, limpeza e historico
 
-- Torrents em ./downloads/<hash> (pode apagar quando quiser).
-- Progresso em ./data/progress.json.
-- Torrents ociosos sao liberados sozinhos apos IDLE_MINUTES (padrao 40 min).
+- Os dados temporarios dos torrents ficam em ./downloads/<hash>.
+- Ao remover um torrent ou limpar um torrent ocioso, o WebTorrent e instruido a apagar tambem os dados temporarios do disco.
+- Torrents ociosos sao liberados automaticamente apos IDLE_MINUTES (padrao 5 min; minimo 1 min). O tempo e contado desde a ultima atividade do torrent.
+- O historico de reproducao fica separado dos arquivos de video em ./data/progress.json. A interface mostra "Continuar assistindo" e "Ja assistidos", incluindo a posicao aproximada.
+- O navegador mantem uma copia local do progresso para recuperar a posicao neste aparelho se o servidor reiniciar ou perder seu disco temporario. Para sincronizar entre aparelhos, o servidor precisa manter ./data em armazenamento persistente.
+- A limpeza automatica se aplica aos dados de torrents que forem removidos depois desta atualizacao; pastas antigas ja existentes podem precisar de limpeza manual uma vez.
 
 ## Variaveis
 
-PORT, DOWNLOAD_DIR, DATA_DIR, METADATA_TIMEOUT (120), IDLE_MINUTES (40),
+PORT, DOWNLOAD_DIR, DATA_DIR, METADATA_TIMEOUT (120), IDLE_MINUTES (5),
 TRANSCODE_PRESET (ultrafast em PC fraco), TRANSCODE_CRF, MAX_CONNS,
 PROBE_BYTES, FFMPEG_PATH, FFPROBE_PATH, FFMPEG_DISABLE=1, QUIET=1, HTTPS=1.
