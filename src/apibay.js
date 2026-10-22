@@ -82,9 +82,9 @@ function score(t) {
   else if (t.quality === '2160p') s += 12
   if (t.codec === 'x264') s += 14
   if (t.codec === 'x265') s += 6
-  // Prioridade forte para audio em portugues; seeds/qualidade desempata depois.
-  if (t.dub) s += 1000
-  else if (t.dual || (t.langs || []).includes('ptbr')) s += 700
+  // Primeiro releases que declaram PT-BR; dual audio sozinho nao garante portugues.
+  if (t.dub || (t.langs || []).includes('ptbr')) s += 1400
+  else if (t.dual) s += 350
   else if (t.subs) s += 100
   if (/\b(cam|hdcam|ts)\b/i.test(t.title)) s -= 45
   if (/\b3d\b/i.test(t.title)) s -= 12
