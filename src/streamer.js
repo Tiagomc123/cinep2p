@@ -10,7 +10,7 @@ const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), 'downl
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
 const SUBS_DIR = path.join(DATA_DIR, 'subs')
 const METADATA_TIMEOUT = Math.max(20, Number(process.env.METADATA_TIMEOUT || 120)) * 1000
-const IDLE_MINUTES = Math.max(5, Number(process.env.IDLE_MINUTES || 40))
+const IDLE_MINUTES = Math.max(1, Number(process.env.IDLE_MINUTES || 5))
 const PRESET = process.env.TRANSCODE_PRESET || 'veryfast'
 const CRF = process.env.TRANSCODE_CRF || '23'
 const PROBE_BYTES = Number(process.env.PROBE_BYTES || 8 * 1024 * 1024)
@@ -52,12 +52,12 @@ export function ensureTorrent(hash, name = '') {
       settled = true
       clearTimeout(entry.timer)
       registry.delete(key)
-      client.remove(key).catch(() => {})
+      client.remove(key, { destroyStore: true }).catch(() => {})
       log('falha no torrent', key.slice(0, 8), '-', err.message)
       reject(err)
     }
     try {
-      entry.torrent = client.add({ infoHash: key, name: String(name || '').slice(0, 120) }, { path: path.join(DOWNLOAD_DIR, key), announce: TRACKERS })
+      entry.torrent = client.add({ infoHash: key, name: String(name || '').slice(0, 120) }, { path: path.join(DOWNLOAD_DIR, key), announce: TRACKERS, destroyStoreOnDestroy: true })
     } catch (e) { return fail(e) }
 
     log('adicionado', key.slice(0, 8), name || '')
@@ -90,7 +90,7 @@ export async function stop(hash) {
   const entry = registry.get(key)
   registry.delete(key)
   if (entry) clearTimeout(entry.timer)
-  try { await client.remove(key) } catch {}
+  try { await client.remove(key, { destroyStore: true }) } catch {}
 }
 
 export const active = () => registry.size
@@ -473,7 +473,7 @@ setInterval(() => {
     if (now - entry.lastUsed > IDLE_MINUTES * 60e3) {
       registry.delete(key)
       clearTimeout(entry.timer)
-      client.remove(key).catch(() => {})
+      client.remove(key, { destroyStore: true }).catch(() => {})
     }
   }
 }, 60e3).unref()
