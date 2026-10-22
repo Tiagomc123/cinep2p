@@ -22,6 +22,7 @@ setInterval(save, 5000).unref()
 export const get = key => data[key] || null
 export const set = (key, val) => { data[key] = { ...val, ts: Date.now() }; dirty = true }
 export const del = key => { delete data[key]; dirty = true }
+export const clear = () => { data = {}; dirty = true; save() }
 export const recent = (limit = 24) =>
   Object.entries(data).map(([key, v]) => ({ key, ...v }))
     .filter(v => v.t > 15)
