@@ -16,17 +16,82 @@ const ROWS = [
 const $ = s => document.querySelector(s)
 const rowsEl = $('#rows')
 let activeGenre = ''
+const posterLookups = new Map()
 
 function qs(params) {
   return Object.entries(params).filter(([, v]) => v !== '').map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&')
 }
 
+function placeholderPoster(title) {
+  const safeTitle = String(title || 'Filme').replace(/[&<>"]/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'
+  })[c])
+  const shortTitle = safeTitle.length > 34 ? safeTitle.slice(0, 31) + '...' : safeTitle
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450" viewBox="0 0 300 450"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#30204f"/><stop offset="1" stop-color="#101018"/></linearGradient></defs><rect width="300" height="450" fill="url(#g)"/><circle cx="150" cy="150" r="52" fill="none" stroke="#8b5cf6" stroke-width="3" opacity=".8"/><path d="M135 119 L180 150 L135 181 Z" fill="#c4b5fd"/><text x="150" y="260" fill="#ffffff" font-family="Arial,sans-serif" font-size="18" font-weight="700" text-anchor="middle">${shortTitle}</text><text x="150" y="292" fill="#a78bfa" font-family="Arial,sans-serif" font-size="12" letter-spacing="3" text-anchor="middle">CINEP2P</text></svg>`
+  return 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg)
+}
+
+async function lookupPoster(title) {
+  const key = String(title || '').trim().toLocaleLowerCase('pt-BR')
+  if (!key) return ''
+  if (!posterLookups.has(key)) {
+    posterLookups.set(key, fetch('/api/poster?title=' + encodeURIComponent(title))
+      .then(r => r.ok ? r.json() : { poster: '' })
+      .then(j => j.poster || '')
+      .catch(() => ''))
+  }
+  return posterLookups.get(key)
+}
+
+function setPoster(img, movie, tryLookup = true) {
+  const fallback = placeholderPoster(movie.title)
+  img.onerror = async () => {
+    img.onerror = null
+    img.src = fallback
+    if (tryLookup && !img.dataset.posterLookup) {
+      img.dataset.posterLookup = '1'
+      const poster = await lookupPoster(movie.title)
+      if (poster) {
+        img.onerror = () => {
+          img.onerror = null
+          img.src = fallback
+        }
+        img.src = poster
+      }
+    }
+  }
+
+  if (movie.poster) {
+    img.src = movie.poster
+  } else {
+    img.src = fallback
+    if (tryLookup) {
+      img.dataset.posterLookup = '1'
+      lookupPoster(movie.title).then(poster => {
+        if (poster && img.isConnected && img.src === fallback) img.src = poster
+      })
+    }
+  }
+}
+
 function card(movie) {
   const d = document.createElement('div')
   d.className = 'card'
-  d.innerHTML = `<img loading="lazy" src="${movie.poster || ''}" alt="">
-    <div class="t">${movie.title}</div>
-    <div class="m">${movie.year || ''} ${movie.rating ? '| ' + movie.rating : ''}</div>`
+  const img = document.createElement('img')
+  img.className = 'poster'
+  img.loading = 'lazy'
+  img.alt = `Capa de ${movie.title || 'filme'}`
+  setPoster(img, movie)
+
+  const title = document.createElement('div')
+  title.className = 't'
+  title.textContent = movie.title || 'Titulo indisponivel'
+
+  const meta = document.createElement('div')
+  meta.className = 'm'
+  meta.textContent = [movie.year || '', movie.rating ? 'Nota ' + movie.rating : ''].filter(Boolean).join(' | ')
+
+  d.append(img, title, meta)
   d.onclick = () => openDetail(movie)
   return d
 }
@@ -34,7 +99,9 @@ function card(movie) {
 function strip(title, movies) {
   const row = document.createElement('div')
   row.className = 'row'
-  row.innerHTML = `<h2>${title}</h2>`
+  const heading = document.createElement('h2')
+  heading.textContent = title
+  row.appendChild(heading)
   const s = document.createElement('div')
   s.className = 'strip'
   movies.forEach(m => s.appendChild(card(m)))
@@ -55,6 +122,7 @@ async function loadCatalog() {
   }
   rowsEl.innerHTML = ''
   rowsEl.appendChild(frag)
+  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Nao foi possivel carregar o catalogo. Tente novamente.</div>'
 }
 
 function renderGenres() {
@@ -72,17 +140,20 @@ function renderGenres() {
 function openDetail(movie) {
   const t = (movie.torrents || []).filter(x => x.seeds > 0)
   $('#detail').innerHTML = `
-    <div class="hero" style="background-image:url('${movie.background || movie.poster}')"></div>
+    <div class="hero" style="background-image:url('${movie.background || movie.poster || ''}')"></div>
     <div class="dbody">
-      <h1>${movie.title} ${movie.year ? '(' + movie.year + ')' : ''}</h1>
-      <div class="dmeta">${(movie.genres || []).join(' | ')} ${movie.rating ? '| Nota ' + movie.rating : ''} ${movie.runtime ? '| ' + movie.runtime + ' min' : ''}</div>
-      <div class="dsum">${movie.summary || ''}</div>
+      <h1></h1>
+      <div class="dmeta"></div>
+      <div class="dsum"></div>
       <div class="sec">Fontes disponiveis (${t.length})</div>
       <div id="srcList"></div>
       <div class="sec">Outras fontes</div>
       <button class="alt" id="more">Buscar no indice extra</button>
       <div id="extraList"></div>
     </div>`
+  $('#detail h1').textContent = `${movie.title || ''} ${movie.year ? '(' + movie.year + ')' : ''}`
+  $('#detail .dmeta').textContent = `${(movie.genres || []).join(' | ')} ${movie.rating ? '| Nota ' + movie.rating : ''} ${movie.runtime ? '| ' + movie.runtime + ' min' : ''}`
+  $('#detail .dsum').textContent = movie.summary || ''
 
   const list = $('#srcList')
   if (!t.length) list.innerHTML = '<div class="dsum">Nenhuma fonte com seed agora.</div>'
@@ -91,13 +162,18 @@ function openDetail(movie) {
   $('#more').onclick = async (e) => {
     e.target.disabled = true
     e.target.textContent = 'Buscando...'
-    const r = await fetch(`/api/extra?title=${encodeURIComponent(movie.title)}&year=${movie.year || ''}`)
-    const j = await r.json()
-    const ex = $('#extraList')
-    ex.innerHTML = ''
-    if (!j.results.length) ex.innerHTML = '<div class="dsum">Nada encontrado.</div>'
-    j.results.forEach(x => ex.appendChild(srcRow(x, movie)))
-    e.target.remove()
+    try {
+      const r = await fetch(`/api/extra?title=${encodeURIComponent(movie.title)}&year=${movie.year || ''}`)
+      const j = await r.json()
+      const ex = $('#extraList')
+      ex.innerHTML = ''
+      if (!j.results?.length) ex.innerHTML = '<div class="dsum">Nada encontrado.</div>'
+      ;(j.results || []).forEach(x => ex.appendChild(srcRow(x, movie)))
+      e.target.remove()
+    } catch {
+      e.target.disabled = false
+      e.target.textContent = 'Tentar novamente'
+    }
   }
 
   $('#modal').classList.remove('hidden')
@@ -106,11 +182,15 @@ function openDetail(movie) {
 function srcRow(x, movie) {
   const d = document.createElement('div')
   d.className = 'src'
-  d.innerHTML = `<span class="q">${x.quality}</span>
-    <span class="tag">${x.codec || 'n/d'}</span>
-    <span class="tag">${x.source}</span>
-    <span class="s">${x.seeds} seeds | ${x.size}</span>
+  d.innerHTML = `<span class="q"></span>
+    <span class="tag codec"></span>
+    <span class="tag source"></span>
+    <span class="s"></span>
     <button class="play">Assistir</button>`
+  d.querySelector('.q').textContent = x.quality || 'SD'
+  d.querySelector('.codec').textContent = x.codec || 'n/d'
+  d.querySelector('.source').textContent = x.source || 'Fonte'
+  d.querySelector('.s').textContent = `${x.seeds || 0} seeds | ${x.size || '?'}`
   d.querySelector('.play').onclick = () => play(x, movie)
   return d
 }
@@ -156,19 +236,23 @@ $('#q').oninput = e => {
   debounce = setTimeout(async () => {
     if (!q) return loadCatalog()
     rowsEl.innerHTML = '<div class="loading">Buscando...</div>'
-    const j = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json()
-    rowsEl.innerHTML = ''
-    const g = document.createElement('div')
-    g.className = 'grid'
-    ;(j.results || []).forEach(m => g.appendChild(card(m)))
-    ;(j.extra || []).forEach(x => {
-      g.appendChild(card({
-        title: x.title.slice(0, 60), year: '', poster: '',
-        torrents: [x], genres: [], summary: `Fonte extra | ${x.seeds} seeds | ${x.size}`
-      }))
-    })
-    rowsEl.appendChild(g)
-    if (!g.children.length) rowsEl.innerHTML = '<div class="loading">Nada encontrado.</div>'
+    try {
+      const j = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json()
+      rowsEl.innerHTML = ''
+      const g = document.createElement('div')
+      g.className = 'grid'
+      ;(j.results || []).forEach(m => g.appendChild(card(m)))
+      ;(j.extra || []).forEach(x => {
+        g.appendChild(card({
+          title: x.title.slice(0, 60), year: '', poster: '',
+          torrents: [x], genres: [], summary: `Fonte extra | ${x.seeds} seeds | ${x.size}`
+        }))
+      })
+      rowsEl.appendChild(g)
+      if (!g.children.length) rowsEl.innerHTML = '<div class="loading">Nada encontrado.</div>'
+    } catch {
+      rowsEl.innerHTML = '<div class="loading">Erro ao pesquisar. Tente novamente.</div>'
+    }
   }, 500)
 }
 
