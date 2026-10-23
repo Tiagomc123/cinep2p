@@ -124,3 +124,34 @@ video::cue { background: rgba(0,0,0,.65); font-size: 1.15em; }
 .ep .info i { font-size: .74rem; color: var(--mut); font-style: normal; }
 .ep:hover { border-color: var(--acc); }
 .backbar { margin-bottom: 10px; }
+
+/* Interface de streaming: navegação limpa, capas consistentes e seletores de reprodução */
+#historyModal { position:fixed; inset:0; z-index:45; display:flex; align-items:center; justify-content:center; padding:16px; background:rgba(0,0,0,.82); }
+.history-sheet { max-width:1100px; }
+.history-top-btn { color:#f4f4fb; border-color:#51456f; }
+.history-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(135px,1fr)); gap:18px 14px; padding:10px 0 20px; }
+.history-grid .card { min-width:0; width:100%; }
+.history-type { display:inline-block; margin-top:5px; color:#b8a3ff; font-size:.72rem; }
+.history-filter { background:#1a1a25; color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:10px 14px; margin:12px 0; min-width:210px; }
+.chooser-body { padding-bottom:30px; }
+.watch-panel { max-width:720px; background:linear-gradient(145deg,#191925,#111118); border:1px solid #302d40; border-radius:16px; padding:18px; margin-top:16px; }
+.choice-row { display:flex; flex-wrap:wrap; gap:7px; }
+.choice-row .alt { margin:0; }
+.source-hint { color:#b6b6c8; font-size:.83rem; padding:14px 0; min-height:46px; }
+.main-play { width:100%; min-height:48px; font-size:1rem; margin:4px 0 12px; }
+.main-play:disabled { opacity:.45; cursor:not-allowed; }
+.card img { background:linear-gradient(135deg,#242033,#101018); }
+.row h2 { font-size:1.08rem; letter-spacing:-.015em; }
+.strip { gap:15px; }
+.card { flex-basis:clamp(142px,14vw,190px); }
+.card img { border-radius:12px; box-shadow:0 5px 18px rgba(0,0,0,.2); }
+@media (max-width:700px) {
+  header { gap:9px; padding-top:10px; padding-bottom:10px; }
+  #q { order:2; flex-basis:100%; min-width:100%; }
+  .hbtns { order:3; margin-left:0; width:100%; gap:6px; }
+  .hbtns .chip { padding:7px 10px; font-size:.78rem; }
+  .logo { margin-right:auto; }
+  .card { flex-basis:clamp(112px,34vw,155px); }
+  .history-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .watch-panel { padding:13px; }
+}
