@@ -19,6 +19,7 @@
   <div class="logo">cine<span>p2p</span></div>
   <input id="q" type="search" placeholder="Buscar filme, serie ou doc..." enterkeyhint="search">
   <div class="hbtns">
+    <button class="chip history-top-btn" id="historyBtn" title="Histórico de filmes e séries">◷ Histórico</button>
     <button class="chip" id="liveBtn" title="Canais de TV ao vivo">Ao Vivo</button>
     <button class="chip" id="dubChip" title="So resultados dublados">Dublado</button>
     <button class="chip" id="spaceBtn" title="Espaco usado e liberar agora">Cache: 0 MB</button>
@@ -38,8 +39,6 @@
 <nav id="genres"></nav>
 
 <main>
-  <div id="contRow"></div>
-  <div id="watchedRow"></div>
   <div id="rows"><div class="loading">Carregando catalogo...</div></div>
 </main>
 
@@ -47,6 +46,21 @@
   <div class="sheet">
     <button class="close" id="closeModal">x</button>
     <div id="detail"></div>
+  </div>
+</div>
+
+<div id="historyModal" class="hidden">
+  <div class="sheet history-sheet">
+    <button class="close" id="closeHistory">×</button>
+    <div class="dbody">
+      <h1>Seu histórico</h1>
+      <div class="dmeta">Filmes e episódios assistidos ou iniciados</div>
+      <select id="historyFilter" class="history-filter">
+        <option value="all">Tudo</option><option value="movies">Filmes</option><option value="series">Séries / episódios</option>
+      </select>
+      <div id="historyList"><div class="loading">Carregando histórico...</div></div>
+      <button class="alt focusable" id="clearHistoryBtn">Apagar histórico</button>
+    </div>
   </div>
 </div>
 
