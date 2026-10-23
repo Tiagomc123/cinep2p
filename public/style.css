@@ -20,15 +20,15 @@ header {
   border-bottom: 1px solid var(--line); position: sticky; top: 0;
   background: rgba(11,11,17,.94); backdrop-filter: blur(8px); z-index: 20; flex-wrap: wrap;
 }
-.logo { font-weight: 800; font-size: 1.2rem; letter-spacing: -.02em; }
+.logo { font-weight: 800; font-size: 1.2rem; letter-spacing: -.02em; text-decoration: none; color: inherit; }
 .logo span { color: var(--acc); }
 #q { flex: 1; min-width: 160px; background: var(--card); border: 1px solid var(--line); color: var(--fg); padding: 10px 16px; border-radius: 999px; outline: none; font-size: .95rem; }
 #q:focus { border-color: var(--acc); }
 .hbtns { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
 .badge { font-size: .7rem; color: var(--mut); border: 1px solid var(--line); padding: 5px 11px; border-radius: 999px; white-space: nowrap; }
 
-#genres { display: flex; gap: 8px; padding: 14px var(--pad) 4px; overflow-x: auto; scrollbar-width: none; }
-#genres::-webkit-scrollbar { display: none; }
+#genres, #modes { display: flex; gap: 8px; padding: 14px var(--pad) 4px; overflow-x: auto; scrollbar-width: none; }
+#genres::-webkit-scrollbar, #modes::-webkit-scrollbar { display: none; }
 .chip { white-space: nowrap; font-size: .85rem; padding: 9px 16px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--mut); cursor: pointer; }
 .chip.on { background: var(--acc); border-color: var(--acc); color: #fff; font-weight: 600; }
 
@@ -45,6 +45,7 @@ main { padding: 8px 0 24px; }
 .card .m { font-size: .72rem; color: var(--mut); }
 .card .bar { position: absolute; left: 6px; right: 6px; bottom: 30%; height: 4px; background: rgba(255,255,255,.25); border-radius: 3px; overflow: hidden; }
 .card .bar i { display: block; height: 100%; background: var(--acc); }
+.card .progress-label { font-size: .68rem; color: var(--mut); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 16px; padding: 8px var(--pad); }
 .grid .card { flex: none; }
@@ -98,9 +99,19 @@ video::cue { background: rgba(0,0,0,.65); font-size: 1.15em; }
 
 @media (min-width: 1100px) { html { font-size: 17px; } }
 
-.card .progress-label { font-size: .68rem; color: var(--muted, #aaa); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
 .history-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 var(--pad) 10px; }
 .history-head h2 { padding: 0; }
 .history-clear { flex: none; background: transparent; border: 1px solid var(--line); color: var(--mut); border-radius: 8px; padding: 5px 10px; font-size: .75rem; cursor: pointer; }
 .history-clear:hover { border-color: #ef4444; color: #fca5a5; }
+
+/* TV ao vivo */
+#lbar { display: flex; gap: 8px; padding: 12px var(--pad); flex-wrap: wrap; align-items: center; }
+#lbar select, #lbar input { background: var(--card); border: 1px solid var(--line); color: var(--fg); padding: 10px 14px; border-radius: 999px; font: inherit; }
+#lbar input { flex: 1; min-width: 150px; }
+#lchips { display: flex; gap: 8px; padding: 0 var(--pad) 6px; overflow-x: auto; scrollbar-width: none; }
+#lchips::-webkit-scrollbar { display: none; }
+.chan { flex: 0 0 clamp(120px, 15vw, 170px); cursor: pointer; }
+.chan .box { aspect-ratio: 16/10; background: #12121a; border: 1px solid var(--line); border-radius: 10px; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 10px; }
+.chan img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.chan .t { font-size: .78rem; margin-top: 6px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chan .m { font-size: .7rem; color: var(--mut); }

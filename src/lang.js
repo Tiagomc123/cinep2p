@@ -15,7 +15,6 @@ const NAMES = {
 }
 export const langName = c => NAMES[String(c || '').toLowerCase()] || String(c || '').toUpperCase() || 'Desconhecido'
 
-// Marcadores de portugues (inclui girias de grupos BR: nacional, brdub, pob...).
 const PT = /(dublado|dublada|dublagem|nacional|brasileir[oa]|brazilian|\bptbr\b|\bpt[-_. ]?br\b|\bpob\b|\bbrdub\b|\bbr[-_. ]?dub\b|portugu[eê]s|\bpor\b)/i
 const DUAL = /(dual[ ._-]?[aá]udio|dual[ ._-]?audio|\bdual\b|multi[ ._-]?[aá]udio)/i
 const LEG = /(legendado|legendad[ao]|legendas?|subbed|subtitled|\bsubs?\b)/i
@@ -36,12 +35,10 @@ export function detectAudio(name) {
   const dub = isPortuguese(s)
   const dual = DUAL.test(s)
   if (dub) langs.push('ptbr')
-  // "Dual" e "Multi" indicam varias faixas, nao quais idiomas elas contem.
   for (const [re, code] of LANGS) if (re.test(s)) langs.push(code)
   return { dub, dual, subs: LEG.test(s), langs: [...new Set(langs)] }
 }
 
-// Filtro de idioma usado pelas rotas. Aceita string (nome do release) ou objeto ja normalizado.
 export function matchesLang(item, lang) {
   const s = String(lang || '').trim().toLowerCase()
   if (!s || s === 'all' || s === 'world') return true

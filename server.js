@@ -3,10 +3,13 @@ import path from 'node:path'
 import os from 'node:os'
 import http from 'node:http'
 import https from 'node:https'
+import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { listMovies, searchMovies } from './src/yts.js'
 import { searchApibay, topMovies, brShelf, rank } from './src/apibay.js'
 import { matchesLang } from './src/lang.js'
+import { liveMeta, liveChannels } from './src/live.js'
+import { archiveSearch, archiveStream } from './src/archive.js'
 import {
   ensureTorrent, serveMedia, status, stop, active, listFiles, pickVideo,
   externalSubs, getProbe, mediaInfo, decideMode, diagnose,
@@ -20,6 +23,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app = express()
 const PORT = Number(process.env.PORT || 3000)
 const USE_HTTPS = process.argv.includes('--https') || ['1', 'true'].includes(String(process.env.HTTPS))
+const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'
 
 app.disable('x-powered-by')
 app.use(express.json({ limit: '64kb' }))
@@ -40,7 +44,6 @@ function cleanTitle(s) {
     .replace(/\s+/g, ' ')
     .trim()
 }
-
 const yearOf = s => (/\b(19\d{2}|20\d{2})\b/.exec(String(s || '')) || [])[1] || ''
 
 /* ---------- catalogo / busca ---------- */
@@ -49,18 +52,16 @@ const posterCache = new Map()
 
 app.get('/api/health', wrap(async (_req, res) => {
   const ff = await ensureFfmpeg()
-  res.json({ ok: true, ffmpeg: ff, ffmpegInfo: ffmpegInfo(), https: USE_HTTPS, version: '0.4.0' })
+  res.json({ ok: true, ffmpeg: ff, ffmpegInfo: ffmpegInfo(), https: USE_HTTPS, version: '0.5.0', live: true, archive: true })
 }))
 
 app.get('/api/active', (_req, res) => res.json({ active: active() }))
 
-// Catalogo internacional (YTS / lingua inglesa).
 app.get('/api/catalog', wrap(async (req, res) => {
   const { genre = '', sort = 'year', order = 'desc', page = '1' } = req.query
   res.json(await listMovies({ genre, sort, order, page: Number(page) }))
 }))
 
-// Catalogo PT-BR (indice The Pirate Bay). q = busca tematica, cat = top por categoria.
 const brCache = new Map()
 const BR_TTL = 120e3
 
@@ -81,16 +82,12 @@ app.get('/api/br', wrap(async (req, res) => {
   } catch (e) {
     console.warn('[cinep2p] /api/br falhou:', e.message)
   }
-
   let filtered = lang ? list.filter(x => matchesLang(x, lang)) : list
-  // Se o filtro de idioma esvaziou a prateleira, relaxa mas mantem PT primeiro.
   if (filtered.length < 3) filtered = list
 
   const data = {
     results: rank(filtered).slice(0, limit).map(x => ({ ...x, year: yearOf(x.title) })),
-    source: 'TPB',
-    lang: lang || 'all',
-    count: filtered.length
+    source: 'TPB', lang: lang || 'all', count: filtered.length
   }
   brCache.set(cacheKey, { at: Date.now(), data })
   if (brCache.size > 200) brCache.clear()
@@ -140,6 +137,75 @@ app.get('/api/poster', wrap(async (req, res) => {
   posterCache.set(key, out)
   if (posterCache.size > 800) posterCache.clear()
   res.json(out)
+}))
+
+/* ---------- TV ao vivo (iptv-org) ---------- */
+
+app.get('/api/live/meta', wrap(async (_req, res) => {
+  try { res.json(await liveMeta()) }
+  catch (e) { res.json({ countries: [], categories: [], total: 0, error: e.message }) }
+}))
+
+app.get('/api/live', wrap(async (req, res) => {
+  const country = String(req.query.country || '').trim().slice(0, 60)
+  const category = String(req.query.category || '').trim().slice(0, 60)
+  const q = String(req.query.q || '').trim().slice(0, 60)
+  const page = Math.max(1, Number(req.query.page || 1))
+  const limit = Math.max(12, Math.min(120, Number(req.query.limit || 60)))
+  try { res.json(await liveChannels({ country, category, q, page, limit })) }
+  catch (e) { res.json({ channels: [], total: 0, page, error: e.message }) }
+}))
+
+const proxify = u => '/api/live/proxy?url=' + encodeURIComponent(u)
+
+function rewritePlaylist(text, baseUrl) {
+  const abs = u => { try { return new URL(u, baseUrl).href } catch { return u } }
+  return String(text).split(/\r?\n/).map(line => {
+    const t = line.trim()
+    if (!t) return line
+    if (t.startsWith('#')) return t.replace(/URI="([^"]+)"/g, (_, u) => `URI="${proxify(abs(u))}"`)
+    return proxify(abs(t))
+  }).join('\n')
+}
+
+app.get('/api/live/proxy', wrap(async (req, res) => {
+  const target = String(req.query.url || '')
+  if (!/^https?:\/\//i.test(target)) return res.status(400).send('url invalida')
+  let up
+  try {
+    up = await fetch(target, { headers: { 'user-agent': UA, accept: '*/*' }, redirect: 'follow' })
+  } catch (e) {
+    return res.status(502).send('falha no stream: ' + e.message)
+  }
+  if (!up.ok) return res.status(up.status).end()
+  const ct = String(up.headers.get('content-type') || '')
+  const isPlaylist = /mpegurl/i.test(ct) || /\.m3u8(\?|$)/i.test(target)
+  res.set('Access-Control-Allow-Origin', '*')
+  res.set('Cache-Control', 'no-store')
+  if (isPlaylist) {
+    res.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8')
+    return res.send(rewritePlaylist(await up.text(), target))
+  }
+  res.set('Content-Type', ct || 'application/octet-stream')
+  if (up.body) Readable.fromWeb(up.body).pipe(res)
+  else res.end()
+}))
+
+/* ---------- Internet Archive (dominio publico) ---------- */
+
+app.get('/api/archive', wrap(async (req, res) => {
+  const q = String(req.query.q || '').trim().slice(0, 80)
+  const collection = String(req.query.col || '').trim().slice(0, 40)
+  const page = Math.max(1, Number(req.query.page || 1))
+  const limit = Math.max(6, Math.min(48, Number(req.query.limit || 24)))
+  try { res.json(await archiveSearch({ q, collection, page, limit })) }
+  catch (e) { res.json({ results: [], total: 0, error: e.message }) }
+}))
+
+app.get('/api/archive/:id', wrap(async (req, res) => {
+  const info = await archiveStream(String(req.params.id))
+  if (!info) return res.status(404).json({ error: 'sem arquivo reproduzivel neste item' })
+  res.json(info)
 }))
 
 /* ---------- torrents ---------- */

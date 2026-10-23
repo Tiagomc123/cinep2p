@@ -1,24 +1,55 @@
 const $ = s => document.querySelector(s)
 const $$ = s => [...document.querySelectorAll(s)]
 
-const CATEGORIES = [
-  ['filmes', 'Filmes'], ['series', 'Séries'], ['novelas', 'Novelas'],
-  ['dramas', 'Dramas'], ['desenhos', 'Desenhos'], ['animes', 'Animes']
+const GENRES = [
+  ['', 'Tudo'], ['action', 'Acao'], ['comedy', 'Comedia'], ['horror', 'Terror'],
+  ['sci-fi', 'Ficcao'], ['animation', 'Animacao'], ['thriller', 'Suspense'],
+  ['crime', 'Crime'], ['romance', 'Romance'], ['adventure', 'Aventura'], ['family', 'Familia']
 ]
-const CATEGORY_SHELVES = {
-  filmes: [{ title: 'Em alta', q: '1080p' }, { title: 'Lançamentos', q: 'web-dl' }, { title: 'Filmes populares', q: 'bluray' }],
-  series: [{ title: 'Séries', q: 'series 1080p' }, { title: 'Episódios', q: 'S01E01' }, { title: 'Temporadas', q: 'season 1080p' }],
-  novelas: [{ title: 'Novelas', q: 'novela' }, { title: 'Novelas brasileiras', q: 'novela brasileira' }, { title: 'Telenovelas', q: 'telenovela' }],
-  dramas: [{ title: 'Dramas', q: 'drama 1080p' }, { title: 'Dramas coreanos', q: 'kdrama' }, { title: 'Doramas', q: 'dorama' }],
-  desenhos: [{ title: 'Desenhos', q: 'cartoon' }, { title: 'Animações', q: 'animation 1080p' }, { title: 'Desenhos brasileiros', q: 'desenho' }],
-  animes: [{ title: 'Animes', q: 'anime 1080p' }, { title: 'Animes recentes', q: 'anime 2026' }, { title: 'Filmes de anime', q: 'anime movie' }]
+const ROWS = [
+  { t: 'Em Alta', p: { sort: 'download_count', order: 'desc' } },
+  { t: 'Lancamentos', p: { sort: 'year', order: 'desc' } },
+  { t: 'Melhores Notas', p: { sort: 'rating', order: 'desc' } },
+  { t: 'Acao', p: { genre: 'action', sort: 'download_count', order: 'desc' } },
+  { t: 'Terror', p: { genre: 'horror', sort: 'download_count', order: 'desc' } },
+  { t: 'Comedia', p: { genre: 'comedy', sort: 'download_count', order: 'desc' } }
+]
+const BR_SHELVES = [
+  { title: 'Em Alta (Dublado)', q: 'dublado 1080p', lang: 'dub' },
+  { title: 'Lancamentos Dublados', q: 'dublado web-dl', lang: 'dub' },
+  { title: 'Nacional / Brasileiro', q: 'nacional 1080p', lang: 'ptbr' },
+  { title: 'Dual Audio (PT + Original)', q: 'dual audio 1080p', lang: 'dual' },
+  { title: 'Legendado', q: 'legendado 1080p', lang: 'subs' },
+  { title: 'Animacao Dublada', q: 'animacao dublado', lang: 'dub' }
+]
+const SERIES_SHELVES = [
+  { title: 'Series Dubladas', q: 'serie dublada 1080p', lang: 'dub' },
+  { title: 'Series Legendadas', q: 'serie legendada 1080p', lang: 'subs' },
+  { title: 'Series Nacionais', q: 'serie nacional', lang: 'ptbr' },
+  { title: 'Top Series HD', cat: '208', lang: 'all' }
+]
+const DOC_SHELVES = [
+  { title: 'Documentarios (dominio publico)', col: 'documentary' },
+  { title: 'Filmes classicos', col: 'feature_films' },
+  { title: 'Animacao classica', col: 'classic_cartoons' },
+  { title: 'Film noir', col: 'film_noir' },
+  { title: 'Ficcao cientifica', col: 'sci-fi_horror' },
+  { title: 'Prelinger', col: 'prelinger' }
+]
+const BR_GENRE = {
+  action: 'acao', comedy: 'comedia', horror: 'terror', 'sci-fi': 'ficcao',
+  animation: 'animacao', thriller: 'suspense', crime: 'crime',
+  romance: 'romance', adventure: 'aventura', family: 'familia'
 }
 const MODE_LABEL = { direct: 'Direto', remux: 'Compativel', transcode: 'Leve' }
 const CHAIN = ['direct', 'remux', 'transcode']
+const MODE_EL = { br: '#modeBr', world: '#modeWorld', series: '#modeSeries', docs: '#modeDocs' }
 
 const video = $('#video')
 const rowsEl = $('#rows')
-let activeCategory = localStorage.getItem('cinep2p.category') || 'filmes'
+let activeGenre = ''
+let catalogMode = localStorage.getItem('cinep2p.catalogMode') || 'br'
+let onlyDub = localStorage.getItem('cinep2p.dub') === '1'
 let health = { ffmpeg: false }
 const state = { progressByHash: {} }
 const LOCAL_PROGRESS_KEY = 'cinep2p.progress.v1'
@@ -196,7 +227,6 @@ function card(movie, opts = {}) {
   img.loading = 'lazy'
   img.alt = movie.title || 'filme'
   const fallback = placeholder(movie.title)
-  // Sem capa propria (itens do TPB): placeholder e busca a capa em paralelo.
   if (movie.poster) {
     img.src = movie.poster
     img.onerror = async () => {
@@ -210,7 +240,12 @@ function card(movie, opts = {}) {
   }
   const t = document.createElement('div'); t.className = 't'; t.textContent = movie.title || 'Sem titulo'
   const m = document.createElement('div'); m.className = 'm'
-  m.textContent = [movie.year || '', movie.rating ? 'Nota ' + movie.rating : ''].filter(Boolean).join(' | ')
+  const languageLabels = []
+  if (movie.dub) languageLabels.push('Dublado')
+  else if (movie.dual) languageLabels.push('Dual audio')
+  else if ((movie.langs || []).includes('ptbr')) languageLabels.push('Portugues')
+  if (movie.subs) languageLabels.push('Legendado')
+  m.textContent = [movie.year || '', movie.rating ? 'Nota ' + movie.rating : '', ...languageLabels].filter(Boolean).join(' | ')
   d.append(img, t, m)
   const p = progressFor(movie)
   if (p && p.d) {
@@ -226,13 +261,30 @@ function card(movie, opts = {}) {
   return d
 }
 
-// Converte um resultado cru do TPB num "filme" de card, com titulo limpo.
 function asTorrentMovie(x) {
   return {
     title: prettyTitle(x.title), rawTitle: x.title, year: x.year || yearOf(x.title), poster: '',
     imdb: x.imdb || '', dub: x.dub, dual: x.dual, subs: x.subs, langs: x.langs || [],
     torrents: [x], genres: [], summary: `TPB | ${x.seeds || 0} seeds | ${x.size || '?'}`
   }
+}
+
+function archiveCard(item) {
+  const d = document.createElement('div')
+  d.className = 'card focusable'
+  d.tabIndex = 0
+  const img = document.createElement('img')
+  img.loading = 'lazy'
+  img.alt = item.title
+  img.src = item.poster
+  img.onerror = () => { img.onerror = null; img.src = placeholder(item.title) }
+  const t = document.createElement('div'); t.className = 't'; t.textContent = item.title
+  const m = document.createElement('div'); m.className = 'm'
+  m.textContent = [item.year, 'Archive.org'].filter(Boolean).join(' | ')
+  d.append(img, t, m)
+  d.onclick = () => openArchive(item)
+  d.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); d.click() } }
+  return d
 }
 
 function strip(title, movies) {
@@ -245,26 +297,91 @@ function strip(title, movies) {
   return row
 }
 
-/* ---------- catalogo ---------- */
+function stripNodes(title, nodes) {
+  const row = document.createElement('div')
+  row.className = 'row'
+  const h = document.createElement('h2'); h.textContent = title
+  const s = document.createElement('div'); s.className = 'strip'
+  nodes.forEach(n => s.appendChild(n))
+  row.append(h, s)
+  return row
+}
+
+/* ---------- catalogos ---------- */
 async function loadBrazilCatalog() {
-  const shelves = CATEGORY_SHELVES[activeCategory] || CATEGORY_SHELVES.filmes
-  const blocks = await Promise.all(shelves.map(async shelf => {
+  const genre = activeGenre ? (BR_GENRE[activeGenre] || '') : ''
+  const blocks = await Promise.all(BR_SHELVES.map(async shelf => {
     try {
-      const p = new URLSearchParams({ limit: '18', q: shelf.q })
-      const result = await api('/api/br?' + p)
-      return { shelf, movies: (result.results || []).map(asTorrentMovie) }
+      const p = new URLSearchParams({ limit: '18' })
+      const termo = [shelf.q, genre].filter(Boolean).join(' ').trim()
+      if (termo) p.set('q', termo)
+      if (shelf.cat) p.set('cat', shelf.cat)
+      p.set('lang', onlyDub ? 'dub' : shelf.lang)
+      const j = await api('/api/br?' + p)
+      return { shelf, movies: (j.results || []).map(asTorrentMovie) }
     } catch { return { shelf, movies: [] } }
+  }))
+  renderBlocks(blocks, 'Nada encontrado. Use a busca ou troque de modo.')
+}
+
+async function loadSeriesCatalog() {
+  const genre = activeGenre ? (BR_GENRE[activeGenre] || '') : ''
+  const blocks = await Promise.all(SERIES_SHELVES.map(async shelf => {
+    try {
+      const p = new URLSearchParams({ limit: '18' })
+      const termo = [shelf.q, genre].filter(Boolean).join(' ').trim()
+      if (termo) p.set('q', termo)
+      if (shelf.cat) p.set('cat', shelf.cat)
+      p.set('lang', onlyDub ? 'dub' : shelf.lang)
+      const j = await api('/api/br?' + p)
+      return { shelf, movies: (j.results || []).map(asTorrentMovie) }
+    } catch { return { shelf, movies: [] } }
+  }))
+  renderBlocks(blocks, 'Nada encontrado em series.')
+}
+
+function renderBlocks(blocks, emptyMsg) {
+  rowsEl.innerHTML = ''
+  const frag = document.createDocumentFragment()
+  for (const b of blocks) if (b.movies?.length) frag.appendChild(strip(b.shelf.title, b.movies))
+  rowsEl.appendChild(frag)
+  if (!rowsEl.children.length) rowsEl.innerHTML = `<div class="loading">${esc(emptyMsg)}</div>`
+}
+
+async function loadWorldCatalog() {
+  const frag = document.createDocumentFragment()
+  for (const r of ROWS) {
+    try {
+      const p = { ...r.p, ...(activeGenre ? { genre: activeGenre } : {}) }
+      const j = await api('/api/catalog?' + new URLSearchParams(p))
+      if (j.movies?.length) frag.appendChild(strip(r.t, j.movies))
+    } catch {}
+  }
+  rowsEl.innerHTML = ''
+  rowsEl.appendChild(frag)
+  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Nao foi possivel carregar o catalogo Mundo.</div>'
+}
+
+async function loadDocsCatalog() {
+  const blocks = await Promise.all(DOC_SHELVES.map(async shelf => {
+    try {
+      const j = await api(`/api/archive?col=${encodeURIComponent(shelf.col)}&limit=18`)
+      return { shelf, nodes: (j.results || []).map(archiveCard) }
+    } catch { return { shelf, nodes: [] } }
   }))
   rowsEl.innerHTML = ''
   const frag = document.createDocumentFragment()
-  for (const block of blocks) if (block.movies.length) frag.appendChild(strip(block.shelf.title, block.movies))
+  for (const b of blocks) if (b.nodes?.length) frag.appendChild(stripNodes(b.shelf.title, b.nodes))
   rowsEl.appendChild(frag)
-  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Não foi possível carregar esta categoria. Tente novamente ou use a busca.</div>'
+  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Nada encontrado no Archive.org.</div>'
 }
 
 async function loadCatalog() {
-  rowsEl.innerHTML = '<div class="loading">Carregando catálogo...</div>'
-  return loadBrazilCatalog()
+  rowsEl.innerHTML = '<div class="loading">Carregando catalogo...</div>'
+  if (catalogMode === 'br') return loadBrazilCatalog()
+  if (catalogMode === 'series') return loadSeriesCatalog()
+  if (catalogMode === 'docs') return loadDocsCatalog()
+  return loadWorldCatalog()
 }
 
 async function refreshContinue() {
@@ -312,18 +429,12 @@ async function refreshContinue() {
 function renderGenres() {
   const nav = $('#genres')
   nav.innerHTML = ''
-  CATEGORIES.forEach(([id, label]) => {
-    const button = document.createElement('button')
-    button.className = 'chip focusable' + (id === activeCategory ? ' on' : '')
-    button.textContent = label
-    button.onclick = () => {
-      activeCategory = id
-      localStorage.setItem('cinep2p.category', id)
-      renderGenres()
-      const query = $('#q').value.trim()
-      if (query) runSearch(query); else loadCatalog()
-    }
-    nav.appendChild(button)
+  GENRES.forEach(([id, label]) => {
+    const b = document.createElement('button')
+    b.className = 'chip focusable' + (id === activeGenre ? ' on' : '')
+    b.textContent = label
+    b.onclick = () => { activeGenre = id; renderGenres(); loadCatalog() }
+    nav.appendChild(b)
   })
 }
 
@@ -341,12 +452,34 @@ $('#q').onkeydown = e => {
   }
 }
 
+function syncCatalogMode() {
+  for (const [k, sel] of Object.entries(MODE_EL)) $(sel).classList.toggle('on', catalogMode === k)
+}
+for (const [k, sel] of Object.entries(MODE_EL)) {
+  $(sel).onclick = () => {
+    catalogMode = k
+    localStorage.setItem('cinep2p.catalogMode', k)
+    syncCatalogMode()
+    const q = $('#q').value.trim()
+    if (q) runSearch(q); else loadCatalog()
+  }
+}
+$('#liveBtn').onclick = () => { location.href = '/live.html' }
+syncCatalogMode()
+
+$('#dubChip').classList.toggle('on', onlyDub)
+$('#dubChip').onclick = () => {
+  onlyDub = !onlyDub
+  localStorage.setItem('cinep2p.dub', onlyDub ? '1' : '0')
+  $('#dubChip').classList.toggle('on', onlyDub)
+  const q = $('#q').value.trim()
+  if (q) runSearch(q); else loadCatalog()
+}
+
 async function runSearch(q) {
   rowsEl.innerHTML = '<div class="loading">Buscando...</div>'
   try {
-    // Sempre usa a busca combinada (TPB + YTS): voce mantem capa, sinopse e nota do YTS
-    // e os releases PT-BR do TPB aparecem primeiro.
-    const j = await api(`/api/search?q=${encodeURIComponent(q)}`)
+    const j = await api(`/api/search?q=${encodeURIComponent(q)}${onlyDub ? '&dub=1' : ''}`)
     rowsEl.innerHTML = ''
     const g = document.createElement('div'); g.className = 'grid'
     const extras = j.extra || []
@@ -365,6 +498,10 @@ async function runSearch(q) {
 /* ---------- detalhe ---------- */
 function langTags(x) {
   const tags = []
+  if (x.dub) tags.push('<span class="tag dub">Dublado</span>')
+  else if (x.dual) tags.push('<span class="tag dub">Dual audio</span>')
+  if (x.subs) tags.push('<span class="tag">Legendado</span>')
+  if ((x.langs || []).includes('ptbr')) tags.push('<span class="tag pt">PT-BR</span>')
   if (x.codec === 'x265') tags.push('<span class="tag warn">x265</span>')
   if (x.codec === 'XviD') tags.push('<span class="tag warn">XviD</span>')
   return tags.join('')
@@ -376,6 +513,7 @@ function srcRow(x, movie) {
   d.innerHTML = `<span class="q">${esc(x.quality || 'SD')}</span>
     <span class="tag">${esc(x.codec || 'n/d')}</span>
     <span class="tag">${esc(x.source || 'Fonte')}</span>
+    ${langTags(x)}
     <span class="s">${x.seeds || 0} seeds | ${esc(x.size || '?')}</span>`
   const b = document.createElement('button')
   b.className = 'play focusable'
@@ -392,8 +530,9 @@ async function openDetail(movie) {
     <div class="dbody">
       <h1></h1><div class="dmeta"></div><div class="dsum"></div>
       <div class="sec">Fontes (${t.length})</div><div id="srcList"></div>
-      <div class="sec">Outras fontes</div>
-      <button class="alt focusable" id="more">Buscar mais fontes</button>
+      <div class="sec">Outras fontes (indice extra)</div>
+      <button class="alt focusable" id="dubBtn">So dublado</button>
+      <button class="alt focusable" id="more">Buscar no indice extra</button>
       <div id="extraList"></div>
     </div>`
   $('#detail h1').textContent = `${movie.title || ''} ${movie.year ? '(' + movie.year + ')' : ''}`
@@ -404,13 +543,17 @@ async function openDetail(movie) {
   if (!t.length) list.innerHTML = '<div class="dsum">Nenhuma fonte com seed agora.</div>'
   t.forEach(x => list.appendChild(srcRow(x, movie)))
 
+  let extraDub = onlyDub
+  const dubBtn = $('#dubBtn')
+  dubBtn.classList.toggle('on', extraDub)
+  dubBtn.onclick = () => { extraDub = !extraDub; dubBtn.classList.toggle('on', extraDub); $('#more').click() }
+
   $('#more').onclick = async e => {
     e.target.disabled = true
     e.target.textContent = 'Buscando...'
     try {
-      // usa o nome ORIGINAL do release para achar mais fontes
       const alvo = movie.rawTitle || movie.title
-      const j = await api(`/api/extra?title=${encodeURIComponent(alvo)}&year=${movie.year || ''}`)
+      const j = await api(`/api/extra?title=${encodeURIComponent(alvo)}&year=${movie.year || ''}${extraDub ? '&dub=1' : ''}`)
       const ex = $('#extraList'); ex.innerHTML = ''
       if (!j.results?.length) ex.innerHTML = '<div class="dsum">Nada encontrado.</div>'
       ;(j.results || []).forEach(x => ex.appendChild(srcRow(x, movie)))
@@ -524,7 +667,7 @@ function applyPrepared(j) {
 
   const audios = state.media?.audios || []
   if (audios.length > 1) {
-    const pt = audios.findIndex(a => /^(pt|pt-br|por|pob|pt_br)$/i.test(String(a.lang || '').trim()) || /portugu[eê]s|brazilian|pt[-_ ]?br|pob/i.test(String(a.label || '')))
+    const pt = audios.findIndex(a => ['pt', 'pt-br', 'por', 'pob'].includes(String(a.lang).toLowerCase()))
     if (pt > 0) state.audio = pt
   }
   state.mode = state.forceCompat ? state.mode : (j.mode || 'auto')
@@ -582,6 +725,38 @@ async function resumeOrStart() {
   }
   clearInterval(saveTimer)
   saveTimer = setInterval(() => saveProgress(), 5000)
+}
+
+/* ---------- player direto (Archive.org) ---------- */
+async function openArchive(item) {
+  toast('Preparando stream...')
+  try {
+    const j = await api('/api/archive/' + encodeURIComponent(item.id))
+    openDirect(j.url, item.title)
+  } catch (e) { toast('Nao foi possivel abrir: ' + e.message) }
+}
+
+function openDirect(url, title) {
+  Object.assign(state, {
+    open: true, movie: { title }, source: { direct: true }, hash: null, fileIndex: null,
+    label: title, mode: 'direct', media: null, files: [], externalSubs: [],
+    duration: 0, base: 0, key: null, sub: -1, forceCompat: false, audio: 0, q: ''
+  })
+  $('#ptitle').textContent = title
+  $('#player').classList.remove('hidden')
+  $('#pmsg').textContent = ''
+  $('#pmsg').classList.remove('err')
+  $$('track').forEach(t => t.remove())
+  $('#pspin').classList.add('hidden')
+  $('#ptop').classList.add('hidden')
+  $('#pmenu').classList.add('hidden')
+  $('#pctl').classList.remove('hidden')
+  video.controls = true
+  pushLayer(closePlayer)
+  requestWakeLock()
+  try { $('#player').requestFullscreen?.().catch(() => {}) } catch {}
+  video.src = url
+  video.play().catch(() => {})
 }
 
 function position() { return (state.base || 0) + (video.currentTime || 0) }
@@ -647,6 +822,7 @@ function showTop(v) {
 
 video.onerror = () => {
   if (!state.open || !video.getAttribute('src')) return
+  if (state.source?.direct) { showError('Nao foi possivel reproduzir este stream.', true); return }
   const i = CHAIN.indexOf(state.mode)
   if (health.ffmpeg && i >= 0 && i < CHAIN.length - 1) {
     state.mode = CHAIN[i + 1]
@@ -664,7 +840,7 @@ video.onloadedmetadata = () => {
   if (state.pendingSeek && state.mode === 'direct') { video.currentTime = state.pendingSeek; state.pendingSeek = null }
 }
 video.oncanplay = () => { clearTimeout(watchdog); $('#pmsg').classList.remove('err') }
-video.onplay = () => { $('#pplay').textContent = 'Pausar'; requestWakeLock(); if (!poll && state.open) startStatusPolling() }
+video.onplay = () => { $('#pplay').textContent = 'Pausar'; requestWakeLock(); if (!poll && state.open && state.hash) startStatusPolling() }
 video.onpause = () => { $('#pplay').textContent = 'Tocar'; saveProgress() }
 video.onended = () => { saveProgress(true); clearInterval(poll); poll = null; refreshContinue() }
 video.ontimeupdate = () => {
@@ -734,12 +910,9 @@ function openMenu(kind) {
 
   if (kind === 'audio') {
     h('Idioma do audio')
-    const list = [...(state.media?.audios || [])].sort((a, b) => {
-      const priority = a => (/^(pt|pt-br|por|pob|pt_br)$/i.test(String(a.lang || '').trim()) || /portugu[eê]s|brazilian|pt[-_ ]?br|pob/i.test(String(a.label || ''))) ? 0 : 1
-      return priority(a) - priority(b) || a.i - b.i
-    })
-    if (list.length < 2) add('Só há uma faixa de áudio neste arquivo', true, () => {})
-    list.forEach(a => add((/^(pt|pt-br|por|pob|pt_br)$/i.test(String(a.lang || '').trim()) || /portugu[eê]s|brazilian|pt[-_ ]?br|pob/i.test(String(a.label || ''))) ? 'Português (Brasil) — ' + (a.label || `Faixa ${a.i + 1}`) : (a.label || `Faixa ${a.i + 1}`), state.audio === a.i, () => {
+    const list = state.media?.audios || []
+    if (list.length < 2) add('So uma faixa neste arquivo', true, () => {})
+    list.forEach(a => add(a.label || `Faixa ${a.i + 1}`, state.audio === a.i, () => {
       if (!health.ffmpeg) return toast('ffmpeg nao encontrado.')
       state.audio = a.i
       state.forceCompat = true

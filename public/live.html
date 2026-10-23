@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Canais ao vivo - cinep2p</title>
+<meta name="theme-color" content="#0b0b11">
+<link rel="icon" href="/icon.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <a class="logo" href="/">cine<span>p2p</span></a>
+  <div id="lbar">
+    <select id="country"><option value="">Todos os paises</option></select>
+    <input id="q" type="search" placeholder="Buscar canal...">
+    <button class="chip" id="tvBtn">TV</button>
+  </div>
+  <span class="badge" id="total">0 canais</span>
+</header>
+
+<nav id="lchips"></nav>
+
+<main><div id="rows"><div class="loading">Carregando canais...</div></div></main>
+
+<div id="player" class="hidden">
+  <video id="video" tabindex="0" playsinline></video>
+  <div class="ptop" id="ptop">
+    <div class="ptitle" id="ptitle"></div>
+    <div class="pacts">
+      <button id="pReload">Recarregar</button>
+      <button id="pFs">Tela cheia</button>
+      <button id="pClose">Fechar</button>
+    </div>
+  </div>
+  <div class="pmsg" id="pmsg"></div>
+  <div class="pspin" id="pspin"><div class="spin"></div></div>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script src="/live.js"></script>
+</body>
+</html>

@@ -4,7 +4,7 @@ const MIRRORS = ['https://apibay.org', 'https://apibay.qicp.vip']
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'
 
 const VIDEO_CATS = new Set([201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 505])
-const CAT = { 201: 'DVD', 207: 'HD', 208: 'Serie', 209: '3D', 211: '4K', 505: 'Adulto', 601: 'Livro', 602: 'HQ', 104: 'FLAC', 102: 'Audio livro' }
+const CAT = { 201: 'DVD', 205: 'Serie', 207: 'HD', 208: 'Serie HD', 209: '3D', 211: '4K', 505: 'Adulto', 601: 'Livro', 602: 'HQ', 104: 'FLAC', 102: 'Audio livro' }
 
 function human(bytes) {
   if (!bytes) return '?'
@@ -81,7 +81,6 @@ export function score(t) {
   else if (t.quality === '2160p') s += 12
   if (t.codec === 'x264') s += 14
   if (t.codec === 'x265') s += 6
-  // Primeiro releases que declaram PT-BR; dual audio sozinho nao garante portugues.
   if (t.dub || (t.langs || []).includes('ptbr') || isPortuguese(t.title)) s += 1500
   else if (t.dual) s += 350
   else if (t.subs) s += 100

@@ -7,6 +7,7 @@ const BASES = [
 ]
 const APIS = ['https://apibay.org', 'https://apibay.qicp.vip']
 const VIDEO_CATS = new Set([201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213])
+const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'
 
 const PT = /(dublado|dublada|dublagem|nacional|brasileir[oa]|brazilian|\bptbr\b|\bpt[-_. ]?br\b|\bpob\b|\bbrdub\b|\bbr[-_. ]?dub\b|portugu[eê]s|\bpor\b)/i
 const DUAL = /(dual[ ._-]?[aá]udio|dual[ ._-]?audio|\bdual\b)/i
@@ -162,12 +163,78 @@ function bayScore(t) {
 }
 const bayRank = list => [...list].sort((a, b) => bayScore(b) - bayScore(a))
 
+/* ---------- iptv-org (TV ao vivo) ---------- */
+
+const COUNTRY_LIST = 'https://iptv-org.github.io/iptv/index.country.m3u'
+const CATEGORY_LIST = 'https://iptv-org.github.io/iptv/index.category.m3u'
+let liveCache = { at: 0, byCountry: [], byCategory: [] }
+
+function parseM3U(text) {
+  const out = []
+  let cur = null
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line) continue
+    if (line.startsWith('#EXTINF')) {
+      const logo = (/(?:tvg-logo|logo)="([^"]*)"/i.exec(line) || [])[1] || ''
+      const group = (/group-title="([^"]*)"/i.exec(line) || [])[1] || ''
+      const name = (line.split(',').pop() || '').trim()
+      cur = { name, logo, group, url: '' }
+    } else if (line.startsWith('#')) {
+      continue
+    } else if (cur) {
+      cur.url = line
+      if (cur.url && cur.name) out.push(cur)
+      cur = null
+    }
+  }
+  return out
+}
+
+async function getText(url, ms = 30000) {
+  const r = await fetch(url, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(ms) })
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  return await r.text()
+}
+
+async function ensureLive() {
+  if (liveCache.at && Date.now() - liveCache.at < 12 * 60 * 60 * 1000) return liveCache
+  const [countries, categories] = await Promise.all([
+    getText(COUNTRY_LIST).then(parseM3U).catch(() => []),
+    getText(CATEGORY_LIST).then(parseM3U).catch(() => [])
+  ])
+  if (!countries.length && !categories.length && liveCache.at) return liveCache
+  liveCache = { at: Date.now(), byCountry: countries, byCategory: categories }
+  return liveCache
+}
+
+/* ---------- Internet Archive ---------- */
+
+async function getJSON(url, ms = 20000) {
+  const r = await fetch(url, { headers: { 'user-agent': UA, accept: 'application/json' }, signal: AbortSignal.timeout(ms) })
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  return await r.json()
+}
+
+/* ---------- proxy HLS ---------- */
+
+const proxify = u => '/api/live/proxy?url=' + encodeURIComponent(u)
+function rewritePlaylist(text, baseUrl) {
+  const abs = u => { try { return new URL(u, baseUrl).href } catch { return u } }
+  return String(text).split(/\r?\n/).map(line => {
+    const t = line.trim()
+    if (!t) return line
+    if (t.startsWith('#')) return t.replace(/URI="([^"]+)"/g, (_, u) => `URI="${proxify(abs(u))}"`)
+    return proxify(abs(t))
+  }).join('\n')
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url)
 
     if (url.pathname === '/api/health') {
-      return json({ ok: true, platform: 'cloudflare-workers', catalog: true, brCatalog: true, torrentStreaming: false })
+      return json({ ok: true, platform: 'cloudflare-workers', catalog: true, brCatalog: true, live: true, archive: true, torrentStreaming: false })
     }
 
     if (url.pathname === '/api/catalog') {
@@ -185,7 +252,6 @@ export default {
       }
     }
 
-    // Catalogo PT-BR (mesma semantica do server.js).
     if (url.pathname === '/api/br') {
       const q = (url.searchParams.get('q') || '').trim().slice(0, 180)
       const catRaw = (url.searchParams.get('cat') || '').trim()
@@ -220,6 +286,105 @@ export default {
       ])
       const extra = onlyDub ? bayRank(bayRes.filter(t => t.dub)) : bayRank(bayRes)
       return json({ results: ytsRes, extra: extra.slice(0, 20) })
+    }
+
+    /* ---- TV ao vivo ---- */
+    if (url.pathname === '/api/live/meta') {
+      try {
+        const c = await ensureLive()
+        return json({
+          countries: [...new Set(c.byCountry.map(x => x.group).filter(Boolean))].sort(),
+          categories: [...new Set(c.byCategory.map(x => x.group).filter(Boolean))].sort(),
+          total: c.byCountry.length
+        })
+      } catch (e) { return json({ countries: [], categories: [], total: 0, error: String(e?.message || e) }) }
+    }
+
+    if (url.pathname === '/api/live') {
+      const country = (url.searchParams.get('country') || '').trim()
+      const category = (url.searchParams.get('category') || '').trim()
+      const q = (url.searchParams.get('q') || '').trim().toLowerCase()
+      const limit = Math.max(12, Math.min(120, Number(url.searchParams.get('limit') || 60)))
+      try {
+        const c = await ensureLive()
+        let base
+        if (country && category) {
+          const urls = new Set(c.byCategory.filter(x => x.group === category).map(x => x.url))
+          base = c.byCountry.filter(x => x.group === country && urls.has(x.url))
+        } else if (country) base = c.byCountry.filter(x => x.group === country)
+        else if (category) base = c.byCategory.filter(x => x.group === category)
+        else base = c.byCountry
+        if (q) base = base.filter(x => x.name.toLowerCase().includes(q) || x.group.toLowerCase().includes(q))
+        const seen = new Set(); const uniq = []
+        for (const x of base) { if (seen.has(x.url)) continue; seen.add(x.url); uniq.push(x) }
+        return json({ total: uniq.length, page: 1, channels: uniq.slice(0, limit) })
+      } catch (e) { return json({ channels: [], total: 0, error: String(e?.message || e) }) }
+    }
+
+    if (url.pathname === '/api/live/proxy') {
+      const target = url.searchParams.get('url') || ''
+      if (!/^https?:\/\//i.test(target)) return new Response('url invalida', { status: 400 })
+      let up
+      try { up = await fetch(target, { headers: { 'user-agent': UA }, redirect: 'follow' }) }
+      catch (e) { return new Response('falha no stream: ' + (e?.message || e), { status: 502 }) }
+      const ct = up.headers.get('content-type') || ''
+      const isPlaylist = /mpegurl/i.test(ct) || /\.m3u8(\?|$)/i.test(target)
+      if (isPlaylist) {
+        const text = await up.text()
+        return new Response(rewritePlaylist(text, target), {
+          headers: { 'content-type': 'application/vnd.apple.mpegurl; charset=utf-8', 'access-control-allow-origin': '*' }
+        })
+      }
+      const headers = new Headers(up.headers)
+      headers.set('access-control-allow-origin', '*')
+      return new Response(up.body, { status: up.status, headers })
+    }
+
+    /* ---- Internet Archive ---- */
+    if (url.pathname === '/api/archive') {
+      const q = (url.searchParams.get('q') || '').trim().slice(0, 80)
+      const collection = (url.searchParams.get('col') || '').trim().slice(0, 40)
+      const limit = Math.max(6, Math.min(48, Number(url.searchParams.get('limit') || 24)))
+      const parts = ['mediatype:movies']
+      if (collection) parts.push(`collection:${collection}`)
+      if (q) parts.push(`(${q})`)
+      const params = new URLSearchParams()
+      params.set('q', parts.join(' AND '))
+      for (const f of ['identifier', 'title', 'year', 'description']) params.append('fl[]', f)
+      params.set('sort[]', 'downloads desc')
+      params.set('rows', String(limit))
+      params.set('output', 'json')
+      try {
+        const data = await getJSON('https://archive.org/advancedsearch.php?' + params)
+        const docs = data?.response?.docs || []
+        return json({
+          total: Number(data?.response?.numFound) || 0,
+          results: docs.map(d => ({
+            id: d.identifier,
+            title: String(d.title || d.identifier || '').replace(/\s+/g, ' ').trim(),
+            year: d.year || '',
+            summary: String(d.description || '').replace(/\s+/g, ' ').slice(0, 400),
+            poster: `https://archive.org/services/img/${encodeURIComponent(d.identifier)}`,
+            source: 'Archive.org'
+          })).filter(x => x.id)
+        })
+      } catch (e) { return json({ results: [], total: 0, error: String(e?.message || e) }, 502) }
+    }
+
+    const archiveMatch = /^\/api\/archive\/(.+)$/.exec(url.pathname)
+    if (archiveMatch) {
+      const id = decodeURIComponent(archiveMatch[1]).trim()
+      if (!/^[\w.\-]{1,120}$/.test(id)) return json({ error: 'id invalido' }, 400)
+      try {
+        const md = await getJSON('https://archive.org/metadata/' + id)
+        const files = md?.files || []
+        const pick =
+          files.find(f => /\.(mp4|m4v)$/i.test(f.name || '') && /h\.?264|mpeg4|512kb|mp4/i.test(f.format || '')) ||
+          files.find(f => /\.(mp4|m4v)$/i.test(f.name || '')) ||
+          files.find(f => /\.(ogv|webm)$/i.test(f.name || ''))
+        if (!pick) return json({ error: 'sem arquivo reproduzivel' }, 404)
+        return json({ url: `https://archive.org/download/${id}/${encodeURIComponent(pick.name)}`, size: Number(pick.size) || 0, format: pick.format || '' })
+      } catch (e) { return json({ error: String(e?.message || e) }, 502) }
     }
 
     if (url.pathname.startsWith('/api/')) {
