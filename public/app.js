@@ -723,7 +723,7 @@ function sourceLanguage(x, movie) {
   return 'unknown'
 }
 function sourceQuality(x) {
-  const q = String(x.quality || x.resolution || '').toLowerCase()
+  const q = String(x.quality || x.resolution || x.title || '').toLowerCase()
   if (/2160|4k/.test(q)) return '2160p'
   if (/1080/.test(q)) return '1080p'
   if (/720/.test(q)) return '720p'
