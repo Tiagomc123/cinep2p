@@ -15,6 +15,8 @@ const ROWS = [
   { t: 'Comedia', p: { genre: 'comedy', sort: 'download_count', order: 'desc' } }
 ]
 const BR_SHELVES = [
+  { title: 'Lançamentos 2026', q: '2026 1080p', lang: 'all', recent: true },
+  { title: 'Lançamentos 2025', q: '2025 1080p', lang: 'all', recent: true },
   { title: 'Em Alta (Dublado)', q: 'dublado 1080p', lang: 'dub' },
   { title: 'Lancamentos Dublados', q: 'dublado web-dl', lang: 'dub' },
   { title: 'Nacional / Brasileiro', q: 'nacional 1080p', lang: 'ptbr' },
@@ -346,7 +348,9 @@ async function tpbShelfBlocks(shelves, extraTerm = '') {
       if (shelf.cat) p.set('cat', shelf.cat)
       p.set('lang', onlyDub ? 'dub' : shelf.lang)
       const j = await api('/api/br?' + p)
-      return { shelf, movies: (j.results || []).map(asTorrentMovie) }
+      const movies = (j.results || []).map(asTorrentMovie)
+      movies.sort((a, b) => Number(b.year || 0) - Number(a.year || 0))
+      return { shelf, movies: shelf.recent ? movies.filter(m => ['2025', '2026'].includes(String(m.year))) : movies }
     } catch { return { shelf, movies: [] } }
   }))
 }
