@@ -35,11 +35,13 @@ function cleanTitle(s) {
   return String(s || '')
     .replace(/\.(mp4|mkv|avi|mov|webm|m4v|ts)$/i, '')
     .replace(/[._]/g, ' ')
-    .replace(/\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-?ray|web-?dl|webrip|hdrip|brrip|dvdrip|remux|hdr|dv|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ac3|ddp?5[ .]?1|dts(-hd)?|truehd|atmos|yify|galaxyrg|yts|dublado|dual|multi|legendado|repackage?d?|proper|extended|imax|10bit|8bit|hq|bone|psa|oft|turg|rarbg)\b/gi, ' ')
+    .replace(/\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-?ray|web-?dl|webrip|hdrip|brrip|dvdrip|remux|hdr|dv|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ac3|ddp?5[ .]?1|dts(-hd)?|truehd|atmos|yify|galaxyrg|yts|dublado|dublada|dublagem|dual|multi|legendado|legendas?|nacional|brasileir[oa]|repackage?d?|proper|extended|imax|10bit|8bit|hq|bone|psa|oft|turg|rarbg)\b/gi, ' ')
     .replace(/\s*-\s*[a-z0-9]+$/i, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 }
+
+const yearOf = s => (/\b(19\d{2}|20\d{2})\b/.exec(String(s || '')) || [])[1] || ''
 
 /* ---------- catalogo / busca ---------- */
 
@@ -47,15 +49,20 @@ const posterCache = new Map()
 
 app.get('/api/health', wrap(async (_req, res) => {
   const ff = await ensureFfmpeg()
-  res.json({ ok: true, ffmpeg: ff, ffmpegInfo: ffmpegInfo(), https: USE_HTTPS, version: '0.3.0' })
+  res.json({ ok: true, ffmpeg: ff, ffmpegInfo: ffmpegInfo(), https: USE_HTTPS, version: '0.4.0' })
 }))
 
 app.get('/api/active', (_req, res) => res.json({ active: active() }))
 
+// Catalogo internacional (YTS / lingua inglesa).
 app.get('/api/catalog', wrap(async (req, res) => {
   const { genre = '', sort = 'year', order = 'desc', page = '1' } = req.query
   res.json(await listMovies({ genre, sort, order, page: Number(page) }))
 }))
+
+// Catalogo PT-BR (indice The Pirate Bay). q = busca tematica, cat = top por categoria.
+const brCache = new Map()
+const BR_TTL = 120e3
 
 app.get('/api/br', wrap(async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 180)
@@ -63,9 +70,31 @@ app.get('/api/br', wrap(async (req, res) => {
   const cats = catRaw ? catRaw.split(',').map(Number).filter(Number.isFinite) : [201, 207]
   const lang = String(req.query.lang || '').trim().toLowerCase()
   const limit = Math.max(1, Math.min(60, Number.parseInt(req.query.limit || '24', 10) || 24))
-  const list = q ? await brShelf([q]) : await topMovies(cats)
-  const filtered = lang ? list.filter(x => matchesLang(x, lang)) : list
-  res.json({ results: rank(filtered).slice(0, limit), source: 'TPB', lang: lang || 'all', count: filtered.length })
+
+  const cacheKey = `${q}|${cats.join(',')}|${lang}|${limit}`
+  const hit = brCache.get(cacheKey)
+  if (hit && Date.now() - hit.at < BR_TTL) return res.json(hit.data)
+
+  let list = []
+  try {
+    list = q ? await brShelf([q]) : await topMovies(cats)
+  } catch (e) {
+    console.warn('[cinep2p] /api/br falhou:', e.message)
+  }
+
+  let filtered = lang ? list.filter(x => matchesLang(x, lang)) : list
+  // Se o filtro de idioma esvaziou a prateleira, relaxa mas mantem PT primeiro.
+  if (filtered.length < 3) filtered = list
+
+  const data = {
+    results: rank(filtered).slice(0, limit).map(x => ({ ...x, year: yearOf(x.title) })),
+    source: 'TPB',
+    lang: lang || 'all',
+    count: filtered.length
+  }
+  brCache.set(cacheKey, { at: Date.now(), data })
+  if (brCache.size > 200) brCache.clear()
+  res.json(data)
 }))
 
 app.get('/api/search', wrap(async (req, res) => {
@@ -183,7 +212,7 @@ app.get('/api/subs/:hash', wrap(async (req, res) => {
 
 app.get('/api/progress', (_req, res) => res.json({ items: progress.recent(24) }))
 app.get('/api/progress/:key', (req, res) => res.json(progress.get(req.params.key) || {}))
-  app.delete('/api/progress', (_req, res) => { progress.clear(); res.json({ ok: true }) })
+app.delete('/api/progress', (_req, res) => { progress.clear(); res.json({ ok: true }) })
 app.post('/api/progress', (req, res) => {
   const b = req.body || {}
   if (!b.key) return res.status(400).json({ error: 'key obrigatoria' })

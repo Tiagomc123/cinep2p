@@ -14,6 +14,20 @@ const ROWS = [
   { t: 'Terror', p: { genre: 'horror', sort: 'download_count', order: 'desc' } },
   { t: 'Comedia', p: { genre: 'comedy', sort: 'download_count', order: 'desc' } }
 ]
+// Prateleiras PT-BR (indice The Pirate Bay).
+const BR_SHELVES = [
+  { title: 'Em Alta (Dublado)', q: 'dublado 1080p', lang: 'dub' },
+  { title: 'Lancamentos Dublados', q: 'dublado web-dl', lang: 'dub' },
+  { title: 'Nacional / Brasileiro', q: 'nacional 1080p', lang: 'ptbr' },
+  { title: 'Dual Audio (PT + Original)', q: 'dual audio 1080p', lang: 'dual' },
+  { title: 'Legendado', q: 'legendado 1080p', lang: 'subs' },
+  { title: 'Animacao Dublada', q: 'animacao dublado', lang: 'dub' }
+]
+const BR_GENRE = {
+  action: 'acao', comedy: 'comedia', horror: 'terror', 'sci-fi': 'ficcao',
+  animation: 'animacao', thriller: 'suspense', crime: 'crime',
+  romance: 'romance', adventure: 'aventura', family: 'familia'
+}
 const MODE_LABEL = { direct: 'Direto', remux: 'Compativel', transcode: 'Leve' }
 const CHAIN = ['direct', 'remux', 'transcode']
 
@@ -170,6 +184,19 @@ function lookupPoster(title, imdb) {
   return posterCache.get(key)
 }
 
+/* ---------- limpeza de nome de release ---------- */
+const JUNK = /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-?ray|web-?dl|webrip|hdrip|brrip|dvdrip|remux|hdr|dv|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ac3|ddp?5[ .]?1|dts(-hd)?|truehd|atmos|yify|galaxyrg|yts|dublado|dublada|dublagem|dual|multi|legendado|legendas?|nacional|brasileir[oa]|repackage?d?|proper|extended|imax|10bit|8bit|hq|bone|psa|oft|turg|rarbg)\b/gi
+function prettyTitle(name) {
+  return String(name || '')
+    .replace(/\.(mp4|mkv|avi|mov|webm|m4v|ts)$/i, '')
+    .replace(/[._]/g, ' ')
+    .replace(JUNK, ' ')
+    .replace(/\s*-\s*[a-z0-9]+$/i, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+const yearOf = name => (/\b(19\d{2}|20\d{2})\b/.exec(String(name || '')) || [])[1] || ''
+
 /* ---------- cartoes ---------- */
 function progressFor(movie) {
   if (movie.progressKey) return state.progressByHash[movie.hash]
@@ -186,18 +213,24 @@ function card(movie, opts = {}) {
   img.loading = 'lazy'
   img.alt = movie.title || 'filme'
   const fallback = placeholder(movie.title)
-  img.src = movie.poster || fallback
-  img.onerror = async () => {
-    img.onerror = null
-    const j = await lookupPoster(movie.title, movie.imdb)
-    img.src = j?.poster || fallback
+  // Sem capa propria (itens do TPB): placeholder e busca a capa em paralelo.
+  if (movie.poster) {
+    img.src = movie.poster
+    img.onerror = async () => {
+      img.onerror = null
+      const j = await lookupPoster(movie.title, movie.imdb)
+      img.src = j?.poster || fallback
+    }
+  } else {
+    img.src = fallback
+    lookupPoster(movie.title, movie.imdb).then(j => { if (j?.poster) img.src = j.poster })
   }
   const t = document.createElement('div'); t.className = 't'; t.textContent = movie.title || 'Sem titulo'
   const m = document.createElement('div'); m.className = 'm'
   const languageLabels = []
   if (movie.dub) languageLabels.push('Dublado')
   else if (movie.dual) languageLabels.push('Dual audio')
-  else if ((movie.langs || []).includes('ptbr')) languageLabels.push('Português')
+  else if ((movie.langs || []).includes('ptbr')) languageLabels.push('Portugues')
   if (movie.subs) languageLabels.push('Legendado')
   m.textContent = [movie.year || '', movie.rating ? 'Nota ' + movie.rating : '', ...languageLabels].filter(Boolean).join(' | ')
   d.append(img, t, m)
@@ -215,6 +248,15 @@ function card(movie, opts = {}) {
   return d
 }
 
+// Converte um resultado cru do TPB num "filme" de card, com titulo limpo.
+function asTorrentMovie(x) {
+  return {
+    title: prettyTitle(x.title), rawTitle: x.title, year: x.year || yearOf(x.title), poster: '',
+    imdb: x.imdb || '', dub: x.dub, dual: x.dual, subs: x.subs, langs: x.langs || [],
+    torrents: [x], genres: [], summary: `TPB | ${x.seeds || 0} seeds | ${x.size || '?'}`
+  }
+}
+
 function strip(title, movies) {
   const row = document.createElement('div')
   row.className = 'row'
@@ -226,39 +268,31 @@ function strip(title, movies) {
 }
 
 /* ---------- catalogo ---------- */
-function asTorrentMovie(x) {
-  return { title: x.title, year: '', poster: '', imdb: x.imdb || '', dub: x.dub, dual: x.dual, subs: x.subs,
-    langs: x.langs || [], torrents: [x], genres: [], summary: `TPB | ${x.seeds} seeds | ${x.size || '?'}` }
-}
 async function loadBrazilCatalog() {
-  const shelves = [
-    { title: 'Dublado', q: 'dublado', lang: 'dub' },
-    { title: 'Nacional', q: 'nacional', lang: 'ptbr' },
-    { title: 'Dual Áudio', q: 'dual audio', lang: 'dual' },
-    { title: 'Legendado', q: 'legendado', lang: 'subs' },
-    { title: 'Top HD', cat: '207', lang: 'ptbr' },
-    { title: 'Top DVD', cat: '201', lang: 'ptbr' }
-  ]
-  const frag = document.createDocumentFragment()
-  for (const shelf of shelves) {
+  const genre = activeGenre ? (BR_GENRE[activeGenre] || '') : ''
+  // Paralelo: uma prateleira lenta nao trava as outras.
+  const blocks = await Promise.all(BR_SHELVES.map(async shelf => {
     try {
-      const p = new URLSearchParams({ limit: '24' })
-      if (shelf.q) p.set('q', shelf.q)
-      if (shelf.cat) p.set('cat', shelf.cat)
-      if (shelf.lang) p.set('lang', shelf.lang)
-      if (onlyDub) p.set('lang', 'dub')
+      const p = new URLSearchParams({ limit: '18' })
+      const termo = [shelf.q, genre].filter(Boolean).join(' ').trim()
+      if (termo) p.set('q', termo)
+      p.set('lang', onlyDub ? 'dub' : shelf.lang)
       const j = await api('/api/br?' + p)
-      const movies = (j.results || []).map(asTorrentMovie)
-      if (movies.length) frag.appendChild(strip(shelf.title, movies))
-    } catch {}
-  }
+      return { shelf, movies: (j.results || []).map(asTorrentMovie) }
+    } catch {
+      return { shelf, movies: [] }
+    }
+  }))
   rowsEl.innerHTML = ''
+  const frag = document.createDocumentFragment()
+  for (const b of blocks) if (b.movies.length) frag.appendChild(strip(b.shelf.title, b.movies))
   rowsEl.appendChild(frag)
-  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Não foi possível carregar o catálogo PT-BR. Tente novamente.</div>'
+  if (!rowsEl.children.length) {
+    rowsEl.innerHTML = '<div class="loading">Nao foi possivel carregar o catalogo PT-BR. Use a busca ou troque para Mundo.</div>'
+  }
 }
-async function loadCatalog() {
-  rowsEl.innerHTML = '<div class="loading">Carregando catálogo...</div>'
-  if (catalogMode === 'br') return loadBrazilCatalog()
+
+async function loadWorldCatalog() {
   const frag = document.createDocumentFragment()
   for (const r of ROWS) {
     try {
@@ -269,7 +303,13 @@ async function loadCatalog() {
   }
   rowsEl.innerHTML = ''
   rowsEl.appendChild(frag)
-  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Não foi possível carregar o catálogo Mundo.</div>'
+  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Nao foi possivel carregar o catalogo Mundo.</div>'
+}
+
+async function loadCatalog() {
+  rowsEl.innerHTML = '<div class="loading">Carregando catalogo...</div>'
+  if (catalogMode === 'br') return loadBrazilCatalog()
+  return loadWorldCatalog()
 }
 
 async function refreshContinue() {
@@ -296,7 +336,7 @@ async function refreshContinue() {
     const row = document.createElement('div'); row.className = 'row'
     const head = document.createElement('div'); head.className = 'history-head'
     const h = document.createElement('h2'); h.textContent = title
-    const clear = document.createElement('button'); clear.className = 'history-clear'; clear.textContent = 'Apagar histórico'
+    const clear = document.createElement('button'); clear.className = 'history-clear'; clear.textContent = 'Apagar historico'
     clear.onclick = clearWatchHistory
     head.append(h, clear)
     const s = document.createElement('div'); s.className = 'strip'
@@ -311,7 +351,7 @@ async function refreshContinue() {
     row.append(head, s); cont.appendChild(row)
   }
   renderRow('#contRow', 'Continuar assistindo', continuing)
-  renderRow('#watchedRow', 'Já assistidos', watched)
+  renderRow('#watchedRow', 'Ja assistidos', watched)
 }
 
 function renderGenres() {
@@ -342,7 +382,7 @@ $('#q').onkeydown = e => {
 
 function syncCatalogMode() {
   const b = $('#catalogMode')
-  b.textContent = catalogMode === 'br' ? 'Catálogo: PT-BR' : 'Catálogo: Mundo'
+  b.textContent = catalogMode === 'br' ? 'Catalogo: PT-BR' : 'Catalogo: Mundo'
   b.classList.toggle('on', catalogMode === 'br')
 }
 $('#catalogMode').onclick = () => {
@@ -353,6 +393,7 @@ $('#catalogMode').onclick = () => {
   if (q) runSearch(q); else loadCatalog()
 }
 syncCatalogMode()
+
 $('#dubChip').classList.toggle('on', onlyDub)
 $('#dubChip').onclick = () => {
   onlyDub = !onlyDub
@@ -365,32 +406,17 @@ $('#dubChip').onclick = () => {
 async function runSearch(q) {
   rowsEl.innerHTML = '<div class="loading">Buscando...</div>'
   try {
-    if (catalogMode === 'br') {
-      const p = new URLSearchParams({ q, limit: '50' })
-      if (onlyDub) p.set('lang', 'dub')
-      const j = await api('/api/br?' + p)
-      rowsEl.innerHTML = ''
-      const g = document.createElement('div'); g.className = 'grid'
-      ;(j.results || []).forEach(x => g.appendChild(card(asTorrentMovie(x))))
-      rowsEl.appendChild(g)
-      if (!g.children.length) rowsEl.innerHTML = '<div class="loading">Nada encontrado no catálogo TPB.</div>'
-      return
-    }
+    // Sempre usa a busca combinada (TPB + YTS): voce mantem capa, sinopse e nota do YTS
+    // e os releases PT-BR do TPB aparecem primeiro.
     const j = await api(`/api/search?q=${encodeURIComponent(q)}${onlyDub ? '&dub=1' : ''}`)
     rowsEl.innerHTML = ''
     const g = document.createElement('div'); g.className = 'grid'
     const extras = j.extra || []
     const portuguese = extras.filter(x => x.dub || x.dual || (x.langs || []).includes('ptbr'))
     const others = extras.filter(x => !x.dub && !x.dual && !(x.langs || []).includes('ptbr'))
-    const addExtra = x => g.appendChild(card({
-      title: x.title.slice(0, 70), year: '', dub: x.dub, dual: x.dual,
-      subs: x.subs, langs: x.langs, imdb: x.imdb,
-      torrents: [x], genres: [], summary: `Fonte extra | ${x.seeds} seeds | ${x.size}`
-    }))
-    // Exibe fontes em português antes do catálogo geral e das versões sem idioma identificado.
-    portuguese.forEach(addExtra)
+    portuguese.forEach(x => g.appendChild(card(asTorrentMovie(x))))
     ;(j.results || []).forEach(m => g.appendChild(card(m)))
-    others.forEach(addExtra)
+    others.forEach(x => g.appendChild(card(asTorrentMovie(x))))
     rowsEl.appendChild(g)
     if (!g.children.length) rowsEl.innerHTML = '<div class="loading">Nada encontrado.</div>'
   } catch (e) {
@@ -455,7 +481,9 @@ async function openDetail(movie) {
     e.target.disabled = true
     e.target.textContent = 'Buscando...'
     try {
-      const j = await api(`/api/extra?title=${encodeURIComponent(movie.title)}&year=${movie.year || ''}${extraDub ? '&dub=1' : ''}`)
+      // usa o nome ORIGINAL do release para achar mais fontes
+      const alvo = movie.rawTitle || movie.title
+      const j = await api(`/api/extra?title=${encodeURIComponent(alvo)}&year=${movie.year || ''}${extraDub ? '&dub=1' : ''}`)
       const ex = $('#extraList'); ex.innerHTML = ''
       if (!j.results?.length) ex.innerHTML = '<div class="dsum">Nada encontrado.</div>'
       ;(j.results || []).forEach(x => ex.appendChild(srcRow(x, movie)))
