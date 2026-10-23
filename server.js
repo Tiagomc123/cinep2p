@@ -112,6 +112,40 @@ app.get('/api/extra', wrap(async (req, res) => {
   res.json({ results: j.extras || [] })
 }))
 
+const posterHostAllowed = host => {
+  const h = String(host || '').toLowerCase()
+  return ['yts.mx','yts.lt','yts.gg','yts.bz','yts.rs','tmdb.org','tvmaze.com','archive.org']
+    .some(domain => h === domain || h.endsWith('.' + domain))
+}
+
+app.get('/api/poster/image', wrap(async (req, res) => {
+  let current
+  try { current = new URL(String(req.query.url || '')) }
+  catch { return res.status(400).end() }
+  if (current.protocol !== 'https:' || !posterHostAllowed(current.hostname)) return res.status(400).end()
+  let upstream
+  for (let redirects = 0; redirects <= 3; redirects++) {
+    upstream = await fetch(current, { headers: { 'user-agent': UA, accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8' }, redirect: 'manual' })
+    if (upstream.status >= 300 && upstream.status < 400) {
+      const location = upstream.headers.get('location')
+      if (!location || redirects === 3) return res.status(502).end()
+      current = new URL(location, current)
+      if (current.protocol !== 'https:' || !posterHostAllowed(current.hostname)) return res.status(502).end()
+      continue
+    }
+    break
+  }
+  if (!upstream?.ok) return res.status(upstream?.status || 502).end()
+  const type = String(upstream.headers.get('content-type') || '')
+  if (!type.startsWith('image/')) return res.status(415).end()
+  const data = Buffer.from(await upstream.arrayBuffer())
+  if (data.length > 8 * 1024 * 1024) return res.status(413).end()
+  res.set('Content-Type', type)
+  res.set('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800')
+  res.set('X-Content-Type-Options', 'nosniff')
+  res.send(data)
+}))
+
 app.get('/api/poster', wrap(async (req, res) => {
   const imdb = String(req.query.imdb || '').trim()
   const raw = String(req.query.title || '').trim().slice(0, 180)
