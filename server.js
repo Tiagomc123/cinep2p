@@ -5,7 +5,8 @@ import http from 'node:http'
 import https from 'node:https'
 import { fileURLToPath } from 'node:url'
 import { listMovies, searchMovies } from './src/yts.js'
-import { searchApibay, rank } from './src/apibay.js'
+import { searchApibay, topMovies, brShelf, rank } from './src/apibay.js'
+import { matchesLang } from './src/lang.js'
 import {
   ensureTorrent, serveMedia, status, stop, active, listFiles, pickVideo,
   externalSubs, getProbe, mediaInfo, decideMode, diagnose,
@@ -54,6 +55,17 @@ app.get('/api/active', (_req, res) => res.json({ active: active() }))
 app.get('/api/catalog', wrap(async (req, res) => {
   const { genre = '', sort = 'year', order = 'desc', page = '1' } = req.query
   res.json(await listMovies({ genre, sort, order, page: Number(page) }))
+}))
+
+app.get('/api/br', wrap(async (req, res) => {
+  const q = String(req.query.q || '').trim().slice(0, 180)
+  const catRaw = String(req.query.cat || '').trim()
+  const cats = catRaw ? catRaw.split(',').map(Number).filter(Number.isFinite) : [201, 207]
+  const lang = String(req.query.lang || '').trim().toLowerCase()
+  const limit = Math.max(1, Math.min(60, Number.parseInt(req.query.limit || '24', 10) || 24))
+  const list = q ? await brShelf([q]) : await topMovies(cats)
+  const filtered = lang ? list.filter(x => matchesLang(x, lang)) : list
+  res.json({ results: rank(filtered).slice(0, limit), source: 'TPB', lang: lang || 'all', count: filtered.length })
 }))
 
 app.get('/api/search', wrap(async (req, res) => {
