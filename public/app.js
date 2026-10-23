@@ -408,36 +408,55 @@ async function refreshContinue() {
     if (!prev || Number(item.ts || 0) >= Number(prev.ts || 0)) merged.set(item.key, item)
   }
   const items = [...merged.values()]
-    .filter(i => i.d && i.t > 30)
+    .filter(i => i.d && i.t > 3)
     .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
     .slice(0, 100)
   state.progressByHash = Object.fromEntries(items.map(i => [i.hash, i]))
   state.progressByKey = Object.fromEntries(items.map(i => [i.key, i]))
-  const watched = items.filter(i => i.t >= i.d * 0.92 || i.d - i.t <= 90)
-  const continuing = items.filter(i => !watched.includes(i))
-  const renderRow = (containerId, title, list) => {
-    const cont = $(containerId)
-    cont.innerHTML = ''
-    if (!list.length) return
-    const row = document.createElement('div'); row.className = 'row'
-    const head = document.createElement('div'); head.className = 'history-head'
-    const h = document.createElement('h2'); h.textContent = title
-    const clear = document.createElement('button'); clear.className = 'history-clear'; clear.textContent = 'Apagar historico'
-    clear.onclick = clearWatchHistory
-    head.append(h, clear)
-    const s = document.createElement('div'); s.className = 'strip'
-    for (const i of list) {
-      s.appendChild(card({
-        title: i.title || i.name, year: i.year, poster: i.poster,
-        hash: i.hash, progressKey: i.key,
-        source: { hash: i.hash, title: i.title, source: 'retomar', quality: '' },
-        file: i.file
-      }, { direct: true }))
-    }
-    row.append(head, s); cont.appendChild(row)
+  renderHistory(items)
+}
+
+function renderHistory(items = []) {
+  const list = $('#historyList')
+  if (!list) return
+  const filter = $('#historyFilter')?.value || 'all'
+  const filtered = items.filter(i => {
+    const isSeries = String(i.key || '').startsWith('tv:')
+    return filter === 'all' || (filter === 'series' && isSeries) || (filter === 'movies' && !isSeries)
+  })
+  list.innerHTML = ''
+  if (!filtered.length) {
+    list.innerHTML = '<div class="loading">Seu histórico aparecerá aqui depois que você assistir.</div>'
+    return
   }
-  renderRow('#contRow', 'Continuar assistindo', continuing)
-  renderRow('#watchedRow', 'Ja assistidos', watched)
+  const grid = document.createElement('div')
+  grid.className = 'history-grid'
+  for (const i of filtered) {
+    const isSeries = String(i.key || '').startsWith('tv:')
+    const movie = {
+      title: i.title || i.name || 'Sem título', year: i.year, poster: i.poster,
+      hash: i.hash, progressKey: i.key, historyType: isSeries ? 'Série / episódio' : 'Filme',
+      source: { hash: i.hash, title: i.title, source: 'retomar', quality: '' }, file: i.file
+    }
+    const c = card(movie, { direct: true })
+    const type = document.createElement('span')
+    type.className = 'history-type'
+    type.textContent = movie.historyType
+    c.appendChild(type)
+    grid.appendChild(c)
+  }
+  list.appendChild(grid)
+}
+
+$('#historyBtn').onclick = () => {
+  renderHistory([...new Map([...Object.values(readLocalProgress()), ...Object.values(state.progressByKey)].map(i => [i.key, i])).values()])
+  $('#historyModal').classList.remove('hidden')
+  pushLayer(() => $('#historyModal').classList.add('hidden'))
+}
+$('#closeHistory').onclick = () => closeTop()
+$('#clearHistoryBtn').onclick = clearWatchHistory
+$('#historyFilter').onchange = () => {
+  renderHistory([...new Map([...Object.values(readLocalProgress()), ...Object.values(state.progressByKey)].map(i => [i.key, i])).values()])
 }
 
 function renderGenres() {
@@ -677,48 +696,110 @@ function srcRow(x, movie) {
   return d
 }
 
+function sourceLanguage(x, movie) {
+  const name = String(x.title || '').toLowerCase()
+  if (x.dub || /dublado|dublada|dublagem|\bpt[- .]?br\b|\bptbr\b/.test(name)) return 'pt'
+  if (x.dual || /dual audio|multi audio|multi-audio/.test(name)) return 'dual'
+  if ((x.langs || []).includes('ptbr') || /portugu[eê]s|\bnacional\b/.test(name)) return 'pt'
+  if (/legendado|subbed|\bsubs?\b/.test(name) || x.subs) return 'sub'
+  if (String(movie.language || '').toLowerCase() === 'en' || /\b(english|eng)\b/.test(name)) return 'en'
+  return 'unknown'
+}
+function sourceQuality(x) {
+  const q = String(x.quality || x.resolution || '').toLowerCase()
+  if (/2160|4k/.test(q)) return '2160p'
+  if (/1080/.test(q)) return '1080p'
+  if (/720/.test(q)) return '720p'
+  if (/480/.test(q)) return '480p'
+  return q ? q.toUpperCase() : 'SD / não informado'
+}
+function sourceScore(x, movie) {
+  const lang = sourceLanguage(x, movie)
+  const q = sourceQuality(x)
+  return (Number(x.seeds) || 0) * 10 +
+    (q === '2160p' ? 450 : q === '1080p' ? 350 : q === '720p' ? 200 : q === '480p' ? 80 : 0) +
+    (lang === 'pt' ? 180 : lang === 'dual' ? 150 : 0)
+}
 async function openDetail(movie) {
-  const t = (movie.torrents || []).filter(x => x.seeds > 0)
+  let sources = [...(movie.torrents || [])].filter(x => x.hash && x.seeds > 0)
+  const unique = new Map()
+  sources.forEach(x => unique.set(x.hash, x))
+  sources = [...unique.values()]
+  let selectedLang = 'best'
+  let selectedQuality = 'best'
   $('#detail').innerHTML = `
     <div class="hero" style="background-image:url('${esc(movie.background || movie.poster || '')}')"></div>
-    <div class="dbody">
+    <div class="dbody chooser-body">
       <h1></h1><div class="dmeta"></div><div class="dsum"></div>
-      <div class="sec">Fontes (${t.length})</div><div id="srcList"></div>
-      <div class="sec">Outras fontes (busca ampla)</div>
-      <button class="alt focusable" id="dubBtn">So dublado</button>
-      <button class="alt focusable" id="more">Buscar mais fontes</button>
-      <div id="extraList"></div>
+      <div class="watch-panel">
+        <div class="sec">Idioma</div>
+        <div id="languageChoices" class="choice-row"></div>
+        <div class="sec">Qualidade</div>
+        <div id="qualityChoices" class="choice-row"></div>
+        <div id="sourceHint" class="source-hint"></div>
+        <button class="play main-play" id="watchNow">▶ Assistir agora</button>
+        <button class="alt focusable" id="moreSources">Procurar outras opções</button>
+        <div class="dsum" id="sourceStatus"></div>
+      </div>
     </div>`
   $('#detail h1').textContent = `${movie.title || ''} ${movie.year ? '(' + movie.year + ')' : ''}`
   $('#detail .dmeta').textContent = [(movie.genres || []).join(' | '), movie.rating ? 'Nota ' + movie.rating : '', movie.runtime ? movie.runtime + ' min' : ''].filter(Boolean).join(' | ')
   $('#detail .dsum').textContent = movie.summary || ''
 
-  const list = $('#srcList')
-  if (!t.length) list.innerHTML = '<div class="dsum">Nenhuma fonte com seed agora. Use "Buscar mais fontes".</div>'
-  t.forEach(x => list.appendChild(srcRow(x, movie)))
-
-  let extraDub = onlyDub
-  const dubBtn = $('#dubBtn')
-  dubBtn.classList.toggle('on', extraDub)
-  dubBtn.onclick = () => { extraDub = !extraDub; dubBtn.classList.toggle('on', extraDub); $('#more').click() }
-
-  $('#more').onclick = async e => {
-    e.target.disabled = true
-    e.target.textContent = 'Buscando...'
-    try {
-      const alvo = movie.rawTitle || movie.title
-      const j = await api(`/api/extra?title=${encodeURIComponent(alvo)}&year=${movie.year || ''}${extraDub ? '&dub=1' : ''}`)
-      const ex = $('#extraList'); ex.innerHTML = ''
-      if (!j.results?.length) ex.innerHTML = '<div class="dsum">Nada encontrado.</div>'
-      ;(j.results || []).forEach(x => ex.appendChild(srcRow(x, movie)))
-      e.target.textContent = 'Buscar mais fontes'
-      e.target.disabled = false
-    } catch {
-      e.target.textContent = 'Tentar novamente'
-      e.target.disabled = false
-    }
+  const languageName = k => ({best:'Melhor opção',pt:'Português / dublado',dual:'Dual áudio',en:'Inglês / original',sub:'Legendado',unknown:'Idioma não confirmado'}[k] || k)
+  const langOrder = ['best','pt','dual','en','sub','unknown']
+  const qualityOrder = ['best','2160p','1080p','720p','480p','SD / não informado']
+  const buildButtons = (container, values, current, setter) => {
+    container.innerHTML = ''
+    values.forEach(value => {
+      const b = document.createElement('button')
+      b.className = 'alt focusable' + (value === current ? ' on' : '')
+      b.textContent = value === 'best' ? (container.id === 'languageChoices' ? 'Melhor idioma' : 'Melhor qualidade') : value
+      b.onclick = () => { setter(value); buildButtons(container, values, value, setter); updateHint() }
+      container.appendChild(b)
+    })
   }
-
+  const availableLangs = () => [...new Set(sources.map(x => sourceLanguage(x, movie)))]
+  const availableQualities = () => [...new Set(sources.map(sourceQuality))]
+  const candidates = () => sources.filter(x => {
+    const lang = sourceLanguage(x, movie), quality = sourceQuality(x)
+    return (selectedLang === 'best' || lang === selectedLang) && (selectedQuality === 'best' || quality === selectedQuality)
+  }).sort((a,b) => sourceScore(b,movie)-sourceScore(a,movie))
+  const updateHint = () => {
+    const best = candidates()[0]
+    const hint = $('#sourceHint')
+    if (!best) { hint.textContent = 'Não encontrei uma fonte que combine com essas escolhas.'; $('#watchNow').disabled = true; return }
+    $('#watchNow').disabled = false
+    hint.textContent = `Fonte selecionada automaticamente: ${sourceQuality(best)} · ${languageName(sourceLanguage(best,movie))} · ${best.seeds || 0} seeds · ${best.size || 'tamanho não informado'}`
+  }
+  const languages = ['best', ...langOrder.slice(1).filter(x => availableLangs().includes(x))]
+  const qualities = ['best', ...qualityOrder.slice(1).filter(x => availableQualities().includes(x))]
+  buildButtons($('#languageChoices'), languages, selectedLang, v => { selectedLang = v })
+  buildButtons($('#qualityChoices'), qualities, selectedQuality, v => { selectedQuality = v })
+  updateHint()
+  $('#watchNow').onclick = () => {
+    const chosen = candidates()[0]
+    if (!chosen) return toast('Não há fonte disponível com essas opções.')
+    $('#modal').classList.add('hidden')
+    openPlayer(chosen, movie)
+  }
+  $('#moreSources').onclick = async e => {
+    e.currentTarget.disabled = true
+    e.currentTarget.textContent = 'Procurando...'
+    try {
+      const target = movie.rawTitle || movie.title
+      const j = await api(`/api/extra?title=${encodeURIComponent(target)}&year=${movie.year || ''}`)
+      for (const x of (j.results || [])) if (x.hash && x.seeds > 0 && !sources.some(s => s.hash === x.hash)) sources.push(x)
+      const ls = ['best', ...langOrder.slice(1).filter(x => availableLangs().includes(x))]
+      const qs = ['best', ...qualityOrder.slice(1).filter(x => availableQualities().includes(x))]
+      buildButtons($('#languageChoices'), ls, selectedLang, v => { selectedLang = v })
+      buildButtons($('#qualityChoices'), qs, selectedQuality, v => { selectedQuality = v })
+      updateHint()
+      $('#sourceStatus').textContent = `${j.results?.length || 0} opções adicionais encontradas.`
+    } catch (err) { $('#sourceStatus').textContent = 'Não foi possível buscar outras opções agora.' }
+    e.currentTarget.disabled = false
+    e.currentTarget.textContent = 'Procurar outras opções'
+  }
   $('#modal').classList.remove('hidden')
   pushLayer(() => $('#modal').classList.add('hidden'))
 }
