@@ -15,7 +15,7 @@ const NAMES = {
 }
 export const langName = c => NAMES[String(c || '').toLowerCase()] || String(c || '').toUpperCase() || 'Desconhecido'
 
-const PT = /(dublado|dublada|dublagem|nacional|brasileir[oa]|brazilian|\\bptbr\\b|\\bpt[-_. ]?br\\b|\\bpob\\b|\\bbrdub\\b|\\bbr[-_. ]?dub\\b|portugu[eê]s|\\bpor\\b)/i
+const PT = /(dublado|dublada|dublagem|nacional|brasileir[oa]|brazilian|\bptbr\b|\bpt[-_. ]?br\b|\bpob\b|\bbrdub\b|\bbr[-_. ]?dub\b|portugu[eê]s|\bpor\b)/i
 const DUAL = /(dual[ ._-]?[aá]udio|dual)/i
 const LEG = /(legendado|legendad[ao]|subbed)/i
 
