@@ -236,8 +236,8 @@ async function loadBrazilCatalog() {
     { title: 'Nacional', q: 'nacional', lang: 'ptbr' },
     { title: 'Dual Áudio', q: 'dual audio', lang: 'dual' },
     { title: 'Legendado', q: 'legendado', lang: 'subs' },
-    { title: 'Top HD', cat: '207', lang: '' },
-    { title: 'Top DVD', cat: '201', lang: '' }
+    { title: 'Top HD', cat: '207', lang: 'ptbr' },
+    { title: 'Top DVD', cat: '201', lang: 'ptbr' }
   ]
   const frag = document.createDocumentFragment()
   for (const shelf of shelves) {
