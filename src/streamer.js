@@ -10,7 +10,7 @@ const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), 'downl
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
 const SUBS_DIR = path.join(DATA_DIR, 'subs')
 const METADATA_TIMEOUT = Math.max(20, Number(process.env.METADATA_TIMEOUT || 120)) * 1000
-const IDLE_MINUTES = Math.max(1, Number(process.env.IDLE_MINUTES || 1))
+const IDLE_MINUTES = Math.max(1, Number(process.env.IDLE_MINUTES || 5))
 const PRESET = process.env.TRANSCODE_PRESET || 'veryfast'
 const CRF = process.env.TRANSCODE_CRF || '23'
 const PROBE_BYTES = Number(process.env.PROBE_BYTES || 8 * 1024 * 1024)
@@ -143,7 +143,7 @@ export function pickVideo(torrent, index) {
 
 function subLangGuess(name) {
   const s = String(name).toLowerCase()
-  if (/pt[-_ .]?br|ptbr|portugu[eê]s[-_ ]?br|brazil|pob/.test(s)) return 'pt-BR'
+  if (/pt[-_ .]?br|ptbr|portugu[eÃª]s[-_ ]?br|brazil|pob/.test(s)) return 'pt-BR'
   if (/portugu|portugues|\bpt\b|\bpor\b/.test(s)) return 'pt'
   if (/english|\beng\b|\ben\b/.test(s)) return 'en'
   if (/spanish|espa|\bes\b|\bspa\b/.test(s)) return 'es'
@@ -193,7 +193,6 @@ export function getProbe(torrent, file) {
   return promise
 }
 
-// Decide como entregar o arquivo. NUNCA assume "direto" so pela extensao.
 export async function decideMode(torrent, file, { wantAudio = false, hint = '' } = {}) {
   const p = await getProbe(torrent, file)
   const vc = String(p?.video?.codec || hint || '').toLowerCase()
@@ -479,3 +478,26 @@ setInterval(() => {
 }, 15e3).unref()
 
 export function destroyClient() { try { client.destroy() } catch {} }
+
+/* ---------- liberacao de espaco ---------- */
+
+export async function stopAll() {
+  const keys = [...registry.keys()]
+  await Promise.all(keys.map(k => stop(k).catch(() => {})))
+  return keys.length
+}
+
+export function storageInfo() {
+  let bytes = 0, dirs = 0, files = 0
+  const walk = dir => {
+    let ents
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const e of ents) {
+      const p = path.join(dir, e.name)
+      if (e.isDirectory()) { dirs++; walk(p) }
+      else { files++; try { bytes += fs.statSync(p).size } catch {} }
+    }
+  }
+  walk(DOWNLOAD_DIR)
+  return { bytes, dirs, files, active: registry.size }
+}

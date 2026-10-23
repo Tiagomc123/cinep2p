@@ -7,13 +7,15 @@ import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { listMovies, searchMovies } from './src/yts.js'
 import { searchApibay, topMovies, brShelf, rank } from './src/apibay.js'
+import { searchAll } from './src/search.js'
+import { tvSearch, tvShow, tvFind } from './src/tv.js'
 import { matchesLang } from './src/lang.js'
 import { liveMeta, liveChannels } from './src/live.js'
 import { archiveSearch, archiveStream } from './src/archive.js'
 import {
   ensureTorrent, serveMedia, status, stop, active, listFiles, pickVideo,
   externalSubs, getProbe, mediaInfo, decideMode, diagnose,
-  externalSubVtt, embeddedSubVtt, destroyClient
+  externalSubVtt, embeddedSubVtt, destroyClient, stopAll, storageInfo
 } from './src/streamer.js'
 import { ensureFfmpeg, ffmpegInfo } from './src/ffmpeg.js'
 import { ensureCerts } from './src/tls.js'
@@ -46,13 +48,11 @@ function cleanTitle(s) {
 }
 const yearOf = s => (/\b(19\d{2}|20\d{2})\b/.exec(String(s || '')) || [])[1] || ''
 
-/* ---------- catalogo / busca ---------- */
-
 const posterCache = new Map()
 
 app.get('/api/health', wrap(async (_req, res) => {
   const ff = await ensureFfmpeg()
-  res.json({ ok: true, ffmpeg: ff, ffmpegInfo: ffmpegInfo(), https: USE_HTTPS, version: '0.5.0', live: true, archive: true })
+  res.json({ ok: true, ffmpeg: ff, ffmpegInfo: ffmpegInfo(), https: USE_HTTPS, version: '0.6.0', live: true, archive: true, tv: true })
 }))
 
 app.get('/api/active', (_req, res) => res.json({ active: active() }))
@@ -100,17 +100,16 @@ app.get('/api/search', wrap(async (req, res) => {
   const onlyDub = req.query.dub === '1'
   const [yts, bay] = await Promise.all([
     searchMovies(q).catch(() => []),
-    searchApibay(onlyDub ? q + ' dublado' : q).catch(() => [])
+    searchAll(q, { onlyDub, limit: 60 }).catch(() => ({ extras: [] }))
   ])
-  res.json({ results: yts, extra: rank(bay, { onlyDub }).slice(0, 20) })
+  res.json({ results: onlyDub ? [] : yts, extra: bay.extras || [] })
 }))
 
 app.get('/api/extra', wrap(async (req, res) => {
   const title = String(req.query.title || '').trim()
   if (!title) return res.json({ results: [] })
-  const q = (title + ' ' + (req.query.year || '') + ' ' + (req.query.dub === '1' ? 'dublado' : '')).trim()
-  const list = await searchApibay(q)
-  res.json({ results: rank(list, { onlyDub: req.query.dub === '1' }).slice(0, 25) })
+  const j = await searchAll(title, { onlyDub: req.query.dub === '1', limit: 30 }).catch(() => ({ extras: [] }))
+  res.json({ results: j.extras || [] })
 }))
 
 app.get('/api/poster', wrap(async (req, res) => {
@@ -139,7 +138,26 @@ app.get('/api/poster', wrap(async (req, res) => {
   res.json(out)
 }))
 
-/* ---------- TV ao vivo (iptv-org) ---------- */
+app.get('/api/tv/search', wrap(async (req, res) => {
+  const q = String(req.query.q || '').trim()
+  if (!q) return res.json({ results: [] })
+  try { res.json(await tvSearch(q)) }
+  catch (e) { res.json({ results: [], error: e.message }) }
+}))
+
+app.get('/api/tv/show/:id', wrap(async (req, res) => {
+  try { res.json(await tvShow(Number(req.params.id))) }
+  catch (e) { res.json({ show: null, seasons: [], error: e.message }) }
+}))
+
+app.get('/api/tv/find', wrap(async (req, res) => {
+  const title = String(req.query.title || '').trim().slice(0, 100)
+  const season = Number(req.query.season || 1)
+  const episode = Number(req.query.episode || 1)
+  if (!title) return res.json({ results: [] })
+  try { res.json(await tvFind({ title, season, episode, dub: req.query.dub !== '0' })) }
+  catch (e) { res.json({ results: [], error: e.message }) }
+}))
 
 app.get('/api/live/meta', wrap(async (_req, res) => {
   try { res.json(await liveMeta()) }
@@ -191,8 +209,6 @@ app.get('/api/live/proxy', wrap(async (req, res) => {
   else res.end()
 }))
 
-/* ---------- Internet Archive (dominio publico) ---------- */
-
 app.get('/api/archive', wrap(async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 80)
   const collection = String(req.query.col || '').trim().slice(0, 40)
@@ -208,7 +224,15 @@ app.get('/api/archive/:id', wrap(async (req, res) => {
   res.json(info)
 }))
 
-/* ---------- torrents ---------- */
+app.get('/api/storage', (_req, res) => res.json(storageInfo()))
+
+app.post('/api/cleanup', wrap(async (_req, res) => {
+  const before = storageInfo().bytes
+  const torrents = await stopAll()
+  await new Promise(r => setTimeout(r, 400))
+  const after = storageInfo().bytes
+  res.json({ ok: true, torrents, freed: Math.max(0, before - after), bytes: after })
+}))
 
 app.get('/api/status/:hash', (req, res) => {
   if (!hash40(req.params.hash)) return res.status(400).json({ error: 'hash invalido' })
@@ -274,8 +298,6 @@ app.get('/api/subs/:hash', wrap(async (req, res) => {
   res.set('Content-Type', 'text/vtt; charset=utf-8').set('Cache-Control', 'no-store').send(vtt)
 }))
 
-/* ---------- progresso ---------- */
-
 app.get('/api/progress', (_req, res) => res.json({ items: progress.recent(24) }))
 app.get('/api/progress/:key', (req, res) => res.json(progress.get(req.params.key) || {}))
 app.delete('/api/progress', (_req, res) => { progress.clear(); res.json({ ok: true }) })
@@ -292,8 +314,6 @@ app.post('/api/progress', (req, res) => {
 app.delete('/api/progress/:key', (req, res) => { progress.del(req.params.key); res.json({ ok: true }) })
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'rota nao encontrada' }))
-
-/* ---------- servidor ---------- */
 
 const server = USE_HTTPS
   ? https.createServer(ensureCerts(path.join(__dirname, 'certs')), app)

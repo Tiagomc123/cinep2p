@@ -7,10 +7,11 @@ const BASES = [
 ]
 const APIS = ['https://apibay.org', 'https://apibay.qicp.vip']
 const VIDEO_CATS = new Set([201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213])
+const TVMAZE = 'https://api.tvmaze.com'
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'
 
-const PT = /(dublado|dublada|dublagem|nacional|brasileir[oa]|brazilian|\bptbr\b|\bpt[-_. ]?br\b|\bpob\b|\bbrdub\b|\bbr[-_. ]?dub\b|portugu[eê]s|\bpor\b)/i
-const DUAL = /(dual[ ._-]?[aá]udio|dual[ ._-]?audio|\bdual\b)/i
+const PT = /(dublado|dublada|dublagem|nacional|brasileir[oa]|brazilian|\bptbr\b|\bpt[-_. ]?br\b|\bpob\b|\bbrdub\b|\bbr[-_. ]?dub\b|portugu[eÃª]s|\bpor\b)/i
+const DUAL = /(dual[ ._-]?[aÃ¡]udio|dual[ ._-]?audio|\bdual\b)/i
 const LEG = /(legendado|legendad[ao]|legendas?|subbed|subtitled)/i
 
 function json(data, status = 200) {
@@ -28,17 +29,12 @@ async function yts(path) {
   let lastError = 'Catalogo temporariamente indisponivel'
   for (const base of BASES) {
     try {
-      const response = await fetch(base + path, {
-        headers: { accept: 'application/json' },
-        signal: AbortSignal.timeout(8000)
-      })
+      const response = await fetch(base + path, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(8000) })
       if (!response.ok) { lastError = 'Fonte respondeu HTTP ' + response.status; continue }
       const body = await response.json()
       if (body?.status === 'ok' && body?.data) return body.data
       lastError = 'Resposta inesperada da fonte'
-    } catch (error) {
-      lastError = String(error?.message || error)
-    }
+    } catch (error) { lastError = String(error?.message || error) }
   }
   throw new Error(lastError)
 }
@@ -56,6 +52,14 @@ async function apibay(path) {
   }
   throw new Error(lastError)
 }
+
+async function getJSON(url, ms = 15000) {
+  const r = await fetch(url, { headers: { 'user-agent': UA, accept: 'application/json' }, signal: AbortSignal.timeout(ms) })
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  return await r.json()
+}
+
+const plain = (html, n) => String(html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n)
 
 function normalize(movie) {
   return {
@@ -163,8 +167,6 @@ function bayScore(t) {
 }
 const bayRank = list => [...list].sort((a, b) => bayScore(b) - bayScore(a))
 
-/* ---------- iptv-org (TV ao vivo) ---------- */
-
 const COUNTRY_LIST = 'https://iptv-org.github.io/iptv/index.country.m3u'
 const CATEGORY_LIST = 'https://iptv-org.github.io/iptv/index.category.m3u'
 let liveCache = { at: 0, byCountry: [], byCategory: [] }
@@ -208,16 +210,6 @@ async function ensureLive() {
   return liveCache
 }
 
-/* ---------- Internet Archive ---------- */
-
-async function getJSON(url, ms = 20000) {
-  const r = await fetch(url, { headers: { 'user-agent': UA, accept: 'application/json' }, signal: AbortSignal.timeout(ms) })
-  if (!r.ok) throw new Error('HTTP ' + r.status)
-  return await r.json()
-}
-
-/* ---------- proxy HLS ---------- */
-
 const proxify = u => '/api/live/proxy?url=' + encodeURIComponent(u)
 function rewritePlaylist(text, baseUrl) {
   const abs = u => { try { return new URL(u, baseUrl).href } catch { return u } }
@@ -234,7 +226,7 @@ export default {
     const url = new URL(request.url)
 
     if (url.pathname === '/api/health') {
-      return json({ ok: true, platform: 'cloudflare-workers', catalog: true, brCatalog: true, live: true, archive: true, torrentStreaming: false })
+      return json({ ok: true, platform: 'cloudflare-workers', catalog: true, brCatalog: true, live: true, archive: true, tv: true, torrentStreaming: false })
     }
 
     if (url.pathname === '/api/catalog') {
@@ -279,16 +271,79 @@ export default {
       const q = (url.searchParams.get('q') || '').trim().slice(0, 120)
       if (!q) return json({ results: [], extra: [] })
       const onlyDub = url.searchParams.get('dub') === '1'
-      const [ytsRes, bayRes] = await Promise.all([
+      const terms = onlyDub ? [q + ' dublado', q + ' nacional'] : [q, q + ' dublado', q + ' nacional', q + ' dual audio', q + ' legendado']
+      const [ytsRes, ...bayLists] = await Promise.all([
         yts('/list_movies.json?' + new URLSearchParams({ query_term: q, limit: '20' }).toString())
           .then(d => (d.movies || []).map(normalize)).catch(() => []),
-        apibay('/q.php?q=' + encodeURIComponent(onlyDub ? q + ' dublado' : q)).then(cleanBay).catch(() => [])
+        ...terms.map(t => apibay('/q.php?q=' + encodeURIComponent(t)).then(cleanBay).catch(() => []))
       ])
-      const extra = onlyDub ? bayRank(bayRes.filter(t => t.dub)) : bayRank(bayRes)
-      return json({ results: ytsRes, extra: extra.slice(0, 20) })
+      const seen = new Map()
+      for (const arr of bayLists) for (const t of arr) if (!seen.has(t.hash)) seen.set(t.hash, t)
+      let all = [...seen.values()]
+      const pt = all.filter(t => matchesLang(t, 'pt'))
+      const rest = all.filter(t => !pt.includes(t))
+      return json({ results: ytsRes, extra: [...bayRank(pt), ...bayRank(rest)].slice(0, 60) })
     }
 
-    /* ---- TV ao vivo ---- */
+    if (url.pathname === '/api/tv/search') {
+      const q = (url.searchParams.get('q') || '').trim().slice(0, 80)
+      if (!q) return json({ results: [] })
+      try {
+        const data = await getJSON(TVMAZE + '/search/shows?q=' + encodeURIComponent(q))
+        return json({
+          results: (Array.isArray(data) ? data : []).map(x => x?.show).filter(Boolean).map(s => ({
+            id: s.id, name: s.name, year: (s.premiered || '').slice(0, 4),
+            poster: s.image?.medium || '', summary: plain(s.summary, 400),
+            genres: s.genres || [], status: s.status || ''
+          }))
+        })
+      } catch (e) { return json({ results: [], error: String(e?.message || e) }) }
+    }
+
+    const showMatch = /^\/api\/tv\/show\/(\d+)$/.exec(url.pathname)
+    if (showMatch) {
+      try {
+        const id = Number(showMatch[1])
+        const [show, eps] = await Promise.all([
+          getJSON(`${TVMAZE}/shows/${id}`).catch(() => null),
+          getJSON(`${TVMAZE}/shows/${id}/episodes`).catch(() => [])
+        ])
+        const list = (Array.isArray(eps) ? eps : []).filter(e => Number(e.season) > 0 && Number(e.number) > 0)
+        const bySeason = new Map()
+        for (const e of list) {
+          if (!bySeason.has(e.season)) bySeason.set(e.season, [])
+          bySeason.get(e.season).push({ season: e.season, episode: e.number, name: e.name || `Episodio ${e.number}`, airdate: e.airdate || '', summary: plain(e.summary, 300) })
+        }
+        return json({
+          show: show ? { id: show.id, name: show.name, poster: show.image?.medium || '', year: (show.premiered || '').slice(0, 4) } : null,
+          seasons: [...bySeason.entries()].map(([season, episodes]) => ({ season, episodes: episodes.sort((a, b) => a.episode - b.episode) })).sort((a, b) => a.season - b.season)
+        })
+      } catch (e) { return json({ show: null, seasons: [], error: String(e?.message || e) }) }
+    }
+
+    if (url.pathname === '/api/tv/find') {
+      const title = (url.searchParams.get('title') || '').trim().slice(0, 100)
+      const season = Number(url.searchParams.get('season') || 1)
+      const episode = Number(url.searchParams.get('episode') || 1)
+      const dub = url.searchParams.get('dub') !== '0'
+      if (!title) return json({ results: [] })
+      const s = String(season).padStart(2, '0')
+      const e = String(episode).padStart(2, '0')
+      const code = `S${s}E${e}`
+      const terms = [`${title} ${code}`, `${title} ${code} dublado`, `${title} ${code} 1080p`, `${title} ${season}x${episode}`]
+      try {
+        const lists = await Promise.all(terms.map(t => apibay('/q.php?q=' + encodeURIComponent(t)).then(cleanBay).catch(() => [])))
+        const seen = new Map()
+        for (const arr of lists) for (const t of arr) if (!seen.has(t.hash)) seen.set(t.hash, t)
+        const norm = v => String(v).toUpperCase().replace(/[^A-Z0-9]/g, '')
+        const alt = new RegExp(`\\b${season}\\s*[xX]\\s*${episode}\\b`)
+        let all = [...seen.values()].filter(t => norm(t.title).includes(code) || alt.test(t.title))
+        if (!all.length) all = [...seen.values()]
+        if (dub) { const pt = all.filter(t => matchesLang(t, 'pt')); if (pt.length) all = pt }
+        return json({ results: bayRank(all).slice(0, 30) })
+      } catch (e) { return json({ results: [], error: String(e?.message || e) }) }
+    }
+
     if (url.pathname === '/api/live/meta') {
       try {
         const c = await ensureLive()
@@ -340,7 +395,6 @@ export default {
       return new Response(up.body, { status: up.status, headers })
     }
 
-    /* ---- Internet Archive ---- */
     if (url.pathname === '/api/archive') {
       const q = (url.searchParams.get('q') || '').trim().slice(0, 80)
       const collection = (url.searchParams.get('col') || '').trim().slice(0, 40)

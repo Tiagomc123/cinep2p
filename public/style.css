@@ -104,7 +104,6 @@ video::cue { background: rgba(0,0,0,.65); font-size: 1.15em; }
 .history-clear { flex: none; background: transparent; border: 1px solid var(--line); color: var(--mut); border-radius: 8px; padding: 5px 10px; font-size: .75rem; cursor: pointer; }
 .history-clear:hover { border-color: #ef4444; color: #fca5a5; }
 
-/* TV ao vivo */
 #lbar { display: flex; gap: 8px; padding: 12px var(--pad); flex-wrap: wrap; align-items: center; }
 #lbar select, #lbar input { background: var(--card); border: 1px solid var(--line); color: var(--fg); padding: 10px 14px; border-radius: 999px; font: inherit; }
 #lbar input { flex: 1; min-width: 150px; }
@@ -115,3 +114,13 @@ video::cue { background: rgba(0,0,0,.65); font-size: 1.15em; }
 .chan img { max-width: 100%; max-height: 100%; object-fit: contain; }
 .chan .t { font-size: .78rem; margin-top: 6px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chan .m { font-size: .7rem; color: var(--mut); }
+
+.seasonbar { display: flex; gap: 8px; overflow-x: auto; padding: 4px 0 14px; scrollbar-width: none; }
+.seasonbar::-webkit-scrollbar { display: none; }
+.ep { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; cursor: pointer; }
+.ep .n { font-weight: 800; color: var(--mut); min-width: 28px; text-align: center; }
+.ep .info { flex: 1; min-width: 0; }
+.ep .info b { display: block; font-size: .9rem; font-weight: 600; }
+.ep .info i { font-size: .74rem; color: var(--mut); font-style: normal; }
+.ep:hover { border-color: var(--acc); }
+.backbar { margin-bottom: 10px; }
