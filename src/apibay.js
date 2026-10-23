@@ -1,4 +1,4 @@
-import { detectAudio } from './lang.js'
+import { detectAudio, isPortuguese, matchesLang } from './lang.js'
 
 const MIRRORS = ['https://apibay.org', 'https://apibay.qicp.vip']
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'
@@ -26,13 +26,13 @@ function codecOf(name) {
   return ''
 }
 
-async function fetchMirror(q) {
+async function fetchEndpoint(endpoint) {
   let lastErr
   for (const base of MIRRORS) {
     const ctrl = new AbortController()
     const to = setTimeout(() => ctrl.abort(), 12000)
     try {
-      const r = await fetch(`${base}/q.php?q=${encodeURIComponent(q)}`, {
+      const r = await fetch(`${base}/${endpoint}`, {
         signal: ctrl.signal, headers: { 'user-agent': UA, accept: 'application/json' }
       })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -44,8 +44,7 @@ async function fetchMirror(q) {
   throw lastErr || new Error('apibay indisponivel')
 }
 
-export async function searchApibay(q) {
-  const j = await fetchMirror(q)
+function normalizeResults(j) {
   if (!j.length || j[0].name === 'No results returned') return []
   return j.map(x => {
     const name = String(x.name || '')
@@ -75,7 +74,7 @@ export async function searchApibay(q) {
   }).filter(x => x.seeds > 0 && /^[0-9a-f]{40}$/.test(x.hash))
 }
 
-function score(t) {
+export function score(t) {
   let s = Math.min(t.seeds, 250)
   if (t.quality === '1080p') s += 60
   else if (t.quality === '720p') s += 35
@@ -83,7 +82,7 @@ function score(t) {
   if (t.codec === 'x264') s += 14
   if (t.codec === 'x265') s += 6
   // Primeiro releases que declaram PT-BR; dual audio sozinho nao garante portugues.
-  if (t.dub || (t.langs || []).includes('ptbr')) s += 1400
+  if (t.dub || (t.langs || []).includes('ptbr') || isPortuguese(t.title)) s += 1500
   else if (t.dual) s += 350
   else if (t.subs) s += 100
   if (/\b(cam|hdcam|ts)\b/i.test(t.title)) s -= 45
@@ -96,7 +95,21 @@ function score(t) {
   return s
 }
 
+export async function searchApibay(q) { return normalizeResults(await fetchEndpoint(`q.php?q=${encodeURIComponent(q)}`)) }
+
+export async function topMovies(cats = [201, 207]) {
+  const categories = [...new Set((Array.isArray(cats) ? cats : [cats]).map(Number).filter(n => VIDEO_CATS.has(n)))].slice(0, 8)
+  const lists = await Promise.all(categories.map(cat => fetchEndpoint(`top.php?cat=${encodeURIComponent(cat)}`).then(normalizeResults).catch(() => [])))
+  return [...new Map(lists.flat().map(x => [x.hash, x])).values()]
+}
+
+export async function brShelf(queries = []) {
+  const terms = [...new Set((Array.isArray(queries) ? queries : [queries]).map(x => String(x || '').trim()).filter(Boolean))].slice(0, 8)
+  const lists = await Promise.all(terms.map(q => searchApibay(q).catch(() => [])))
+  return [...new Map(lists.flat().map(x => [x.hash, x])).values()]
+}
+
 export function rank(list, { onlyDub = false } = {}) {
-  const out = onlyDub ? list.filter(t => t.dub || t.dual) : [...list]
+  const out = onlyDub ? list.filter(t => t.dub || matchesLang(t.title, 'dub')) : [...list]
   return out.sort((a, b) => score(b) - score(a))
 }

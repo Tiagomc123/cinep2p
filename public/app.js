@@ -20,6 +20,7 @@ const CHAIN = ['direct', 'remux', 'transcode']
 const video = $('#video')
 const rowsEl = $('#rows')
 let activeGenre = ''
+let catalogMode = localStorage.getItem('cinep2p.catalogMode') || 'br'
 let onlyDub = localStorage.getItem('cinep2p.dub') === '1'
 let health = { ffmpeg: false }
 const state = { progressByHash: {} }
@@ -225,8 +226,39 @@ function strip(title, movies) {
 }
 
 /* ---------- catalogo ---------- */
+function asTorrentMovie(x) {
+  return { title: x.title, year: '', poster: '', imdb: x.imdb || '', dub: x.dub, dual: x.dual, subs: x.subs,
+    langs: x.langs || [], torrents: [x], genres: [], summary: `TPB | ${x.seeds} seeds | ${x.size || '?'}` }
+}
+async function loadBrazilCatalog() {
+  const shelves = [
+    { title: 'Dublado', q: 'dublado', lang: 'dub' },
+    { title: 'Nacional', q: 'nacional', lang: 'ptbr' },
+    { title: 'Dual Áudio', q: 'dual audio', lang: 'dual' },
+    { title: 'Legendado', q: 'legendado', lang: 'subs' },
+    { title: 'Top HD', cat: '207', lang: '' },
+    { title: 'Top DVD', cat: '201', lang: '' }
+  ]
+  const frag = document.createDocumentFragment()
+  for (const shelf of shelves) {
+    try {
+      const p = new URLSearchParams({ limit: '24' })
+      if (shelf.q) p.set('q', shelf.q)
+      if (shelf.cat) p.set('cat', shelf.cat)
+      if (shelf.lang) p.set('lang', shelf.lang)
+      if (onlyDub) p.set('lang', 'dub')
+      const j = await api('/api/br?' + p)
+      const movies = (j.results || []).map(asTorrentMovie)
+      if (movies.length) frag.appendChild(strip(shelf.title, movies))
+    } catch {}
+  }
+  rowsEl.innerHTML = ''
+  rowsEl.appendChild(frag)
+  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Não foi possível carregar o catálogo PT-BR. Tente novamente.</div>'
+}
 async function loadCatalog() {
-  rowsEl.innerHTML = '<div class="loading">Carregando catalogo...</div>'
+  rowsEl.innerHTML = '<div class="loading">Carregando catálogo...</div>'
+  if (catalogMode === 'br') return loadBrazilCatalog()
   const frag = document.createDocumentFragment()
   for (const r of ROWS) {
     try {
@@ -237,7 +269,7 @@ async function loadCatalog() {
   }
   rowsEl.innerHTML = ''
   rowsEl.appendChild(frag)
-  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Nao foi possivel carregar o catalogo.</div>'
+  if (!rowsEl.children.length) rowsEl.innerHTML = '<div class="loading">Não foi possível carregar o catálogo Mundo.</div>'
 }
 
 async function refreshContinue() {
@@ -308,6 +340,19 @@ $('#q').onkeydown = e => {
   }
 }
 
+function syncCatalogMode() {
+  const b = $('#catalogMode')
+  b.textContent = catalogMode === 'br' ? 'Catálogo: PT-BR' : 'Catálogo: Mundo'
+  b.classList.toggle('on', catalogMode === 'br')
+}
+$('#catalogMode').onclick = () => {
+  catalogMode = catalogMode === 'br' ? 'world' : 'br'
+  localStorage.setItem('cinep2p.catalogMode', catalogMode)
+  syncCatalogMode()
+  const q = $('#q').value.trim()
+  if (q) runSearch(q); else loadCatalog()
+}
+syncCatalogMode()
 $('#dubChip').classList.toggle('on', onlyDub)
 $('#dubChip').onclick = () => {
   onlyDub = !onlyDub
@@ -320,6 +365,17 @@ $('#dubChip').onclick = () => {
 async function runSearch(q) {
   rowsEl.innerHTML = '<div class="loading">Buscando...</div>'
   try {
+    if (catalogMode === 'br') {
+      const p = new URLSearchParams({ q, limit: '50' })
+      if (onlyDub) p.set('lang', 'dub')
+      const j = await api('/api/br?' + p)
+      rowsEl.innerHTML = ''
+      const g = document.createElement('div'); g.className = 'grid'
+      ;(j.results || []).forEach(x => g.appendChild(card(asTorrentMovie(x))))
+      rowsEl.appendChild(g)
+      if (!g.children.length) rowsEl.innerHTML = '<div class="loading">Nada encontrado no catálogo TPB.</div>'
+      return
+    }
     const j = await api(`/api/search?q=${encodeURIComponent(q)}${onlyDub ? '&dub=1' : ''}`)
     rowsEl.innerHTML = ''
     const g = document.createElement('div'); g.className = 'grid'
