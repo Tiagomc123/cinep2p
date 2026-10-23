@@ -193,6 +193,19 @@ function placeholder(title) {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#30204f"/><stop offset="1" stop-color="#101018"/></linearGradient></defs><rect width="300" height="450" fill="url(#g)"/><circle cx="150" cy="150" r="52" fill="none" stroke="#8b5cf6" stroke-width="3"/><path d="M135 119 L180 150 L135 181 Z" fill="#c4b5fd"/><text x="150" y="270" fill="#fff" font-family="Arial" font-size="17" font-weight="700" text-anchor="middle">${t}</text></svg>`
   return 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg)
 }
+function posterSrc(url) {
+  if (!url) return ''
+  try {
+    const u = new URL(url, location.href)
+    if (u.origin === location.origin) return u.href
+    const host = u.hostname.toLowerCase()
+    const allowed = ['yts.mx','yts.lt','yts.gg','yts.bz','yts.rs','tmdb.org','tvmaze.com','archive.org']
+    if (allowed.some(domain => host === domain || host.endsWith('.' + domain))) {
+      return '/api/poster/image?url=' + encodeURIComponent(u.href)
+    }
+    return u.href
+  } catch { return url }
+}
 function lookupPoster(title, imdb) {
   const key = (imdb || title || '').toLowerCase()
   if (!key) return Promise.resolve(null)
@@ -233,15 +246,15 @@ function card(movie, opts = {}) {
   img.alt = movie.title || 'filme'
   const fallback = placeholder(movie.title)
   if (movie.poster) {
-    img.src = movie.poster
+    img.src = posterSrc(movie.poster)
     img.onerror = async () => {
       img.onerror = null
       const j = await lookupPoster(movie.title, movie.imdb)
-      img.src = j?.poster || fallback
+      img.src = j?.poster ? posterSrc(j.poster) : fallback
     }
   } else {
     img.src = fallback
-    lookupPoster(movie.title, movie.imdb).then(j => { if (j?.poster) img.src = j.poster })
+    lookupPoster(movie.title, movie.imdb).then(j => { if (j?.poster) img.src = posterSrc(j.poster) })
   }
   const t = document.createElement('div'); t.className = 't'; t.textContent = movie.title || 'Sem titulo'
   const m = document.createElement('div'); m.className = 'm'
@@ -281,7 +294,7 @@ function archiveCard(item) {
   const img = document.createElement('img')
   img.loading = 'lazy'
   img.alt = item.title
-  img.src = item.poster
+  img.src = posterSrc(item.poster)
   img.onerror = () => { img.onerror = null; img.src = placeholder(item.title) }
   const t = document.createElement('div'); t.className = 't'; t.textContent = item.title
   const m = document.createElement('div'); m.className = 'm'
@@ -299,7 +312,7 @@ function showCard(s) {
   const img = document.createElement('img')
   img.loading = 'lazy'
   img.alt = s.name
-  img.src = s.poster || placeholder(s.name)
+  img.src = posterSrc(s.poster) || placeholder(s.name)
   img.onerror = () => { img.onerror = null; img.src = placeholder(s.name) }
   const t = document.createElement('div'); t.className = 't'; t.textContent = s.name
   const m = document.createElement('div'); m.className = 'm'
