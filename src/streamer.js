@@ -1,503 +1,371 @@
-import fs from 'node:fs'
-import path from 'node:path'
-import { spawn } from 'node:child_process'
-import WebTorrent from 'webtorrent'
-import { buildMagnet, TRACKERS } from './yts.js'
-import { ensureFfmpeg, ffmpegCmd, ffmpegInfo, probe } from './ffmpeg.js'
-import { langName } from './lang.js'
+'use strict';
 
-const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), 'downloads')
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
-const SUBS_DIR = path.join(DATA_DIR, 'subs')
-const METADATA_TIMEOUT = Math.max(20, Number(process.env.METADATA_TIMEOUT || 120)) * 1000
-const IDLE_MINUTES = Math.max(1, Number(process.env.IDLE_MINUTES || 5))
-const PRESET = process.env.TRANSCODE_PRESET || 'veryfast'
-const CRF = process.env.TRANSCODE_CRF || '23'
-const PROBE_BYTES = Number(process.env.PROBE_BYTES || 8 * 1024 * 1024)
+/**
+ * Player P2P blindado.
+ *
+ *  - announce list massiva no magnet + no add() + re-anuncio a cada 6s
+ *  - timeout de metadados com retentativas automaticas
+ *  - overlay de buffer com porcentagem (file.progress)
+ *  - LIMPEZA ABSOLUTA: cada job tem sua propria pasta em cache/ e ela e
+ *    apagada (destroyStore + rm recursivo com retry no Windows) ao fechar
+ */
 
-fs.mkdirSync(DOWNLOAD_DIR, { recursive: true })
-fs.mkdirSync(SUBS_DIR, { recursive: true })
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const WebTorrent = require('webtorrent');
+const trackers = require('./trackers');
 
-const VIDEO_RE = /\.(mp4|m4v|mkv|webm|avi|mov|mpg|mpeg|m2ts|ts|flv|wmv|ogv|divx)$/i
-const SUB_RE = /\.(srt|vtt|ass|ssa)$/i
-const DIRECT_RE = /\.(mp4|m4v|webm|ogv)$/i
-const SAFE_V = ['h264', 'vp8', 'vp9', 'av1']
-const SAFE_A = ['aac', 'mp3', 'opus', 'vorbis']
-const MIME = { mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', avi: 'video/x-msvideo', mov: 'video/quicktime', ts: 'video/mp2t', ogv: 'video/ogg' }
+const TRACKERS = trackers.TRACKERS;
+const appendTrackers = trackers.appendTrackers;
 
-const log = (...a) => { if (process.env.QUIET !== '1') console.log('[cinep2p]', ...a) }
+const cacheSetting = process.env.TORRENT_CACHE_DIR || 'cache';
+const CACHE_ROOT = path.isAbsolute(cacheSetting) ? cacheSetting : path.join(__dirname, '..', cacheSetting);
 
-const client = new WebTorrent({ maxConns: Number(process.env.MAX_CONNS || 80) })
-const registry = new Map()
-const probeCache = new Map()
-const subJobs = new Map()
+const CACHE_MODE = (process.env.CACHE_MODE || 'session').toLowerCase();
+const METADATA_TIMEOUT = Number(process.env.METADATA_TIMEOUT || 40) * 1000;
+const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT || 12 * 60 * 1000);
+const MAX_JOBS = Number(process.env.MAX_JOBS || 3);
+const MAX_CONNS = Number(process.env.MAX_CONNS || 200);
+const MIN_BUFFER_PERCENT = Number(process.env.MIN_BUFFER_PERCENT || 4);
+const MIN_BUFFER_MB = Number(process.env.MIN_BUFFER_MB || 12);
 
-client.on('error', e => log('erro do cliente:', e?.message || e))
-client.on('warning', e => log('aviso:', e?.message || e))
+fs.mkdirSync(CACHE_ROOT, { recursive: true });
 
-/* ---------- torrents ---------- */
+const client = new WebTorrent({
+  maxConns: MAX_CONNS,
+  dht: true,
+  tracker: true,
+  lsd: true,
+  utp: true,
+  webSeeds: true
+});
 
-export function ensureTorrent(hash, name = '') {
-  const key = String(hash || '').toLowerCase()
-  if (!/^[0-9a-f]{40}$/.test(key)) return Promise.reject(new Error('hash invalido'))
+client.on('error', function (e) { console.error('[webtorrent] ' + e.message); });
+client.on('warning', function (e) { console.warn('[webtorrent] ' + e.message); });
 
-  const hit = registry.get(key)
-  if (hit) { hit.lastUsed = Date.now(); return hit.ready }
+const jobs = new Map();
 
-  const entry = { key, name, torrent: null, timer: null, lastUsed: Date.now() }
-  entry.ready = new Promise((resolve, reject) => {
-    let settled = false
-    const fail = err => {
-      if (settled) return
-      settled = true
-      clearTimeout(entry.timer)
-      registry.delete(key)
-      client.remove(key, { destroyStore: true }).catch(() => {})
-      log('falha no torrent', key.slice(0, 8), '-', err.message)
-      reject(err)
+const VIDEO_EXT = /\.(mp4|m4v|mkv|webm|avi|mov|ogv|ogg|ts|mpg|mpeg|flv)$/i;
+const MIME = {
+  mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska',
+  avi: 'video/x-msvideo', mov: 'video/quicktime', ogv: 'video/ogg', ts: 'video/mp2t'
+};
+
+function mimeFor(name) {
+  const ext = String(name).split('.').pop().toLowerCase();
+  return MIME[ext] || 'application/octet-stream';
+}
+
+function agora() { return Date.now(); }
+
+/* ----------------------------- limpeza ----------------------------- */
+
+function apagarPasta(dir, tentativa) {
+  const n = tentativa || 0;
+  if (!dir) return;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (!fs.existsSync(dir)) return;
+  } catch (e) { }
+  if (n < 6) setTimeout(function () { apagarPasta(dir, n + 1); }, 300 * (n + 1));
+}
+
+function limparOrfaos() {
+  if (CACHE_MODE === 'keep') return;
+  try {
+    fs.readdirSync(CACHE_ROOT).forEach(function (nome) {
+      const p = path.join(CACHE_ROOT, nome);
+      try { if (fs.statSync(p).isDirectory()) apagarPasta(p); } catch (e) { }
+    });
+  } catch (e) { }
+}
+limparOrfaos();
+
+/* ------------------------------- job ------------------------------- */
+
+function start(params) {
+  const magnet = appendTrackers(params.magnet);
+  if (!magnet) throw new Error('Magnet link invalido.');
+
+  if (jobs.size >= MAX_JOBS) destruirMaisAntigo();
+
+  const id = crypto.randomBytes(8).toString('hex');
+  const dir = path.join(CACHE_ROOT, id);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const job = {
+    id: id,
+    dir: dir,
+    createdAt: agora(),
+    lastAccess: agora(),
+    state: 'conectando',
+    message: 'Conectando aos peers...',
+    magnet: magnet,
+    titulo: params.titulo || '',
+    qualidade: params.qualidade || '',
+    fileIdx: (params.fileIdx === undefined || params.fileIdx === null || params.fileIdx === '')
+      ? null : Number(params.fileIdx),
+    peers: 0, progress: 0, buffer: 0, speed: 0, downloaded: 0, total: 0,
+    fileName: '', streamUrl: null, canPlay: false,
+    tentativas: 0, torrent: null, file: null, nudge: null, timers: []
+  };
+
+  jobs.set(id, job);
+  attach(job);
+  return job;
+}
+
+function limparTimers(job) {
+  if (job.nudge) { clearInterval(job.nudge); job.nudge = null; }
+  (job.timers || []).forEach(function (t) { clearTimeout(t); });
+  job.timers = [];
+}
+
+function attach(job) {
+  let torrent;
+  try {
+    torrent = client.add(job.magnet, { path: job.dir, announce: TRACKERS });
+  } catch (err) {
+    job.state = 'erro';
+    job.message = 'Nao foi possivel abrir o magnet: ' + err.message;
+    return;
+  }
+
+  job.torrent = torrent;
+  job.state = 'conectando';
+  job.message = 'Procurando peers em ' + TRACKERS.length + ' trackers...';
+
+  try { torrent.strategy = 'sequential'; } catch (e) { }
+
+  job.nudge = setInterval(function () {
+    if (job.state === 'pronto') return;
+    job.peers = torrent.numPeers || 0;
+    if (job.peers === 0) {
+      TRACKERS.forEach(function (t) { try { torrent.addTracker(t); } catch (e) { } });
+      job.message = 'Reforcando announce list (' + TRACKERS.length + ' trackers)...';
     }
-    try {
-      entry.torrent = client.add({ infoHash: key, name: String(name || '').slice(0, 120) }, { path: path.join(DOWNLOAD_DIR, key), announce: TRACKERS, destroyStoreOnDestroy: true })
-    } catch (e) { return fail(e) }
+  }, 6000);
 
-    log('adicionado', key.slice(0, 8), name || '')
+  job.timers.push(setTimeout(function () {
+    if (job.state === 'pronto') return;
+    job.message = 'Metadados demorando. Tentando trackers alternativos...';
+  }, 14000));
 
-    entry.timer = setTimeout(() => {
-      const peers = entry.torrent ? entry.torrent.numPeers : 0
-      fail(new Error(peers
-        ? `Os ${peers} peers conectados nao enviaram os metadados em ${METADATA_TIMEOUT / 1000}s. Tente outra fonte.`
-        : `Nenhum peer encontrado em ${METADATA_TIMEOUT / 1000}s. Tente outra qualidade ou fonte.`))
-    }, METADATA_TIMEOUT)
+  job.timers.push(setTimeout(function () {
+    if (job.state === 'pronto') return;
+    if (job.tentativas < 2) {
+      job.tentativas += 1;
+      job.message = 'Tentativa ' + job.tentativas + ' expirada. Reiniciando...';
+      restart(job);
+    } else {
+      job.state = 'erro';
+      job.message = 'Tempo esgotado: nenhum peer respondeu. Tente outra fonte.';
+      limparTimers(job);
+    }
+  }, METADATA_TIMEOUT));
 
-    entry.torrent.once('metadata', () => log('metadados ok', key.slice(0, 8)))
-    entry.torrent.once('ready', () => {
-      if (settled) return
-      settled = true
-      clearTimeout(entry.timer)
-      log('pronto', key.slice(0, 8), entry.torrent.files.length, 'arquivo(s)')
-      resolve(entry.torrent)
-    })
-    entry.torrent.on('error', err => fail(err))
-  })
+  torrent.on('metadata', function () {
+    job.state = 'metadados';
+    job.message = 'Metadados recebidos. Selecionando video...';
+    setTimeout(function () { onReady(job); }, 400);
+  });
 
-  registry.set(key, entry)
-  entry.ready.catch(() => {})
-  return entry.ready
-}
+  torrent.on('ready', function () { onReady(job); });
+  torrent.on('noPeers', function () { job.message = 'Sem peers no momento, reforcando trackers...'; });
+  torrent.on('wire', function () { job.peers = torrent.numPeers || 0; });
 
-export async function stop(hash) {
-  const key = String(hash || '').toLowerCase()
-  const entry = registry.get(key)
-  registry.delete(key)
-  if (entry) clearTimeout(entry.timer)
-  try { await client.remove(key, { destroyStore: true }) } catch {}
-}
-
-export const active = () => registry.size
-
-export function status(hash) {
-  const entry = registry.get(String(hash || '').toLowerCase())
-  if (!entry) return { state: 'idle', ready: false }
-  entry.lastUsed = Date.now()
-  const t = entry.torrent
-  if (!t || !t.ready) {
-    return { state: 'metadata', ready: false, peers: t ? t.numPeers : 0, progress: 0, name: entry.name }
-  }
-  return {
-    state: 'ready', ready: true, name: t.name,
-    progress: t.progress, downloaded: t.downloaded, length: t.length,
-    downloadSpeed: t.downloadSpeed, uploadSpeed: t.uploadSpeed,
-    peers: t.numPeers, timeRemaining: t.timeRemaining
-  }
-}
-
-/* ---------- arquivos ---------- */
-
-export function listFiles(torrent) {
-  const files = torrent.files || []
-  const vids = files.map((f, i) => ({ f, i })).filter(({ f }) => VIDEO_RE.test(f.name) && f.length > 0)
-  const big = vids.filter(({ f }) => f.length > 30e6)
-  const pool = big.length ? big : vids
-  let main = null
-  for (const v of pool) if (!main || v.f.length > main.f.length) main = v
-  return {
-    name: torrent.name,
-    main: main ? main.i : null,
-    files: files.map((f, i) => ({
-      i, name: f.name, length: f.length,
-      kind: VIDEO_RE.test(f.name) ? 'video' : SUB_RE.test(f.name) ? 'sub' : 'other'
-    }))
-  }
-}
-
-export function pickVideo(torrent, index) {
-  const { main } = listFiles(torrent)
-  if (index !== undefined && index !== null && index !== '') {
-    const i = Number(index)
-    const f = torrent.files[i]
-    if (f && VIDEO_RE.test(f.name)) return { file: f, index: i }
-  }
-  if (main === null) return null
-  return { file: torrent.files[main], index: main }
-}
-
-function subLangGuess(name) {
-  const s = String(name).toLowerCase()
-  if (/pt[-_ .]?br|ptbr|portugu[eÃª]s[-_ ]?br|brazil|pob/.test(s)) return 'pt-BR'
-  if (/portugu|portugues|\bpt\b|\bpor\b/.test(s)) return 'pt'
-  if (/english|\beng\b|\ben\b/.test(s)) return 'en'
-  if (/spanish|espa|\bes\b|\bspa\b/.test(s)) return 'es'
-  if (/italian|\bita\b/.test(s)) return 'it'
-  if (/french|\bfra\b|\bfre\b/.test(s)) return 'fr'
-  if (/german|deutsch|\bger\b|\bdeu\b/.test(s)) return 'de'
-  return ''
-}
-
-export function externalSubs(torrent) {
-  return (torrent.files || []).map((f, i) => ({ f, i }))
-    .filter(({ f }) => SUB_RE.test(f.name) && f.length < 5e6)
-    .map(({ f, i }) => {
-      const lang = subLangGuess(f.name)
-      return { kind: 'file', i, name: f.name, lang, label: langName(lang) || f.name.split('/').pop() }
-    })
-}
-
-export function mediaInfo(p) {
-  if (!p) return null
-  return {
-    duration: p.duration,
-    format: p.format,
-    video: p.video,
-    audios: p.audios.map(a => ({
-      i: a.i, codec: a.codec, channels: a.channels, lang: a.lang,
-      label: [a.title, langName(a.lang)].filter(Boolean).join(' / ') || `Faixa ${a.i + 1}`
-    })),
-    subs: p.subs.map(s => ({
-      i: s.i, codec: s.codec, lang: s.lang,
-      label: [s.title, langName(s.lang)].filter(Boolean).join(' / ') || `Legenda ${s.i + 1}`,
-      text: ['subrip', 'srt', 'ass', 'ssa', 'mov_text', 'webvtt', 'text'].includes(String(s.codec).toLowerCase())
-    }))
-  }
-}
-
-export function getProbe(torrent, file) {
-  const key = `${torrent.infoHash}:${file.name}`
-  const hit = probeCache.get(key)
-  if (hit && Date.now() - hit.at < 20 * 60e3) return hit.promise
-  const promise = (async () => {
-    if (!(await ensureFfmpeg())) return null
-    const cap = Math.max(512 * 1024, Math.min(file.length, PROBE_BYTES))
-    return probe(() => file.createReadStream({ start: 0, end: cap - 1 }))
-  })()
-  probeCache.set(key, { promise, at: Date.now() })
-  return promise
-}
-
-export async function decideMode(torrent, file, { wantAudio = false, hint = '' } = {}) {
-  const p = await getProbe(torrent, file)
-  const vc = String(p?.video?.codec || hint || '').toLowerCase()
-  const audios = p?.audios || []
-  const audioOk = audios.length === 0 || audios.every(a => SAFE_A.includes(String(a.codec).toLowerCase()))
-  const singleAudio = audios.length <= 1
-  const containerOk = DIRECT_RE.test(file.name)
-  if (containerOk && SAFE_V.includes(vc) && audioOk && singleAudio && !wantAudio) return 'direct'
-  if (vc === 'h264' || vc === 'vp9' || vc === 'av1') return 'remux'
-  if (!vc) return 'remux'
-  return 'transcode'
-}
-
-/* ---------- entrega: direto (range) ---------- */
-
-function serveDirect(file, req, res) {
-  const total = file.length
-  const ext = (file.name.split('.').pop() || '').toLowerCase()
-  const base = {
-    'Accept-Ranges': 'bytes',
-    'Content-Type': MIME[ext] || 'application/octet-stream',
-    'Cache-Control': 'no-store'
-  }
-  let start = 0, end = total - 1, partial = false
-  const range = req.headers.range
-  if (range) {
-    const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim())
-    if (m && (m[1] || m[2])) {
-      if (!m[1]) { const n = Number(m[2]); start = Math.max(0, total - n) }
-      else {
-        start = Number(m[1])
-        if (m[2]) end = Math.min(Number(m[2]), total - 1)
+  torrent.on('download', function () {
+    job.progress = torrent.progress || 0;
+    job.speed = torrent.downloadSpeed || 0;
+    job.downloaded = torrent.downloaded || 0;
+    job.peers = torrent.numPeers || 0;
+    if (job.file) {
+      job.buffer = (job.file.progress || 0) * 100;
+      if (!job.canPlay) {
+        const baixado = job.file.downloaded || 0;
+        if (job.buffer >= MIN_BUFFER_PERCENT || baixado >= MIN_BUFFER_MB * 1024 * 1024) {
+          job.canPlay = true;
+          job.state = 'pronto';
+          job.message = 'Buffer pronto. Iniciando reproducao...';
+        }
       }
-      if (!Number.isFinite(start) || start < 0) start = 0
-      if (!Number.isFinite(end) || end >= total) end = total - 1
-      if (start > end) { res.writeHead(416, { 'Content-Range': `bytes */${total}` }); return res.end() }
-      partial = true
     }
-  }
-  res.writeHead(partial ? 206 : 200, {
-    ...base,
-    ...(partial ? { 'Content-Range': `bytes ${start}-${end}/${total}` } : {}),
-    'Content-Length': end - start + 1,
-    'X-Mode': 'direct'
-  })
-  if (req.method === 'HEAD') return res.end()
-  const stream = file.createReadStream({ start, end })
-  stream.on('error', e => { log('erro no stream direto:', e.message); try { res.end() } catch {} })
-  res.on('close', () => { try { stream.destroy() } catch {} })
-  stream.pipe(res)
+  });
+
+  torrent.on('error', function (err) {
+    job.state = 'erro';
+    job.message = 'Erro no torrent: ' + err.message;
+    limparTimers(job);
+  });
+
+  torrent.on('warning', function (e) { console.warn('[torrent] ' + e.message); });
 }
 
-/* ---------- entrega: remux / transcode ---------- */
-
-async function serveFfmpeg({ torrent, file, mode, audioTrack, pos, q, req, res }) {
-  const ff = ffmpegCmd()
-  const info = await getProbe(torrent, file)
-  const frac = Math.min(0.995, Math.max(0, Number(pos) || 0))
-  const isMp4 = /mp4|mov|m4a|3gp|isom/.test(String(info?.format || '').toLowerCase())
-  const duration = info?.duration || 0
-
-  let start = 0
-  if (!isMp4 && frac > 0.002) {
-    const piece = torrent.pieceLength || 1
-    start = Math.floor((file.length * frac) / piece) * piece
-    if (start >= file.length) start = Math.max(0, file.length - piece)
-  }
-
-  const args = ['-hide_banner', '-loglevel', 'error', '-probesize', '4M', '-analyzeduration', '4M', '-fflags', '+genpts']
-  if (frac > 0.002 && duration) args.push('-ss', (frac * duration).toFixed(3))
-  args.push('-i', 'pipe:0', '-map', '0:v:0')
-
-  const audios = info?.audios || []
-  const aIdx = Math.min(Math.max(0, Number(audioTrack) || 0), Math.max(0, audios.length - 1))
-  args.push('-map', audios.length ? `0:a:${aIdx}` : '0:a:0?')
-
-  if (mode === 'transcode') {
-    if (q === '720' || q === '480') args.push('-vf', `scale=-2:${q}`)
-    args.push('-c:v', 'libx264', '-preset', PRESET, '-crf', CRF,
-      '-pix_fmt', 'yuv420p', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0')
-  } else {
-    args.push('-c:v', 'copy')
-    if (info?.video?.codec === 'hevc') args.push('-tag:v', 'hvc1')
-  }
-  args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-sn',
-    '-max_muxing_queue_size', '4096', '-avoid_negative_ts', 'make_zero',
-    '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', 'pipe:1')
-
-  res.writeHead(200, {
-    'Content-Type': 'video/mp4',
-    'Cache-Control': 'no-store',
-    'Accept-Ranges': 'none',
-    'X-Mode': mode
-  })
-
-  const proc = spawn(ff, args, { stdio: ['pipe', 'pipe', 'pipe'] })
-  const input = file.createReadStream({ start, end: file.length - 1 })
-  input.on('error', () => {})
-  proc.stdin.on('error', () => {})
-  proc.stdout.on('error', () => {})
-  input.pipe(proc.stdin)
-  proc.stdout.pipe(res)
-
-  let err = ''
-  proc.stderr.on('data', d => { err += d; if (err.length > 4000) err = err.slice(-4000) })
-
-  const kill = () => { try { proc.kill('SIGKILL') } catch {}; try { input.destroy() } catch {} }
-  res.on('close', kill)
-  proc.on('close', code => {
-    if (code && code !== 0) log(`ffmpeg/${mode} saida ${code}: ${err.trim().split('\n').pop() || ''}`)
-    if (!res.writableEnded) res.end()
-  })
+function restart(job) {
+  limparTimers(job);
+  try { if (job.torrent) job.torrent.destroy({ destroyStore: false }); } catch (e) { }
+  job.torrent = null;
+  job.state = 'conectando';
+  job.peers = 0;
+  setTimeout(function () { if (job.state !== 'pronto' && !job.torrent) attach(job); }, 500);
 }
 
-export async function serveMedia({ torrent, fileIndex, mode = 'auto', audioTrack = 0, pos = 0, q = '', hint = '', req, res }) {
-  const picked = pickVideo(torrent, fileIndex)
-  if (!picked) { res.status(404).json({ error: 'Nenhum arquivo de video neste torrent.' }); return }
-  const { file } = picked
-  const wantAudio = Number(audioTrack) > 0
-
-  let m = mode
-  if (m === 'auto') m = await decideMode(torrent, file, { wantAudio, hint })
-  if (m === 'direct' && wantAudio) m = 'remux'
-  if (m !== 'direct' && !(await ensureFfmpeg())) {
-    log('ffmpeg indisponivel, caindo para direto')
-    m = 'direct'
+function pickFile(torrent, fileIdx) {
+  const files = torrent.files || [];
+  if (!files.length) return null;
+  if (fileIdx !== null && fileIdx >= 0 && files[fileIdx]) {
+    const candidato = files[fileIdx];
+    if (VIDEO_EXT.test(candidato.name)) return candidato;
+    const vids = files.filter(function (f) { return VIDEO_EXT.test(f.name); });
+    if (vids.length <= 1) return candidato;
   }
-  log('stream', file.name.slice(0, 40), 'modo=' + m, 'audio=' + audioTrack, 'pos=' + pos)
-  if (m === 'direct') return serveDirect(file, req, res)
-  return serveFfmpeg({ torrent, file, mode: m, audioTrack, pos, q, req, res })
+  const vids = files.filter(function (f) { return VIDEO_EXT.test(f.name); });
+  const pool = vids.length ? vids : files;
+  return pool.slice().sort(function (a, b) { return b.length - a.length; })[0] || null;
 }
 
-/* ---------- diagnostico ---------- */
+function onReady(job) {
+  if (job.file) return;
+  const torrent = job.torrent;
+  if (!torrent) return;
 
-function readBytes(file, n, ms) {
-  return new Promise((resolve, reject) => {
-    const end = Math.min(n, file.length) - 1
-    const stream = file.createReadStream({ start: 0, end })
-    let got = 0
-    let done = false
-    const finish = err => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      try { stream.destroy() } catch {}
-      err ? reject(err) : resolve(got)
-    }
-    const timer = setTimeout(() => finish(), ms)
-    stream.on('data', c => {
-      got += c.length
-      if (got >= n) finish()
-    })
-    stream.on('error', e => finish(e))
-    stream.on('end', () => finish())
-  })
+  const file = pickFile(torrent, job.fileIdx);
+  if (!file) {
+    job.state = 'erro';
+    job.message = 'Nenhum arquivo de video neste torrent.';
+    limparTimers(job);
+    return;
+  }
+
+  job.file = file;
+  job.fileName = file.name;
+  job.total = file.length;
+  job.streamUrl = '/api/play/stream?jobId=' + job.id;
+  job.state = 'bufferizando';
+  job.message = 'Conectando aos peers (buffer)...';
+
+  try { file.select(); } catch (e) { }
+  (torrent.files || []).forEach(function (f) {
+    if (f !== file) { try { f.deselect(); } catch (e) { } }
+  });
 }
 
-export async function diagnose(hash, name = '') {
-  const out = { hash, name, steps: [], errors: [] }
-  const step = (label, ok, extra = {}) => out.steps.push({ label, ok, ...extra })
-  const t0 = Date.now()
-  let torrent
+/* ------------------------------- HTTP ------------------------------ */
+
+function handle(jobId, req, res) {
+  const job = jobs.get(jobId);
+  if (!job) { res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Job nao encontrado.'); return; }
+  job.lastAccess = agora();
+
+  if (job.state === 'erro') { res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end(job.message); return; }
+
+  const file = job.file;
+  if (!file) { res.writeHead(202, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Aguardando metadados...'); return; }
+
+  const total = file.length;
+  const base = {
+    'content-type': mimeFor(file.name),
+    'accept-ranges': 'bytes',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+    'access-control-expose-headers': 'content-range,content-length,accept-ranges'
+  };
+
+  if (req.method === 'HEAD') {
+    res.writeHead(200, Object.assign({ 'content-length': total }, base));
+    res.end();
+    return;
+  }
+
+  const range = req.headers.range;
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range);
+    let start = m && m[1] ? parseInt(m[1], 10) : 0;
+    let end = m && m[2] ? parseInt(m[2], 10) : total - 1;
+    if (isNaN(start) || start < 0) start = 0;
+    if (isNaN(end) || end >= total) end = total - 1;
+    if (start > end) { res.writeHead(416, Object.assign({ 'content-range': 'bytes */' + total }, base)); res.end(); return; }
+    res.writeHead(206, Object.assign({
+      'content-range': 'bytes ' + start + '-' + end + '/' + total,
+      'content-length': end - start + 1
+    }, base));
+    const stream = file.createReadStream({ start: start, end: end });
+    stream.on('error', function () { try { res.end(); } catch (e) { } });
+    res.on('close', function () { try { stream.destroy(); } catch (e) { } });
+    stream.pipe(res);
+    return;
+  }
+
+  res.writeHead(200, Object.assign({ 'content-length': total }, base));
+  const stream = file.createReadStream();
+  stream.on('error', function () { try { res.end(); } catch (e) { } });
+  res.on('close', function () { try { stream.destroy(); } catch (e) { } });
+  stream.pipe(res);
+}
+
+/* ------------------------------ status ----------------------------- */
+
+function status(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return null;
+  job.lastAccess = agora();
+  const t = job.torrent;
+  return {
+    id: job.id,
+    state: job.state,
+    message: job.message,
+    titulo: job.titulo,
+    qualidade: job.qualidade,
+    fileName: job.fileName,
+    peers: t ? (t.numPeers || 0) : job.peers,
+    progress: t ? (t.progress || 0) : 0,
+    buffer: job.buffer || 0,
+    speed: t ? (t.downloadSpeed || 0) : 0,
+    downloaded: t ? (t.downloaded || 0) : 0,
+    total: job.total || 0,
+    canPlay: !!job.canPlay,
+    minBuffer: MIN_BUFFER_PERCENT,
+    elapsed: Math.round((agora() - job.createdAt) / 1000),
+    streamUrl: job.streamUrl
+  };
+}
+
+function stop(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return false;
+  limparTimers(job);
+  jobs.delete(jobId);
+
+  const dir = job.dir;
+  const finalizar = function () {
+    if (CACHE_MODE === 'keep') return;
+    apagarPasta(dir);
+  };
+
   try {
-    torrent = await ensureTorrent(hash, name)
-    step('metadados do torrent', true, { ms: Date.now() - t0 })
-  } catch (e) {
-    step('metadados do torrent', false, { ms: Date.now() - t0, error: e.message })
-    out.errors.push(e.message)
-    out.ffmpeg = ffmpegInfo()
-    return out
-  }
-  const st = status(hash)
-  out.peers = st.peers
-  out.progress = st.progress
-  step('peers conectados', st.peers > 0, { peers: st.peers })
-  const list = listFiles(torrent)
-  step('arquivos de video', list.main !== null, { total: list.files.length, escolhido: list.main })
-  const picked = pickVideo(torrent, list.main)
-  if (!picked) {
-    out.errors.push('nenhum arquivo de video')
-    out.ffmpeg = ffmpegInfo()
-    return out
-  }
-  out.file = { nome: picked.file.name, bytes: picked.file.length }
-  const ff = await ensureFfmpeg()
-  out.ffmpeg = ffmpegInfo()
-  step('ffmpeg', ff, { fonte: ffmpegInfo().source })
-  const t1 = Date.now()
-  try {
-    const got = await readBytes(picked.file, 128 * 1024, 30000)
-    step('leitura dos primeiros bytes', got > 0, { bytes: got, ms: Date.now() - t1 })
-  } catch (e) {
-    step('leitura dos primeiros bytes', false, { ms: Date.now() - t1, error: e.message })
-    out.errors.push('leitura: ' + e.message)
-  }
-  const p = await getProbe(torrent, picked.file)
-  step('ffprobe', Boolean(p), p ? { duracao: p.duration, video: p.video?.codec || null, audios: p.audios.length, legendas: p.subs.length } : {})
-  out.media = mediaInfo(p)
-  out.modoSugerido = await decideMode(torrent, picked.file)
-  return out
+    if (job.torrent) job.torrent.destroy({ destroyStore: true }, function () { finalizar(); });
+    else finalizar();
+  } catch (e) { finalizar(); }
+  return true;
 }
 
-/* ---------- legendas ---------- */
-
-function decodeText(buf) {
-  let t = buf.toString('utf8')
-  if (t.includes('\uFFFD')) { try { t = new TextDecoder('windows-1252').decode(buf) } catch {} }
-  return t.replace(/^\uFEFF/, '')
+function destruirMaisAntigo() {
+  let alvo = null;
+  jobs.forEach(function (j) { if (!alvo || j.lastAccess < alvo.lastAccess) alvo = j; });
+  if (alvo) stop(alvo.id);
 }
 
-function srtToVtt(text) {
-  const body = text.replace(/\r+/g, '')
-    .replace(/^(\d+)[ \t]*$/gm, '')
-    .replace(/(\d{1,2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')
-  return 'WEBVTT\n\n' + body.trim() + '\n'
+function stopTudo() {
+  Array.from(jobs.keys()).forEach(function (id) { stop(id); });
 }
 
-function assTime(t) {
-  const m = /(\d+):(\d{2}):(\d{2})[.:](\d+)/.exec(t || '')
-  if (!m) return '00:00:00.000'
-  return `${m[1].padStart(2, '0')}:${m[2]}:${m[3]}.${m[4].padEnd(3, '0').slice(0, 3)}`
-}
+setInterval(function () {
+  const t = agora();
+  jobs.forEach(function (j) { if (t - j.lastAccess > IDLE_TIMEOUT) { console.log('[streamer] job ocioso encerrado ' + j.id); stop(j.id); } });
+}, 45000);
 
-function assToVtt(text) {
-  const cues = []
-  for (const line of text.split(/\r?\n/)) {
-    const m = /^Dialogue:\s*([^,]*),([^,]*),([^,]*),([^,]*),([^,]*),([^,]*),([^,]*),([^,]*),([^,]*),(.*)$/.exec(line)
-    if (!m) continue
-    const txt = m[10].replace(/\{[^}]*\}/g, '').replace(/\\N/gi, '\n').replace(/\\n/gi, '\n')
-    cues.push(`${assTime(m[2])} --> ${assTime(m[3])}\n${txt}`)
-  }
-  return 'WEBVTT\n\n' + cues.join('\n\n') + '\n'
-}
+process.on('SIGINT', function () { try { client.destroy(); } catch (e) { } stopTudo(); process.exit(0); });
+process.on('SIGTERM', function () { try { client.destroy(); } catch (e) { } stopTudo(); process.exit(0); });
 
-export async function externalSubVtt(torrent, fileIndex) {
-  const f = torrent.files[Number(fileIndex)]
-  if (!f || !SUB_RE.test(f.name)) throw new Error('legenda nao encontrada')
-  const text = decodeText(Buffer.from(await f.arrayBuffer()))
-  return /\.(ass|ssa)$/i.test(f.name) ? assToVtt(text) : srtToVtt(text)
-}
-
-export async function embeddedSubVtt(torrent, file, track) {
-  if (!(await ensureFfmpeg())) throw new Error('ffmpeg nao encontrado')
-  const safe = file.name.replace(/[^\w.-]/g, '_')
-  const out = path.join(SUBS_DIR, `${torrent.infoHash}-${safe}-s${track}.vtt`)
-  if (fs.existsSync(out)) return fs.readFileSync(out, 'utf8')
-  if (subJobs.has(out)) return subJobs.get(out)
-
-  const job = new Promise((resolve, reject) => {
-    const tmp = out + '.tmp'
-    const args = ['-hide_banner', '-loglevel', 'error', '-probesize', '4M', '-analyzeduration', '4M',
-      '-i', 'pipe:0', '-map', `0:s:${Number(track)}`, '-f', 'webvtt', tmp]
-    const proc = spawn(ffmpegCmd(), args, { stdio: ['pipe', 'ignore', 'pipe'] })
-    const input = file.createReadStream({ start: 0, end: file.length - 1 })
-    let err = ''
-    input.on('error', () => {})
-    proc.stdin.on('error', () => {})
-    input.pipe(proc.stdin)
-    proc.stderr.on('data', d => { err += d })
-    proc.on('error', reject)
-    proc.on('close', code => {
-      try { input.destroy() } catch {}
-      if (code !== 0) return reject(new Error('falha ao extrair legenda: ' + err.trim().split('\n').pop()))
-      try { fs.renameSync(tmp, out); resolve(fs.readFileSync(out, 'utf8')) } catch (e) { reject(e) }
-    })
-  }).finally(() => subJobs.delete(out))
-
-  subJobs.set(out, job)
-  return job
-}
-
-/* ---------- limpeza por ociosidade ---------- */
-
-setInterval(() => {
-  const now = Date.now()
-  for (const [key, entry] of registry) {
-    if (now - entry.lastUsed > IDLE_MINUTES * 60e3) {
-      registry.delete(key)
-      clearTimeout(entry.timer)
-      client.remove(key, { destroyStore: true }).catch(() => {})
-    }
-  }
-}, 15e3).unref()
-
-export function destroyClient() { try { client.destroy() } catch {} }
-
-/* ---------- liberacao de espaco ---------- */
-
-export async function stopAll() {
-  const keys = [...registry.keys()]
-  await Promise.all(keys.map(k => stop(k).catch(() => {})))
-  return keys.length
-}
-
-export function storageInfo() {
-  let bytes = 0, dirs = 0, files = 0
-  const walk = dir => {
-    let ents
-    try { ents = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
-    for (const e of ents) {
-      const p = path.join(dir, e.name)
-      if (e.isDirectory()) { dirs++; walk(p) }
-      else { files++; try { bytes += fs.statSync(p).size } catch {} }
-    }
-  }
-  walk(DOWNLOAD_DIR)
-  return { bytes, dirs, files, active: registry.size }
-}
+module.exports = { start: start, status: status, stop: stop, stopTudo: stopTudo, handle: handle, jobs: jobs, CACHE_ROOT: CACHE_ROOT };

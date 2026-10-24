@@ -1,4252 +1,2557 @@
 ﻿<#
-============================================================================
- cinep2p :: atualizar.ps1
- Reestruturacao total do nucleo de scraping/busca para PT-BR
- ---------------------------------------------------------------------------
- Alvos : filmes | series | animes | doramas | novelas | curtas
- Fluxo : catalogo -> busca multi-fonte -> score -> magnet -> WebTorrent
-         -> stream sequencial -> remux/transcode FFmpeg -> player browser
- ---------------------------------------------------------------------------
- Uso   : .\atualizar.ps1
-         .\atualizar.ps1 -Raiz "C:\projetos\cinep2p" -SemNpm
-         .\atualizar.ps1 -Forcar -ManterCRLF
+    CineP2P 4.0 - PT-BR RIGOROSO + Player imediato (30s / legendas) + concorrencia total
+    -----------------------------------------------------------------------------------
+    Executa SOBRE a versao anterior (CineP2P 3.0).
 
- NOTA  : todo conteudo de arquivo usa Here-String SIMPLES (@' ... '@)
-         portanto nada e interpolado pelo PowerShell. Regra de ouro
-         mantida: nenhuma linha de codigo JS/CSS pode comecar com '@
-============================================================================
+    Novidades desta rodada:
+      * Classificador rigoroso de audio brasileiro (antidublagem estrangeira)
+      * Registro de confianca por fonte (trackers nacionais = PT-BR nativo)
+      * 3 scrapers nacionais novos (RedeTorrent, BluDV, TorrentDosFilmes)
+      * Selecao automatica do melhor magnet PT-BR (sem modal intermediario)
+      * Player abre IMEDIATAMENTE e carrega tudo dentro da area do video
+      * Controles: +/-30s, seek, volume, fullscreen e seletor de LEGENDAS
+      * Legendas: arquivos do proprio torrent (.srt/.ass/.vtt) convertidos p/ VTT
+      * Limpeza absoluta de disco mantida (cache/<jobId> destruido ao sair)
+
+    Uso:  powershell -ExecutionPolicy Bypass -File .\atualizar.ps1
+    Flags: -SkipInstall  -Root <pasta>
 #>
-
 [CmdletBinding()]
 param(
-    [string] $Raiz,
-    [switch] $SemBackup,
-    [switch] $SemNpm,
-    [switch] $Forcar,
-    [switch] $ManterCRLF
+    [switch]$SkipInstall,
+    [string]$Root
 )
 
+# ----------------------------------------------------------------------
+if ($PSVersionTable.PSVersion.Major -le 5 -and -not $env:CINEP2P_UTF8) {
+    try {
+        $selfPath = $MyInvocation.MyCommand.Path
+        if ($selfPath -and (Test-Path -LiteralPath $selfPath)) {
+            $raw = [System.IO.File]::ReadAllBytes($selfPath)
+            $hasBom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
+            $hasNonAscii = $false
+            foreach ($b in $raw) { if ($b -gt 127) { $hasNonAscii = $true; break } }
+            if (-not $hasBom -and $hasNonAscii) {
+                $text = [System.Text.Encoding]::UTF8.GetString($raw)
+                $tmp = Join-Path $env:TEMP ('cinep2p-' + [guid]::NewGuid().ToString('N') + '.ps1')
+                [System.IO.File]::WriteAllText($tmp, $text, [System.Text.UTF8Encoding]::new($true))
+                $env:CINEP2P_UTF8 = '1'
+                Write-Host 'Reexecutando com codificacao UTF-8...' -ForegroundColor DarkGray
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $tmp @args
+                exit $LASTEXITCODE
+            }
+        }
+    } catch { }
+}
+
 $ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'
 
-# ---------------------------------------------------------------------------
-# Resolucao de raiz
-# ---------------------------------------------------------------------------
-if ([string]::IsNullOrWhiteSpace($Raiz)) {
-    if ($PSScriptRoot) { $Raiz = $PSScriptRoot } else { $Raiz = (Get-Location).Path }
-}
-if (-not (Test-Path -LiteralPath $Raiz)) {
-    throw "Pasta raiz nao encontrada: $Raiz"
-}
-$Raiz = (Resolve-Path -LiteralPath $Raiz).Path
+if (-not $Root -or $Root.Trim() -eq '') { $Root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $Root -or $Root.Trim() -eq '') { $Root = (Get-Location).Path }
+if (-not (Test-Path -LiteralPath $Root)) { throw "Pasta nao encontrada: $Root" }
+Set-Location -LiteralPath $Root
 
-$script:Marcador = Get-Date -Format 'yyyyMMdd-HHmmss'
-$script:PastaBackup = Join-Path $Raiz ('.backup\' + $script:Marcador)
-$script:TotalGravado = 0
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
-# ---------------------------------------------------------------------------
-# Helpers de console
-# ---------------------------------------------------------------------------
-function Escrever-Cabecalho {
-    param([string] $Texto)
-    Write-Host ''
-    Write-Host ('-' * 78) -ForegroundColor DarkGray
-    Write-Host ('  ' + $Texto) -ForegroundColor Cyan
-    Write-Host ('-' * 78) -ForegroundColor DarkGray
-}
-function Escrever-Ok    { param([string] $m) Write-Host ('   [ok]  ' + $m) -ForegroundColor Green }
-function Escrever-Info  { param([string] $m) Write-Host ('   [..]  ' + $m) -ForegroundColor Gray }
-function Escrever-Aviso { param([string] $m) Write-Host ('   [!!]  ' + $m) -ForegroundColor Yellow }
-function Escrever-Erro  { param([string] $m) Write-Host ('   [xx]  ' + $m) -ForegroundColor Red }
-
-# ---------------------------------------------------------------------------
-# Validacao do alvo
-# ---------------------------------------------------------------------------
-Escrever-Cabecalho 'cinep2p :: ATUALIZADOR DE NUCLEO  (PT-BR / multi-fonte)'
-
-$indicios = @('package.json', 'server.js', 'public', 'src') |
-    Where-Object { Test-Path -LiteralPath (Join-Path $Raiz $_) }
-
-if ($indicios.Count -eq 0 -and -not $Forcar) {
-    Escrever-Aviso "Nenhum arquivo tipico do cinep2p encontrado em: $Raiz"
-    Escrever-Aviso "Rode com -Forcar para gravar assim mesmo."
-    $resposta = Read-Host '  Continuar? (s/N)'
-    if ($resposta -notmatch '^(s|S|y|Y)') { exit 1 }
+function Write-ProjectFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content
+    )
+    $full = Join-Path $Root $RelativePath
+    $dir = Split-Path -Parent $full
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    [System.IO.File]::WriteAllText($full, $Content, $Utf8NoBom)
+    Write-Host ("  [ok] " + $RelativePath) -ForegroundColor DarkGray
 }
 
-Escrever-Info "Raiz do projeto : $Raiz"
-if (-not $SemBackup) { Escrever-Info "Backup           : $script:PastaBackup" }
-Escrever-Info ("Line endings     : " + $(if ($ManterCRLF) { 'CRLF (mantido)' } else { 'LF (normalizado)' }))
+function Write-Step { param([string]$Text) Write-Host ''; Write-Host ("== " + $Text) -ForegroundColor Cyan }
 
-# ---------------------------------------------------------------------------
-# Mapa de arquivos -> conteudo
-# ---------------------------------------------------------------------------
-$Arquivos = [ordered]@{}
+Write-Host ''
+Write-Host '  CineP2P 4.0 - PT-BR rigoroso + player imediato' -ForegroundColor White
+Write-Host '  ----------------------------------------------' -ForegroundColor DarkGray
 
-# ===========================================================================
-#  package.json
-# ===========================================================================
-$Arquivos['package.json'] = @'
-{
-  "name": "cinep2p",
-  "version": "3.0.0",
-  "private": true,
-  "description": "Streaming P2P de Filmes, Series, Animes, Doramas e Novelas em PT-BR via WebTorrent + FFmpeg",
-  "main": "server.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js",
-    "worker": "node worker.js",
-    "aquecer": "node worker.js --once",
-    "fontes": "node scripts/atualizar-fontes.js",
-    "cache:limpar": "node scripts/atualizar-fontes.js --limpar-cache"
-  },
-  "engines": {
-    "node": ">=18.17.0"
-  },
-  "dependencies": {
-    "axios": "^1.7.7",
-    "cheerio": "^1.0.0",
-    "compression": "^1.7.5",
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "ffmpeg-static": "^5.2.0",
-    "ffprobe-static": "^3.1.0",
-    "iconv-lite": "^0.6.3",
-    "morgan": "^1.10.0",
-    "webtorrent": "^2.5.1"
+# ----------------------------------------------------------------------
+Write-Step 'Backup'
+$Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$BackupDir = Join-Path $Root ('.backup-' + $Stamp)
+$madeBackup = $false
+foreach ($t in @('server.js', 'src', 'public', '.env', 'package.json')) {
+    $p = Join-Path $Root $t
+    if (Test-Path -LiteralPath $p) {
+        if (-not $madeBackup) { New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null; $madeBackup = $true }
+        Copy-Item -LiteralPath $p -Destination (Join-Path $BackupDir $t) -Recurse -Force
+    }
+}
+if ($madeBackup) { Write-Host ("  backup: " + (Split-Path -Leaf $BackupDir)) -ForegroundColor DarkGray }
+
+New-Item -ItemType Directory -Force -Path (Join-Path $Root 'src\scrapers') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $Root 'public') | Out-Null
+
+# ======================================================================
+Write-Step 'Filtro PT-BR rigoroso'
+
+# ----------------------------------------------------------------------
+$fontesJs = @'
+'use strict';
+
+/**
+ * Registro de confianca por fonte.
+ *
+ * nacional = true  -> tracker lusofono: "DUBLADO"/"NACIONAL" significa
+ *                     nativamente portugues do Brasil (nao precisa de marcador extra)
+ * regiao           -> 'br' | 'fr' | 'global' (usado para desconfiar de dublagem alheia)
+ */
+const FONTES = {
+  'Commandotorrents': { nacional: true,  regiao: 'br' },
+  'Lapumia':          { nacional: true,  regiao: 'br' },
+  'RedeTorrent':      { nacional: true,  regiao: 'br' },
+  'BluDV':            { nacional: true,  regiao: 'br' },
+  'TorrentDosFilmes': { nacional: true,  regiao: 'br' },
+
+  'Torrent9':         { nacional: false, regiao: 'fr' },
+
+  'Torrentio':        { nacional: false, regiao: 'global' },
+  'YTS':              { nacional: false, regiao: 'global' },
+  'ThePirateBay':     { nacional: false, regiao: 'global' },
+  'EZTV':             { nacional: false, regiao: 'global' },
+  'SolidTorrents':    { nacional: false, regiao: 'global' },
+  'TorrentGalaxy':    { nacional: false, regiao: 'global' },
+  '1337x':            { nacional: false, regiao: 'global' }
+};
+
+function info(nome) {
+  return FONTES[nome] || { nacional: false, regiao: 'global' };
+}
+
+module.exports = { FONTES: FONTES, info: info };
+'@
+Write-ProjectFile 'src/fontes.js' $fontesJs
+
+# ----------------------------------------------------------------------
+$ptbrJs = @'
+'use strict';
+
+/**
+ * Classificador RIGOROSO de audio brasileiro.
+ *
+ * O problema real: o mundo inteiro escreve "DUBLADO" no titulo. Um release
+ * russo/espanhol/frances tambem diz "DUBLADO". Aqui a classificacao exige
+ * prova ou desconfia explicitamente.
+ *
+ * Niveis:
+ *   confirmado  -> marcador PT-BR explicito, OU fonte nacional + DUBLADO/DUAL
+ *   provavel    -> DUAL AUDIO limpo, ou DUBLADO sem nenhum termo estrangeiro
+ *   incerto     -> DUBLADO/DUAL convivendo com idiomas estrangeiros
+ *   estrangeiro -> dublagem estrangeira declarada (russo, VF, castellano...)
+ */
+
+const fontes = require('./fontes');
+
+const RE_PTBR = [
+  /\bpt[\s._-]?br\b/i,
+  /\bptbr\b/i,
+  /\[\s?br\s?\]/i,
+  /\(\s?br\s?\)/i,
+  /\bbrasileir[ao]\b/i,
+  /\bnacional\b/i,
+  /\bportugu[eê]s\b/i,
+  /\bdublado\s?br\b/i,
+  /\bdub\s?br\b/i,
+  /\baudio[\s._-]?(pt|por)\b/i,
+  /(?:\+|\be\b)\s*(?:por|pt)\b/i,
+  /\bpor\s*\+/i,
+  /\bpt[\s._-]?pt\b/i
+];
+
+const RE_ESTRANGEIROS = [
+  { nome: 'russo',    re: /\bruss?[oa]?\b|\brus\b|\brussian\b|русск|италь/i },
+  { nome: 'espanhol', re: /\bespanhol\b|\bespa[nñ]ol\b|\bcastellano\b|\blatino\b|\besp\b|\bspa\b/i },
+  { nome: 'ingles',   re: /\bingl[eê]s\b|\benglish\b|\beng\b/i },
+  { nome: 'frances',  re: /\bfranc[eê]s\b|\bfrench\b|\btruefrench\b|\bvff?\b|\bvostfr\b/i },
+  { nome: 'alemao',   re: /\balem[aã]o\b|\bgerman\b|\bdeutsch\b/i },
+  { nome: 'italiano', re: /\bitalian[oa]\b|\bita\b/i },
+  { nome: 'hindi',    re: /\bhindi\b|\btamil\b|\btelugu\b/i },
+  { nome: 'asiatico', re: /\bjapon[eê]s\b|\bjap\b|\bchin[eê]s\b|\bchinese\b|\bkorean\b|\bkor\b/i }
+];
+
+const RE_ADJ_ESTRANGEIRO = /(dublad\w*|dual[\s._-]?audio|audio[\s._-]?dual|\bdual\b)\W{0,3}(rus\w*|esp\w*|castellano|latino|ingl\w*|english|\beng\b|franc\w*|french|vff?|alem\w*|german|deutsch|ital\w*|hindi|jap\w*|chin\w*|kor\w*)/i;
+
+const RE_ESTRANGEIRO_MAIS_PT = /(rus\w*|esp\w*|castellano|latino|ingl\w*|english|franc\w*|alem\w*|ital\w*|hindi)\s*\+\s*(por|pt|ptbr|dublado|portugu)/i;
+
+const PESOS = {
+  confirmado: 100,
+  provavel: 70,
+  incerto: 30,
+  estrangeiro: 10,
+  desconhecido: 0
+};
+
+function normalizar(txt) {
+  return ' ' + String(txt || '').replace(/[._]/g, ' ').replace(/\s+/g, ' ').toLowerCase().trim() + ' ';
+}
+
+function rotulo(nivel, sinais) {
+  if (sinais.dual) return nivel === 'confirmado' ? 'Dual Audio (PT-BR)' : (nivel === 'provavel' ? 'Dual Audio (provavel PT-BR)' : 'Dual Audio ?');
+  if (sinais.dublado) {
+    if (nivel === 'confirmado') return 'Dublado PT-BR';
+    if (nivel === 'provavel') return 'Dublado (provavel PT-BR)';
+    return 'Dublado ?';
+  }
+  if (sinais.leg) return 'Legendado';
+  return 'Original';
+}
+
+/**
+ * @param {string} titulo  nome do release
+ * @param {string} fonte   nome do indexador (para checar confianca)
+ */
+function avaliar(titulo, fonte) {
+  const t = normalizar(titulo);
+  const meta = fontes.info(fonte);
+
+  const sinais = {
+    ptbr: RE_PTBR.some(function (r) { return r.test(t); }),
+    dublado: /dublad|dublagem|\bdub\b/.test(t),
+    dual: /\bdual\b|\bmulti\b/.test(t),
+    leg: /legendad|\bleg\b|subtitulad|\bsub\b/.test(t)
+  };
+
+  const riscos = [];
+  RE_ESTRANGEIROS.forEach(function (e) { if (e.re.test(t)) riscos.push(e.nome); });
+
+  const adjEstrangeiro = RE_ADJ_ESTRANGEIRO.test(t);
+  const estrangeiroComPt = RE_ESTRANGEIRO_MAIS_PT.test(t);
+  const motivos = [];
+  let nivel;
+
+  if (estrangeiroComPt && !sinais.ptbr) {
+    nivel = 'confirmado';
+    motivos.push('idioma estrangeiro listado junto com POR/PT');
+    sinais.ptbr = true;
+  } else if (sinais.ptbr && !adjEstrangeiro) {
+    nivel = 'confirmado';
+    motivos.push('marcador PT-BR explicito');
+  } else if (sinais.ptbr) {
+    nivel = 'provavel';
+    motivos.push('marcador PT-BR com dublagem estrangeira citada');
+  } else if (meta.nacional && (sinais.dublado || sinais.dual)) {
+    nivel = 'confirmado';
+    motivos.push('fonte nacional (' + meta.regiao.toUpperCase() + ') + ' + (sinais.dual ? 'DUAL AUDIO' : 'DUBLADO'));
+  } else if (sinais.dual && riscos.length === 0) {
+    nivel = 'provavel';
+    motivos.push('DUAL AUDIO sem termo estrangeiro');
+  } else if (sinais.dual) {
+    nivel = 'incerto';
+    motivos.push('DUAL AUDIO convivendo com ' + riscos.join('/'));
+  } else if (sinais.dublado && riscos.length === 0 && meta.regiao !== 'fr') {
+    nivel = 'provavel';
+    motivos.push('DUBLADO sem termo estrangeiro');
+  } else if (sinais.dublado) {
+    nivel = 'incerto';
+    motivos.push('DUBLADO possivelmente estrangeiro (' + riscos.join('/') + ')');
+  } else if (adjEstrangeiro) {
+    nivel = 'estrangeiro';
+    motivos.push('dublagem estrangeira declarada');
+  } else if (sinais.leg) {
+    nivel = 'incerto';
+    motivos.push('legendado');
+  } else {
+    nivel = 'desconhecido';
+  }
+
+  return {
+    nivel: nivel,
+    peso: PESOS[nivel],
+    audio: rotulo(nivel, sinais),
+    motivos: motivos,
+    riscos: riscos,
+    fonteNacional: meta.nacional,
+    regiaoFonte: meta.regiao,
+    elegivel: (nivel === 'confirmado' || nivel === 'provavel')
+  };
+}
+
+module.exports = { avaliar: avaliar, PESOS: PESOS, RE_PTBR: RE_PTBR };
+'@
+Write-ProjectFile 'src/ptbr.js' $ptbrJs
+
+# ----------------------------------------------------------------------
+$rankingJs = @'
+'use strict';
+
+/**
+ * Ranking final: PT-BR confirmado > PT-BR provavel > seeders > qualidade.
+ * Deduplica por infoHash mantendo a melhor ocorrencia.
+ */
+
+const ptbr = require('./ptbr');
+
+function pesoQualidade(q) {
+  switch (String(q || '').toLowerCase()) {
+    case '2160p': return 3.2;
+    case '1080p': return 4;
+    case '720p': return 2.4;
+    case '480p': return 1;
+    default: return 1.5;
   }
 }
-'@
 
-# ===========================================================================
-#  .env.example
-# ===========================================================================
-$Arquivos['.env.example'] = @'
-# ---------------------------------------------------------------------------
-# cinep2p :: configuracao local (copie para .env ou exporte no shell)
-# ---------------------------------------------------------------------------
+const PESO_NIVEL = { confirmado: 3200, provavel: 1800, incerto: 480, estrangeiro: 90, desconhecido: 0 };
 
-# Servidor
-PORT=3000
-HOST=0.0.0.0
-
-# Armazenamento / cache P2P
-# CINE_MAX_TORRENTS   -> quantos torrents ficam ativos simultaneamente
-# CINE_IDLE_MIN       -> minutos de ociosidade antes da limpeza agressiva
-# CINE_MAX_CACHE_GB   -> teto de disco do cache antes de despejar o LRU
-CINE_MAX_TORRENTS=3
-CINE_IDLE_MIN=12
-CINE_MAX_CACHE_GB=25
-
-# Rede
-CINE_HTTP_TIMEOUT=15000
-CINE_HTTP_RETRIES=2
-CINE_FONTES_CONCORRENCIA=8
-
-# Busca
-# Somente fontes com indicio PT-BR (dublado/dual/legendado) por padrao
-CINE_APENAS_PTBR=true
-
-# Binarios externos (opcional - se vazio usa ffmpeg-static / ffprobe-static)
-FFMPEG_PATH=
-FFPROBE_PATH=
-
-# Fontes individuais podem ser desativadas
-CINE_FONTES_OFF=
-'@
-
-# ===========================================================================
-#  .gitignore
-# ===========================================================================
-$Arquivos['.gitignore'] = @'
-node_modules/
-.cache/
-.backup/
-.env
-npm-debug.log*
-yarn-error.log*
-.DS_Store
-Thumbs.db
-*.tmp
-'@
-
-# ===========================================================================
-#  src/config.js
-# ===========================================================================
-$Arquivos['src/config.js'] = @'
-'use strict';
-
-const path = require('path');
-const fs = require('fs');
-
-const RAIZ = path.resolve(__dirname, '..');
-const CACHE_DIR = process.env.CINE_CACHE_DIR || path.join(RAIZ, '.cache');
-
-function numero(valor, padrao) {
-    const n = Number(valor);
-    return Number.isFinite(n) ? n : padrao;
+function contemPalavras(titulo, alvo) {
+  if (!alvo) return false;
+  const t = String(titulo).toLowerCase();
+  return String(alvo).toLowerCase().split(/[^a-z0-9]+/)
+    .filter(function (w) { return w.length > 3; })
+    .some(function (w) { return t.indexOf(w) !== -1; });
 }
 
-function booleano(valor, padrao) {
-    if (valor === undefined || valor === null || valor === '') return padrao;
-    return /^(1|true|sim|on|yes)$/i.test(String(valor));
+function pontuar(item, ctx) {
+  let s = PESO_NIVEL[item.ptbr.nivel] || 0;
+  s += pesoQualidade(item.quality) * 340;
+  s += Math.log10(Math.max(1, item.seeders)) * 150;
+
+  if (item.ptbr.fonteNacional) s += 220;
+  if (ctx.ano && String(item.title).indexOf(String(ctx.ano)) !== -1) s += 180;
+  if (contemPalavras(item.title, ctx.titulo)) s += 150;
+  if (contemPalavras(item.title, ctx.tituloOriginal)) s += 120;
+  if (item.fileIdx !== null && item.fileIdx !== undefined) s += 60;
+  if (/(\bcam\b|\bts\b|hdcam|hdts|telesync)/i.test(item.title)) s -= 260;
+  if (item.seeders === 0) s -= 110;
+  if (item.sizeBytes && item.sizeBytes < 250 * 1024 * 1024) s -= 50;
+
+  return s;
 }
 
-function lista(valor) {
-    if (!valor) return [];
-    return String(valor).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+function normalizar(item) {
+  const nome = String(item.title || '').replace(/\s+/g, ' ').trim();
+  return {
+    title: nome || 'Torrent',
+    magnet: item.magnet,
+    hash: String(item.hash || '').toLowerCase(),
+    quality: item.quality || '',
+    size: item.size || '',
+    sizeBytes: item.sizeBytes || 0,
+    seeders: Number(item.seeders || 0),
+    fileIdx: (item.fileIdx === null || item.fileIdx === undefined) ? null : item.fileIdx,
+    source: item.source || 'Desconhecida',
+    score: 0,
+    ptbr: null,
+    elegivel: false
+  };
 }
 
-const config = {
-    RAIZ,
-    CACHE_DIR,
-    TORRENT_DIR: process.env.CINE_TORRENT_DIR || path.join(CACHE_DIR, 'torrents'),
-    CATALOGO_ARQ: process.env.CINE_CATALOGO_ARQ || path.join(CACHE_DIR, 'catalogo.json'),
-
-    PORT: numero(process.env.PORT, 3000),
-    HOST: process.env.HOST || '0.0.0.0',
-
-    MAX_TORRENTS_ATIVOS: numero(process.env.CINE_MAX_TORRENTS, 3),
-    TORRENT_IDLE_MIN: numero(process.env.CINE_IDLE_MIN, 12),
-    MAX_CACHE_GB: numero(process.env.CINE_MAX_CACHE_GB, 25),
-
-    HTTP_TIMEOUT: numero(process.env.CINE_HTTP_TIMEOUT, 15000),
-    HTTP_RETRIES: numero(process.env.CINE_HTTP_RETRIES, 2),
-    FONTES_CONCORRENCIA: numero(process.env.CINE_FONTES_CONCORRENCIA, 8),
-
-    APENAS_PTBR: booleano(process.env.CINE_APENAS_PTBR, true),
-    FONTES_OFF: lista(process.env.CINE_FONTES_OFF),
-
-    FFMPEG_PATH: process.env.FFMPEG_PATH || null,
-    FFPROBE_PATH: process.env.FFPROBE_PATH || null,
-
-    TTL_BUSCA_MS: numero(process.env.CINE_TTL_BUSCA_MS, 10 * 60 * 1000),
-    TTL_STATUS_MS: numero(process.env.CINE_TTL_STATUS_MS, 60 * 1000)
-};
-
-fs.mkdirSync(config.CACHE_DIR, { recursive: true });
-fs.mkdirSync(config.TORRENT_DIR, { recursive: true });
-
-module.exports = config;
-'@
-
-# ===========================================================================
-#  src/util/logger.js
-# ===========================================================================
-$Arquivos['src/util/logger.js'] = @'
-'use strict';
-
-const NIVEIS = { erro: 0, aviso: 1, info: 2, debug: 3 };
-const ATUAL = NIVEIS[(process.env.CINE_LOG || 'info').toLowerCase()] ?? NIVEIS.info;
-
-function carimbo() {
-    return new Date().toISOString().replace('T', ' ').slice(0, 19);
-}
-
-function emitir(nivel, escopo, args) {
-    if (NIVEIS[nivel] > ATUAL) return;
-    const rotulo = nivel.toUpperCase().padEnd(5, ' ');
-    const linha = '[' + carimbo() + '] ' + rotulo + ' ' + escopo.padEnd(14, ' ') + ' ::';
-    const fn = nivel === 'erro' ? console.error : nivel === 'aviso' ? console.warn : console.log;
-    fn(linha, ...args);
-}
-
-function criar(escopo) {
-    return {
-        erro: (...a) => emitir('erro', escopo, a),
-        aviso: (...a) => emitir('aviso', escopo, a),
-        info: (...a) => emitir('info', escopo, a),
-        debug: (...a) => emitir('debug', escopo, a)
-    };
-}
-
-module.exports = { criar, log: criar('cinep2p') };
-'@
-
-# ===========================================================================
-#  src/util/magnet.js
-# ===========================================================================
-$Arquivos['src/util/magnet.js'] = @'
-'use strict';
-
-const ALFABETO_B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-
-const TRACKERS_PADRAO = [
-    'udp://tracker.opentrackr.org:1337/announce',
-    'udp://open.tracker.cl:1337/announce',
-    'udp://open.demonii.com:1337/announce',
-    'udp://tracker.openbittorrent.com:6969/announce',
-    'udp://exodus.desync.com:6969/announce',
-    'udp://tracker.torrent.eu.org:451/announce',
-    'udp://tracker.dler.org:6969/announce',
-    'udp://9.rarbg.com:2710/announce',
-    'udp://opentracker.io:6969/announce',
-    'http://tracker.openbittorrent.com:80/announce',
-    'wss://tracker.openwebtorrent.com',
-    'wss://tracker.btorrent.xyz'
-];
-
-function base32ParaHex(base32) {
-    let bits = '';
-    const texto = String(base32 || '').toUpperCase();
-    for (let i = 0; i < texto.length; i++) {
-        const valor = ALFABETO_B32.indexOf(texto[i]);
-        if (valor < 0) continue;
-        bits += valor.toString(2).padStart(5, '0');
+function deduplicar(lista) {
+  const mapa = new Map();
+  lista.forEach(function (item) {
+    const chave = item.hash || item.magnet;
+    if (!chave) return;
+    const atual = mapa.get(chave);
+    if (!atual) { mapa.set(chave, item); return; }
+    if (item.score > atual.score) {
+      mapa.set(chave, item);
+      return;
     }
-    let hex = '';
-    for (let i = 0; i + 8 <= bits.length && hex.length < 40; i += 8) {
-        hex += parseInt(bits.slice(i, i + 8), 2).toString(16).padStart(2, '0');
-    }
-    return hex.slice(0, 40);
+    if (item.seeders > atual.seeders) atual.seeders = item.seeders;
+    if (!atual.size && item.size) { atual.size = item.size; atual.sizeBytes = item.sizeBytes; }
+    if (atual.fileIdx === null && item.fileIdx !== null) atual.fileIdx = item.fileIdx;
+    if (!atual.quality && item.quality) atual.quality = item.quality;
+  });
+  return Array.from(mapa.values());
 }
 
-function infoHashDe(entrada) {
-    if (!entrada) return null;
-    const s = String(entrada).trim();
+function preparar(lista, ctx) {
+  const validos = lista
+    .filter(function (i) { return i && i.magnet && /^magnet:/i.test(i.magnet); })
+    .map(normalizar);
 
-    let m = /urn:btih:([0-9a-fA-F]{40})/.exec(s);
-    if (m) return m[1].toLowerCase();
+  validos.forEach(function (i) {
+    i.ptbr = ptbr.avaliar(i.title, i.source);
+    i.elegivel = i.ptbr.elegivel;
+    i.score = pontuar(i, ctx);
+  });
 
-    m = /urn:btih:([a-zA-Z2-7]{32})/.exec(s);
-    if (m) return base32ParaHex(m[1]);
-
-    m = /\b([0-9a-fA-F]{40})\b/.exec(s);
-    if (m) return m[1].toLowerCase();
-
-    m = /^([a-zA-Z2-7]{32})$/.exec(s);
-    if (m) return base32ParaHex(m[1]);
-
-    return null;
+  const unicos = deduplicar(validos);
+  unicos.sort(function (a, b) {
+    if (a.elegivel !== b.elegivel) return a.elegivel ? -1 : 1;
+    return b.score - a.score;
+  });
+  return unicos;
 }
 
-function montarMagnet(infoHash, nome, trackers) {
-    const hash = String(infoHash || '').toLowerCase();
-    if (!/^[0-9a-f]{40}$/.test(hash)) return null;
-    const params = ['xt=urn:btih:' + hash];
-    if (nome) params.push('dn=' + encodeURIComponent(nome));
-    const trs = Array.isArray(trackers) && trackers.length ? trackers : TRACKERS_PADRAO;
-    for (const tr of trs) params.push('tr=' + encodeURIComponent(tr));
-    return 'magnet:?' + params.join('&');
+module.exports = { preparar: preparar, pontuar: pontuar };
+'@
+Write-ProjectFile 'src/ranking.js' $rankingJs
+
+# ----------------------------------------------------------------------
+$magnetsJs = @'
+'use strict';
+
+/**
+ * Esteira concorrente: todos os scrapers em paralelo (Promise.all),
+ * unificacao, dedupe por hash, classificacao PT-BR e escolha automatica.
+ */
+
+const scrapers = require('./scrapers');
+const ranking = require('./ranking');
+
+async function buscar(ctx) {
+  const t0 = Date.now();
+  const resultados = await scrapers.executar(ctx);
+
+  const stats = resultados.map(function (r) {
+    return { fonte: r.label, nacional: !!r.nacional, itens: r.itens.length, ms: r.ms, erro: r.erro };
+  }).sort(function (a, b) { return b.itens - a.itens; });
+
+  let brutos = [];
+  resultados.forEach(function (r) {
+    r.itens.forEach(function (item) {
+      item.source = item.source || r.label;
+      brutos.push(item);
+    });
+  });
+
+  const ranqueados = ranking.preparar(brutos, ctx);
+  const elegiveis = ranqueados.filter(function (f) { return f.elegivel; });
+  const melhor = elegiveis[0] || ranqueados[0] || null;
+
+  return {
+    melhor: melhor,
+    fontes: ranqueados.slice(0, 40),
+    ptbr: elegiveis.slice(0, 20),
+    total: ranqueados.length,
+    ptbrTotal: elegiveis.length,
+    confirmados: ranqueados.filter(function (f) { return f.ptbr.nivel === 'confirmado'; }).length,
+    ms: Date.now() - t0,
+    scrapers: stats
+  };
 }
 
-function normalizarMagnet(magnet, nome) {
-    const hash = infoHashDe(magnet);
-    if (!hash) return null;
-    if (String(magnet).startsWith('magnet:') && /tr=/.test(magnet)) return magnet;
-    return montarMagnet(hash, nome);
-}
+module.exports = { buscar: buscar };
+'@
+Write-ProjectFile 'src/magnets.js' $magnetsJs
 
-function validarInfoHash(hash) {
-    return typeof hash === 'string' && /^[0-9a-f]{40}$/.test(hash.toLowerCase());
-}
+# ======================================================================
+Write-Step 'Scrapers nacionais'
+
+# ----------------------------------------------------------------------
+$scraperRede = @'
+'use strict';
+
+const http = require('./_http');
+
+const HOSTS = ['https://redetorrent.com', 'https://www.redetorrent.com'];
 
 module.exports = {
-    TRACKERS_PADRAO,
-    base32ParaHex,
-    infoHashDe,
-    montarMagnet,
-    normalizarMagnet,
-    validarInfoHash
+  name: 'redetorrent',
+  label: 'RedeTorrent',
+  nacional: true,
+  supports: function () { return true; },
+  search: async function (ctx) {
+    const termo = encodeURIComponent(ctx.tituloOriginal || ctx.titulo || '');
+    if (!termo) return [];
+    for (const host of HOSTS) {
+      try {
+        const url = host + '/?s=' + termo;
+        const html = await http.fetchText(url);
+        const direto = http.rowsFromHtml(html, { source: 'RedeTorrent' });
+        if (direto.length >= 2) return direto.slice(0, 20);
+        const profundo = await http.deepSearch(url, 'href="(' + host.replace(/\./g, '\\.') + '/[^"?#]+)"', 4, 'RedeTorrent');
+        if (profundo.length) return profundo.slice(0, 20);
+      } catch (e) { }
+    }
+    return [];
+  }
 };
 '@
+Write-ProjectFile 'src/scrapers/redetorrent.js' $scraperRede
 
-# ===========================================================================
-#  src/util/http.js
-# ===========================================================================
-$Arquivos['src/util/http.js'] = @'
+# ----------------------------------------------------------------------
+$scraperBludv = @'
 'use strict';
 
-const axios = require('axios');
-const iconv = require('iconv-lite');
-const config = require('../config');
-const { criar } = require('./logger');
+const http = require('./_http');
 
-const log = criar('http');
-
-const UAS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-];
-
-const cliente = axios.create({
-    timeout: config.HTTP_TIMEOUT,
-    maxRedirects: 8,
-    responseType: 'arraybuffer',
-    decompress: true,
-    validateStatus: (s) => s >= 200 && s < 400,
-    headers: {
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-        Connection: 'keep-alive'
-    }
-});
-
-function dormir(ms) {
-    return new Promise((r) => setTimeout(r, ms));
-}
-
-function uaAleatoria() {
-    return UAS[Math.floor(Math.random() * UAS.length)];
-}
-
-function decodificar(buffer, contentType, forcar) {
-    let charset = forcar || 'utf-8';
-    const m = /charset=["']?([\w-]+)/i.exec(String(contentType || ''));
-    if (m) charset = m[1].toLowerCase();
-    if (['iso-8859-1', 'latin1', 'ascii', 'us-ascii'].includes(charset)) charset = 'windows-1252';
-    if (!iconv.encodingExists(charset)) charset = 'utf-8';
-    try {
-        return iconv.decode(Buffer.from(buffer), charset);
-    } catch (_) {
-        return Buffer.from(buffer).toString('utf8');
-    }
-}
-
-async function requisitar(url, opcoes) {
-    const opt = opcoes || {};
-    const max = Number.isFinite(opt.tentativas) ? opt.tentativas : config.HTTP_RETRIES;
-    let ultimoErro = null;
-
-    for (let tentativa = 0; tentativa <= max; tentativa++) {
-        try {
-            const resposta = await cliente.get(url, {
-                timeout: opt.timeout || config.HTTP_TIMEOUT,
-                headers: Object.assign(
-                    {
-                        'User-Agent': opt.userAgent || uaAleatoria()
-                    },
-                    opt.referer ? { Referer: opt.referer, Origin: origemDe(opt.referer) } : {},
-                    opt.headers || {}
-                )
-            });
-            return {
-                url: url,
-                status: resposta.status,
-                headers: resposta.headers,
-                buffer: Buffer.from(resposta.data),
-                texto: decodificar(resposta.data, resposta.headers['content-type'], opt.encoding)
-            };
-        } catch (erro) {
-            ultimoErro = erro;
-            const status = erro.response && erro.response.status;
-            if (status === 404) break;
-            await dormir(220 * (tentativa + 1) + Math.floor(Math.random() * 200));
-        }
-    }
-
-    throw new Error('HTTP falhou em ' + url + ' :: ' + (ultimoErro ? ultimoErro.message : 'desconhecido'));
-}
-
-function origemDe(url) {
-    try {
-        return new URL(url).origin;
-    } catch (_) {
-        return undefined;
-    }
-}
-
-async function html(url, opcoes) {
-    const r = await requisitar(url, opcoes);
-    return r.texto;
-}
-
-async function json(url, opcoes) {
-    const r = await requisitar(url, opcoes);
-    return JSON.parse(r.texto);
-}
-
-async function binario(url, opcoes) {
-    return requisitar(url, opcoes);
-}
-
-async function ping(url, opcoes) {
-    const inicio = Date.now();
-    try {
-        const r = await requisitar(url, Object.assign({ tentativas: 0, timeout: 9000 }, opcoes || {}));
-        return { ok: true, status: r.status, ms: Date.now() - inicio, bytes: r.buffer.length };
-    } catch (erro) {
-        return { ok: false, erro: erro.message, ms: Date.now() - inicio };
-    }
-}
-
-module.exports = { requisitar, html, json, binario, ping, dormir, uaAleatoria, decodificar };
-'@
-
-# ===========================================================================
-#  src/util/text.js
-# ===========================================================================
-$Arquivos['src/util/text.js'] = @'
-'use strict';
-
-const RE_ACENTOS = /[\u0300-\u036f]/g;
-
-const QUALIDADES = [
-    { re: /(2160p|4k|uhd)/i, rotulo: '2160p', peso: 22 },
-    { re: /(1440p|2k)/i, rotulo: '1440p', peso: 16 },
-    { re: /(1080p|fullhd|full hd)/i, rotulo: '1080p', peso: 15 },
-    { re: /(720p|hd rip|hdrip)/i, rotulo: '720p', peso: 11 },
-    { re: /(480p|dvdrip|dvd rip|sd\b)/i, rotulo: '480p', peso: 5 }
-];
-
-const RE_IDIOMA = {
-    dublado: /\b(dublado|dublada|dublados|dubladas|dub)\b/,
-    dual: /\b(dual|dual audio|dualaudio|dual-audio|dual audio pt br)\b/,
-    legendado: /\b(legendado|legendada|legendados|leg|subbed|subtitulado|sub)\b/,
-    ptbr: /\b(pt br|ptbr|pt-br|portugues|portugues br|brasil|nacional)\b/
-};
-
-const RE_CATEGORIA = {
-    animes: /\b(anime|animes|ova|oad|fansub|fansubs|manga|naruto|bleach|one piece|onepiece|dragon ball|jujutsu|kimetsu|demon slayer|shingeki|attack on titan|my hero academia|boku no hero|hunter x hunter|fullmetal|death note|tokyo ghoul|sword art online|sao|chainsaw man|spy x family|jujutsu kaisen)\b/,
-    doramas: /\b(dorama|doramas|kdrama|k drama|cdrama|jdrama|drama coreano|coreano|coreana|coreanos|chines|chinesa|japones|japonesa|tailandes|asiatico|asiaticos|asiatica)\b/,
-    novelas: /\b(novela|novelas|telenovela|novelinha|novelas mexicanas|novela turca|novelas turcas|carrossel|chiquititas|mexicana|turca)\b/,
-    series: /\b(serie|series|temporada|temporadas|season|completa|completo|s\d{1,2}\s?e\d{1,3})\b/,
-    curtas: /\b(curta|curtas|short|shorts|curta metragem|animacao|animação)\b/,
-    documentarios: /\b(documentario|documentarios|documentary|documental|bbc|discovery|natgeo|national geographic|natureza)\b/
-};
-
-function stripAcentos(texto) {
-    return String(texto == null ? '' : texto).normalize('NFD').replace(RE_ACENTOS, '');
-}
-
-function normalizar(texto) {
-    return stripAcentos(texto)
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
-function tokens(texto) {
-    return normalizar(texto).split(' ').filter((t) => t.length > 1);
-}
-
-function absolutizar(url, base) {
-    if (!url) return null;
-    const u = String(url).trim();
-    if (/^(https?:|magnet:|data:|\/\/)/i.test(u)) {
-        if (u.startsWith('//')) return 'https:' + u;
-        return u;
-    }
-    try {
-        return new URL(u, base).href;
-    } catch (_) {
-        return u;
-    }
-}
-
-function parseBytes(texto) {
-    const m = /([\d]+(?:[.,]\d+)?)\s*(tb|tib|gb|gib|mb|mib|kb|kib|b)\b/i.exec(String(texto || ''));
-    if (!m) return 0;
-    const valor = parseFloat(m[1].replace(',', '.'));
-    const unidade = m[2].toLowerCase();
-    const fatores = {
-        b: 1,
-        kb: 1024,
-        kib: 1024,
-        mb: 1024 ** 2,
-        mib: 1024 ** 2,
-        gb: 1024 ** 3,
-        gib: 1024 ** 3,
-        tb: 1024 ** 4,
-        tib: 1024 ** 4
-    };
-    return Math.round(valor * (fatores[unidade] || 1));
-}
-
-function formatarBytes(bytes) {
-    const n = Number(bytes) || 0;
-    if (n <= 0) return '--';
-    const unidades = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let i = 0;
-    let valor = n;
-    while (valor >= 1024 && i < unidades.length - 1) {
-        valor /= 1024;
-        i++;
-    }
-    return valor.toFixed(valor >= 10 || i === 0 ? 0 : 1) + ' ' + unidades[i];
-}
-
-function detectarQualidade(texto) {
-    const t = String(texto || '');
-    for (const q of QUALIDADES) {
-        if (q.re.test(t)) return { rotulo: q.rotulo, peso: q.peso };
-    }
-    return { rotulo: 'SD', peso: 3 };
-}
-
-function detectarIdioma(texto) {
-    const t = ' ' + normalizar(texto) + ' ';
-
-    const dublado = RE_IDIOMA.dublado.test(t);
-    const dual = RE_IDIOMA.dual.test(t);
-    const legendado = RE_IDIOMA.legendado.test(t);
-    const nacional = RE_IDIOMA.ptbr.test(t);
-
-    let pontos = 0;
-    if (dublado) pontos += 62;
-    if (dual) pontos += 50;
-    if (nacional) pontos += 14;
-    if (legendado) pontos += 26;
-
-    const ptbr = dublado || dual || legendado || nacional;
-    if (!ptbr) pontos -= 22;
-
-    return {
-        ptbr,
-        dublado,
-        dual,
-        legendado,
-        nacional,
-        rotulo: dublado ? 'Dublado' : dual ? 'Dual Áudio' : legendado ? 'Legendado' : nacional ? 'Nacional' : 'Original',
-        pontos
-    };
-}
-
-function detectarCategoria(texto, padrao) {
-    const t = ' ' + normalizar(texto) + ' ';
-
-    if (/\bs\d{1,2}\s?e\d{1,3}\b/.test(t) || /\b(temporada|temporadas|season)\b/.test(t)) {
-        if (RE_CATEGORIA.animes.test(t)) return 'animes';
-        if (RE_CATEGORIA.doramas.test(t)) return 'doramas';
-        if (RE_CATEGORIA.novelas.test(t)) return 'novelas';
-        return 'series';
-    }
-
-    const ordem = ['animes', 'doramas', 'novelas', 'documentarios', 'curtas'];
-    for (const c of ordem) {
-        if (RE_CATEGORIA[c].test(t)) return c;
-    }
-    if (RE_CATEGORIA.series.test(t)) return 'series';
-    return padrao || 'filmes';
-}
-
-function limparTitulo(titulo) {
-    let t = String(titulo || '');
-    t = t.replace(/\s*[|»\-–]\s*(comando\s*torrents?|torrent\s*dos\s*filmes?|bludv|bj-?share|animestorrent|rede\s*torrent|yts(\.\w+)?|the\s*pirate\s*bay|apibay|torrents?)\s*$/i, '');
-    t = t.replace(/\[[^\]]{0,40}\]/g, ' ');
-    t = t.replace(/\((?:19|20)\d{2}\)/g, (m) => m);
-    t = t.replace(/\s{2,}/g, ' ').trim();
-    return t;
-}
-
-function chaveDedupe(texto) {
-    return normalizar(texto)
-        .replace(/\b(2160p|1440p|1080p|720p|480p|4k|uhd|fullhd|bluray|blu ray|bdrip|brrip|webrip|web dl|webdl|hdtv|dvdrip|remux|hevc|x265|x264|h264|aac|ac3|dts|dd5 1|dublado|dual audio|dual|legendado|legendada|nacional|torrent|mkv|mp4|avi|completo|completa)\b/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function slug(texto) {
-    return normalizar(texto).replace(/\s+/g, '-').slice(0, 120);
-}
-
-function truncar(texto, limite) {
-    const t = String(texto || '').replace(/\s+/g, ' ').trim();
-    return t.length > limite ? t.slice(0, limite - 1) + '…' : t;
-}
-
-function decodificarEntidades(texto) {
-    return String(texto || '')
-        .replace(/&amp;/gi, '&')
-        .replace(/&#0?38;/g, '&')
-        .replace(/&quot;/gi, '"')
-        .replace(/&#0?39;/g, "'")
-        .replace(/&apos;/gi, "'")
-        .replace(/&lt;/gi, '<')
-        .replace(/&gt;/gi, '>')
-        .replace(/&nbsp;/gi, ' ');
-}
+const HOSTS = ['https://bludv.xyz', 'https://bludv.tv', 'https://bludv.site'];
 
 module.exports = {
-    stripAcentos,
-    normalizar,
-    tokens,
-    absolutizar,
-    parseBytes,
-    formatarBytes,
-    detectarQualidade,
-    detectarIdioma,
-    detectarCategoria,
-    limparTitulo,
-    chaveDedupe,
-    slug,
-    truncar,
-    decodificarEntidades
+  name: 'bludv',
+  label: 'BluDV',
+  nacional: true,
+  supports: function () { return true; },
+  search: async function (ctx) {
+    const termo = encodeURIComponent(ctx.tituloOriginal || ctx.titulo || '');
+    if (!termo) return [];
+    for (const host of HOSTS) {
+      try {
+        const url = host + '/?s=' + termo;
+        const html = await http.fetchText(url);
+        const direto = http.rowsFromHtml(html, { source: 'BluDV' });
+        if (direto.length >= 2) return direto.slice(0, 20);
+        const profundo = await http.deepSearch(url, 'href="(' + host.replace(/\./g, '\\.') + '/[^"?#]+)"', 4, 'BluDV');
+        if (profundo.length) return profundo.slice(0, 20);
+      } catch (e) { }
+    }
+    return [];
+  }
 };
 '@
+Write-ProjectFile 'src/scrapers/bludv.js' $scraperBludv
 
-# ===========================================================================
-#  src/util/pool.js
-# ===========================================================================
-$Arquivos['src/util/pool.js'] = @'
+# ----------------------------------------------------------------------
+$scraperTdf = @'
 'use strict';
 
-async function mapLimit(itens, limite, fn) {
-    const lista = Array.from(itens || []);
-    const resultados = new Array(lista.length);
-    if (!lista.length) return resultados;
+const http = require('./_http');
 
-    const trabalhadores = Math.max(1, Math.min(Number(limite) || 1, lista.length));
-    let cursor = 0;
-
-    async function operario() {
-        while (cursor < lista.length) {
-            const indice = cursor++;
-            try {
-                resultados[indice] = await fn(lista[indice], indice);
-            } catch (erro) {
-                resultados[indice] = { __erro: erro };
-            }
-        }
-    }
-
-    await Promise.all(new Array(trabalhadores).fill(0).map(operario));
-    return resultados;
-}
-
-function comPrazo(promessa, ms, rotulo) {
-    let timer;
-    const timeout = new Promise((_, rejeitar) => {
-        timer = setTimeout(() => rejeitar(new Error('prazo esgotado: ' + (rotulo || 'operacao'))), ms);
-    });
-    return Promise.race([promessa, timeout]).finally(() => clearTimeout(timer));
-}
-
-module.exports = { mapLimit, comPrazo };
-'@
-
-# ===========================================================================
-#  src/util/ffmpeg.js
-# ===========================================================================
-$Arquivos['src/util/ffmpeg.js'] = @'
-'use strict';
-
-const { spawn, execFile } = require('child_process');
-const fs = require('fs');
-const config = require('../config');
-const { criar } = require('./logger');
-
-const log = criar('ffmpeg');
-
-const EXTENSOES_DIRETAS = ['mp4', 'm4v', 'mov', 'webm'];
-const CODECS_VIDEO_DIRETOS = ['h264', 'avc1', 'vp8', 'vp9', 'av1', 'av01'];
-const CODECS_VIDEO_REMUXAVEIS = ['h264', 'avc1', 'hevc', 'h265', 'vp8', 'vp9', 'av1', 'av01'];
-const CODECS_AUDIO_DIRETOS = ['aac', 'mp3', 'opus', 'vorbis', 'mp4a'];
-
-let binFfmpeg = config.FFMPEG_PATH;
-let binFfprobe = config.FFPROBE_PATH;
-let resolvido = false;
-
-function resolverBinarios() {
-    if (resolvido) return;
-    resolvido = true;
-
-    if (!binFfmpeg) {
-        try {
-            const p = require('ffmpeg-static');
-            if (p && fs.existsSync(p)) binFfmpeg = p;
-        } catch (_) { /* opcional */ }
-    }
-    if (!binFfprobe) {
-        try {
-            const p = require('ffprobe-static');
-            const caminho = p && (p.path || p);
-            if (caminho && fs.existsSync(caminho)) binFfprobe = caminho;
-        } catch (_) { /* opcional */ }
-    }
-
-    if (!binFfmpeg) binFfmpeg = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-    if (!binFfprobe) binFfprobe = process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe';
-}
-
-function disponivel() {
-    resolverBinarios();
-    try {
-        fs.accessSync(binFfmpeg, fs.constants.X_OK);
-        return true;
-    } catch (_) {
-        return true;
-    }
-}
-
-function probe(caminho, opcoes) {
-    resolverBinarios();
-    const opt = opcoes || {};
-    return new Promise((resolver) => {
-        const args = [
-            '-v', 'error',
-            '-print_format', 'json',
-            '-show_format',
-            '-show_streams',
-            caminho
-        ];
-        execFile(binFfprobe, args, { timeout: opt.timeoutMs || 20000, maxBuffer: 8 * 1024 * 1024 }, (erro, stdout) => {
-            if (erro || !stdout) {
-                log.debug('ffprobe falhou:', erro ? erro.message : 'sem saida');
-                return resolver(null);
-            }
-            try {
-                const dados = JSON.parse(stdout);
-                const streams = dados.streams || [];
-                const video = streams.find((s) => s.codec_type === 'video') || {};
-                const audio = streams.find((s) => s.codec_type === 'audio') || {};
-                const formato = dados.format || {};
-                return resolver({
-                    container: (formato.format_name || '').split(',')[0],
-                    duracaoSeg: parseFloat(formato.duration) || 0,
-                    tamanhoBytes: parseInt(formato.size, 10) || 0,
-                    videoCodec: video.codec_name || null,
-                    audioCodec: audio.codec_name || null,
-                    largura: video.width || 0,
-                    altura: video.height || 0,
-                    canais: audio.channels || 0
-                });
-            } catch (_) {
-                return resolver(null);
-            }
-        });
-    });
-}
-
-function planejar(info) {
-    if (!info) return { modo: 'remux', tag: null, motivo: 'ffprobe indisponivel' };
-
-    const container = String(info.container || '').toLowerCase().split(',')[0];
-    const v = String(info.videoCodec || '').toLowerCase();
-    const a = String(info.audioCodec || '').toLowerCase();
-
-    const containerOk = EXTENSOES_DIRETAS.includes(container);
-    const videoDireto = CODECS_VIDEO_DIRETOS.includes(v);
-    const audioDireto = CODECS_AUDIO_DIRETOS.includes(a) || !a;
-
-    if (containerOk && videoDireto && audioDireto) {
-        return { modo: 'direto', tag: null, motivo: 'container e codecs nativos do browser' };
-    }
-
-    if (CODECS_VIDEO_REMUXAVEIS.includes(v)) {
-        const precisaAac = !CODECS_AUDIO_DIRETOS.includes(a) && !!a;
-        return {
-            modo: 'remux',
-            tag: v === 'hevc' || v === 'h265' ? 'hvc1' : null,
-            precisaAac: precisaAac,
-            motivo: 'remux de container' + (precisaAac ? ' + audio para AAC' : '')
-        };
-    }
-
-    return { modo: 'transcode', tag: null, motivo: 'codec de video incompativel (' + (v || 'desconhecido') + ')' };
-}
-
-function argumentosConversao(caminho, opcoes) {
-    const opt = opcoes || {};
-    const plano = opt.plano || { modo: 'remux' };
-    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
-
-    if (opt.seek && opt.seek > 0.5) {
-        args.push('-ss', String(Math.floor(opt.seek)));
-    }
-
-    args.push('-i', caminho, '-map', '0:v:0', '-map', '0:a:0?');
-
-    if (plano.modo === 'transcode') {
-        args.push(
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-tune', 'zerolatency',
-            '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            '-g', '48',
-            '-sc_threshold', '0'
-        );
-    } else {
-        args.push('-c:v', 'copy');
-    }
-
-    if (plano.tag) args.push('-tag:v', plano.tag);
-
-    if (plano.modo === 'transcode' || plano.precisaAac) {
-        args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-ar', '48000');
-    } else {
-        args.push('-c:a', 'copy');
-    }
-
-    args.push(
-        '-sn',
-        '-dn',
-        '-max_muxing_queue_size', '8192',
-        '-avoid_negative_ts', 'make_zero',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-f', 'mp4',
-        'pipe:1'
-    );
-
-    return args;
-}
-
-function converter(caminho, opcoes) {
-    resolverBinarios();
-    const args = argumentosConversao(caminho, opcoes);
-    log.debug('ffmpeg', args.join(' '));
-    return spawn(binFfmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-}
-
-function caminhoDoBinario() {
-    resolverBinarios();
-    return { ffmpeg: binFfmpeg, ffprobe: binFfprobe };
-}
-
-module.exports = { probe, planejar, converter, disponivel, caminhoDoBinario };
-'@
-
-# ===========================================================================
-#  src/sources/generic.js
-# ===========================================================================
-$Arquivos['src/sources/generic.js'] = @'
-'use strict';
-
-const cheerio = require('cheerio');
-const http = require('../util/http');
-const { absolutizar, decodificarEntidades, limparTitulo, parseBytes, truncar } = require('../util/text');
-const { infoHashDe, montarMagnet, TRACKERS_PADRAO } = require('../util/magnet');
-
-const RE_MAGNET = /magnet:\?xt=urn:btih:[0-9a-zA-Z]{32,40}[^"'\s<>\\]*/g;
-
-const SELETOR_CARDS = 'article, .post, .item, .card, .resultado, .result, li.post, .box, .entry, .torrent, tr.torrent_row';
-
-const SELETOR_LINK = [
-    'h1 a', 'h2 a', 'h3 a', 'h4 a',
-    '.entry-title a', '.titulo a', '.title a', '.nome a',
-    'a[rel="bookmark"]', 'a.torrent-name', 'a.lnk', 'a[href*="torrents.php?id="]'
-].join(', ');
-
-const SELETOR_POSTER = 'img';
-
-function carregar(htmlTexto) {
-    return cheerio.load(String(htmlTexto || ''), { decodeEntities: true });
-}
-
-function extrairMagnets(htmlTexto, base) {
-    const achados = new Map();
-    const texto = String(htmlTexto || '');
-    let m;
-    RE_MAGNET.lastIndex = 0;
-    while ((m = RE_MAGNET.exec(texto)) !== null) {
-        const bruto = decodificarEntidades(m[0]).replace(/['"]+$/, '');
-        const hash = infoHashDe(bruto);
-        if (!hash) continue;
-        if (!achados.has(hash)) {
-            achados.set(hash, montarMagnet(hash, null) || bruto);
-        }
-    }
-    return [...achados.values()];
-}
-
-function extrairArquivosTorrent(htmlTexto, base) {
-    const $ = carregar(htmlTexto);
-    const achados = new Set();
-    $('a[href]').each((_, el) => {
-        const href = $(el).attr('href');
-        if (!href) return;
-        if (!/\.torrent(\?|$)/i.test(href)) return;
-        const url = absolutizar(href, base);
-        if (url) achados.add(url);
-    });
-    return [...achados];
-}
-
-function metaOg($, base, propriedade) {
-    const valor =
-        $(`meta[property="${propriedade}"]`).attr('content') ||
-        $(`meta[name="${propriedade}"]`).attr('content') ||
-        $(`meta[name="twitter:image"]`).attr('content');
-    return valor ? absolutizar(valor, base) : null;
-}
-
-function lerCardsPadrao($, ctx, opcoes) {
-    const opt = opcoes || {};
-    const seletorItem = opt.item || SELETOR_CARDS;
-    const seletorLink = opt.link || SELETOR_LINK;
-    const itens = [];
-
-    $(seletorItem).each((_, el) => {
-        const $el = $(el);
-        const $a = $el.find(seletorLink).first().length ? $el.find(seletorLink).first() : $el.find('a[href]').first();
-        const href = $a.attr('href');
-        if (!href || /^(#|javascript:)/i.test(href)) return;
-
-        let titulo = ($a.attr('title') || $a.text() || '').replace(/\s+/g, ' ').trim();
-        if (!titulo || titulo.length < 3) {
-            titulo = ($el.find('.entry-title, .titulo, .title, h2, h3').first().text() || '').replace(/\s+/g, ' ').trim();
-        }
-        if (!titulo || titulo.length < 3) return;
-
-        const $img = $el.find(opt.img || SELETOR_POSTER).first();
-        const posterBruto =
-            $img.attr('src') ||
-            $img.attr('data-src') ||
-            $img.attr('data-lazy-src') ||
-            $img.attr('data-original') ||
-            $el.find('img').first().attr('src');
-
-        const $magnet = $el.find('a[href^="magnet:"]').first();
-
-        itens.push({
-            titulo: limparTitulo(titulo),
-            tituloBruto: titulo,
-            detalheUrl: absolutizar(href, ctx.base),
-            poster: posterBruto ? absolutizar(posterBruto, ctx.base) : null,
-            sinopse: truncar($el.find('p').first().text(), 400),
-            tamanhoBytes: parseBytes($el.text()),
-            seeds: parseInt((/(\d+)\s*(?:seed|seeds|sementes|s\b)/i.exec($el.text()) || [])[1], 10) || 0,
-            magnet: $magnet.length ? decodificarEntidades($magnet.attr('href')) : null,
-            base: ctx.base,
-            urlFonte: ctx.url
-        });
-    });
-
-    return itens;
-}
-
-function construirFonteHtml(cfg) {
-    return {
-        id: cfg.id,
-        nome: cfg.nome,
-        tipo: 'html',
-        categoriaPadrao: cfg.categoriaPadrao || 'filmes',
-        confiabilidade: cfg.confiabilidade == null ? 50 : cfg.confiabilidade,
-        bases: cfg.bases.slice(),
-        timeout: cfg.timeout || 15000,
-
-        async buscar(termo, opcoes) {
-            const opt = opcoes || {};
-            const limite = opt.limite || 20;
-            const falhas = [];
-
-            for (const base of this.bases) {
-                try {
-                    const url = cfg.montarBusca(base, termo);
-                    const htmlTexto = await http.html(url, {
-                        referer: base,
-                        timeout: cfg.timeout,
-                        tentativas: 1
-                    });
-                    const $ = carregar(htmlTexto);
-                    const itens = (cfg.lerLista($, { base, url, termo }) || [])
-                        .filter((i) => i && i.titulo)
-                        .slice(0, limite);
-
-                    if (!itens.length) {
-                        falhas.push(base + ': 0 resultados');
-                        continue;
-                    }
-                    return { base, url, itens };
-                } catch (erro) {
-                    falhas.push(base + ': ' + erro.message);
-                }
-            }
-
-            throw new Error('bases indisponiveis -> ' + falhas.join(' | '));
-        },
-
-        async resolver(item) {
-            if (!item) return { magnets: [], torrents: [] };
-            if (item.magnet && !item.detalheUrl) {
-                return { magnets: [item.magnet], torrents: [] };
-            }
-
-            const alvo = item.detalheUrl || item.magnet;
-            const htmlTexto = await http.html(alvo, { referer: item.base, timeout: cfg.timeout, tentativas: 1 });
-
-            let magnets = extrairMagnets(htmlTexto, alvo);
-            let torrents = extrairArquivosTorrent(htmlTexto, alvo);
-
-            const $ = carregar(htmlTexto);
-
-            if (cfg.lerDetalhe) {
-                const extra = cfg.lerDetalhe($, { base: item.base, url: alvo }) || {};
-                if (Array.isArray(extra.magnets)) magnets = magnets.concat(extra.magnets);
-                if (Array.isArray(extra.torrents)) torrents = torrents.concat(extra.torrents);
-                if (extra.poster && !item.poster) item.poster = extra.poster;
-                if (extra.sinopse && !item.sinopse) item.sinopse = extra.sinopse;
-                if (extra.ano && !item.ano) item.ano = extra.ano;
-            }
-
-            if (!item.poster) item.poster = metaOg($, item.base, 'og:image');
-            if (!item.sinopse) item.sinopse = truncar(metaOg($, item.base, 'og:description') || $('meta[name="description"]').attr('content'), 400);
-            if (!item.ano) item.ano = (/(19|20)\d{2}/.exec($('title').text() || '') || [null])[0];
-
-            const unicos = new Map();
-            for (const m of magnets) {
-                const hash = infoHashDe(m);
-                if (hash && !unicos.has(hash)) unicos.set(hash, montarMagnet(hash, item.tituloBruto || item.titulo) || m);
-            }
-
-            return { magnets: [...unicos.values()], torrents: [...new Set(torrents)] };
-        }
-    };
-}
-
-function construirFonteJson(cfg) {
-    return {
-        id: cfg.id,
-        nome: cfg.nome,
-        tipo: 'json',
-        categoriaPadrao: cfg.categoriaPadrao || 'filmes',
-        confiabilidade: cfg.confiabilidade == null ? 50 : cfg.confiabilidade,
-        bases: cfg.bases.slice(),
-
-        async buscar(termo, opcoes) {
-            const limite = (opcoes && opcoes.limite) || 20;
-            const falhas = [];
-
-            for (const base of this.bases) {
-                try {
-                    const url = cfg.montarBusca(base, termo);
-                    const dados = await http.json(url, Object.assign({ referer: base, tentativas: 1 }, cfg.cabecalhos ? { headers: cfg.cabecalhos } : {}));
-                    const itens = (cfg.lerLista(dados, { base, url, termo }) || []).slice(0, limite);
-                    if (!itens.length) {
-                        falhas.push(base + ': 0 resultados');
-                        continue;
-                    }
-                    return { base, url, itens };
-                } catch (erro) {
-                    falhas.push(base + ': ' + erro.message);
-                }
-            }
-            throw new Error('bases indisponiveis -> ' + falhas.join(' | '));
-        },
-
-        async resolver(item) {
-            if (item && item.magnet) return { magnets: [item.magnet], torrents: [] };
-            return { magnets: [], torrents: [] };
-        }
-    };
-}
+const HOSTS = ['https://torrentdosfilmes.tv', 'https://www.torrentdosfilmes.tv'];
 
 module.exports = {
-    construirFonteHtml,
-    construirFonteJson,
-    lerCardsPadrao,
-    extrairMagnets,
-    extrairArquivosTorrent,
-    metaOg,
-    carregar,
-    TRACKERS_PADRAO
+  name: 'torrentdosfilmes',
+  label: 'TorrentDosFilmes',
+  nacional: true,
+  supports: function () { return true; },
+  search: async function (ctx) {
+    const termo = encodeURIComponent(ctx.tituloOriginal || ctx.titulo || '');
+    if (!termo) return [];
+    for (const host of HOSTS) {
+      const candidatos = [
+        host + '/?s=' + termo,
+        host + '/torrents/search/?search=' + termo
+      ];
+      for (const url of candidatos) {
+        try {
+          const html = await http.fetchText(url);
+          const direto = http.rowsFromHtml(html, { source: 'TorrentDosFilmes' });
+          if (direto.length >= 2) return direto.slice(0, 20);
+          const profundo = await http.deepSearch(url, 'href="(' + host.replace(/\./g, '\\.') + '/[^"?#]+)"', 4, 'TorrentDosFilmes');
+          if (profundo.length) return profundo.slice(0, 20);
+        } catch (e) { }
+      }
+    }
+    return [];
+  }
 };
 '@
+Write-ProjectFile 'src/scrapers/torrentdosfilmes.js' $scraperTdf
 
-# ===========================================================================
-#  src/sources/sites.js
-# ===========================================================================
-$Arquivos['src/sources/sites.js'] = @'
+# ----------------------------------------------------------------------
+$scrapersIndex = @'
 'use strict';
 
-const {
-    construirFonteHtml,
-    construirFonteJson,
-    lerCardsPadrao
-} = require('./generic');
-const { montarMagnet, infoHashDe } = require('../util/magnet');
-const { limparTitulo, parseBytes } = require('../util/text');
+/**
+ * Registry de scrapers. Tudo roda em PARALELO via Promise.all.
+ * Fontes nacionais primeiro (elas provam PT-BR nativamente).
+ */
 
-/* ---------------------------------------------------------------------------
-   Fontes HTML PT-BR
-   Cada fonte declara uma lista de bases (TLDs mudam com frequencia) e o motor
-   tenta em cascata ate obter uma resposta com resultados.
---------------------------------------------------------------------------- */
-
-const comandotorrents = construirFonteHtml({
-    id: 'comandotorrents',
-    nome: 'Comando Torrents',
-    bases: [
-        'https://comandotorrents.com.br',
-        'https://comandotorrents.com',
-        'https://comandotorrents.tv'
-    ],
-    categoriaPadrao: 'filmes',
-    confiabilidade: 88,
-    montarBusca: (base, termo) => base + '/?s=' + encodeURIComponent(termo),
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'article, .item, .post, .resultado',
-        link: 'h2 a, h3 a, .entry-title a, a[rel="bookmark"], .titulo a'
-    }),
-    lerDetalhe: ($, ctx) => ({
-        poster: ($('meta[property="og:image"]').attr('content') || $('.poster img, .capa img, .thumb img').first().attr('src')) || null,
-        sinopse: ($('meta[property="og:description"]').attr('content') || $('.sinopse, .resumo, .entry-content p').first().text() || '').trim()
-    })
-});
-
-const torrentdosfilmes = construirFonteHtml({
-    id: 'torrentdosfilmes',
-    nome: 'Torrent dos Filmes',
-    bases: [
-        'https://torrentdosfilmes.tv',
-        'https://torrentdosfilmes.com.br',
-        'https://torrentdosfilmes.com'
-    ],
-    categoriaPadrao: 'filmes',
-    confiabilidade: 84,
-    montarBusca: (base, termo) => base + '/?s=' + encodeURIComponent(termo),
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'article, .item, .post, .box-filme, .resultado',
-        link: 'h2 a, h3 a, .entry-title a, .titulo a'
-    }),
-    lerDetalhe: ($, ctx) => ({
-        poster: ($('meta[property="og:image"]').attr('content') || $('.poster img, .capa img').first().attr('src')) || null,
-        sinopse: ($('meta[property="og:description"]').attr('content') || '').trim()
-    })
-});
-
-const bludv = construirFonteHtml({
-    id: 'bludv',
-    nome: 'BluDV',
-    bases: ['https://bludv.tv', 'https://bludv.xyz', 'https://www.bludv.tv'],
-    categoriaPadrao: 'filmes',
-    confiabilidade: 82,
-    montarBusca: (base, termo) => base + '/?s=' + encodeURIComponent(termo),
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'article, .item, .post, .movie, .resultado',
-        link: 'h2 a, h3 a, .entry-title a, .title a'
-    }),
-    lerDetalhe: ($, ctx) => ({
-        poster: ($('meta[property="og:image"]').attr('content') || $('.poster img').first().attr('src')) || null,
-        sinopse: ($('meta[property="og:description"]').attr('content') || '').trim()
-    })
-});
-
-const redetorrent = construirFonteHtml({
-    id: 'redetorrent',
-    nome: 'Rede Torrent',
-    bases: ['https://redetorrent.com', 'https://www.redetorrent.com', 'https://redetorrent.org'],
-    categoriaPadrao: 'filmes',
-    confiabilidade: 74,
-    montarBusca: (base, termo) => base + '/?s=' + encodeURIComponent(termo),
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'article, .item, .post, .resultado',
-        link: 'h2 a, h3 a, .entry-title a'
-    })
-});
-
-const bjshare = construirFonteHtml({
-    id: 'bjshare',
-    nome: 'BJ-Share',
-    bases: ['https://bj-share.com', 'https://bj-share.info'],
-    categoriaPadrao: 'filmes',
-    confiabilidade: 92,
-    timeout: 18000,
-    montarBusca: (base, termo) =>
-        base + '/torrents.php?searchstr=' + encodeURIComponent(termo) + '&order_by=seeders&order_way=desc&filter=all',
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'table.torrent_table tr, tr.torrent_row, .torrent_row, .torrent, table#torrent_table tr',
-        link: 'a[href*="torrents.php?id="], a.torrent-name, h3 a'
-    }),
-    lerDetalhe: ($, ctx) => ({
-        poster: ($('#poster img, .poster img').first().attr('src') || null)
-    })
-});
-
-/* ---------------------------------------------------------------------------
-   Fontes especializadas por nicho
---------------------------------------------------------------------------- */
-
-const animestorrent = construirFonteHtml({
-    id: 'animestorrent',
-    nome: 'AnimesTorrent',
-    bases: ['https://animestorrent.com', 'https://www.animestorrent.com', 'https://animestorrent.tv'],
-    categoriaPadrao: 'animes',
-    confiabilidade: 80,
-    montarBusca: (base, termo) => base + '/?s=' + encodeURIComponent(termo),
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'article, .item, .post, .anime, .resultado',
-        link: 'h2 a, h3 a, .entry-title a, .titulo a'
-    })
-});
-
-const animetorrents = construirFonteHtml({
-    id: 'animetorrents',
-    nome: 'Anime Torrents',
-    bases: ['https://animetorrents.me', 'https://www.animetorrents.me'],
-    categoriaPadrao: 'animes',
-    confiabilidade: 68,
-    montarBusca: (base, termo) => base + '/torrents-search.php?search=' + encodeURIComponent(termo),
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'table tr, .item, .resultado',
-        link: 'a[href*="details.php?id="], a[href*="torrent"]'
-    })
-});
-
-const doramastorrent = construirFonteHtml({
-    id: 'doramastorrent',
-    nome: 'Doramas Torrent',
-    bases: [
-        'https://doramastorrent.com',
-        'https://www.doramastorrent.com',
-        'https://doramasytorrents.com'
-    ],
-    categoriaPadrao: 'doramas',
-    confiabilidade: 70,
-    montarBusca: (base, termo) => base + '/?s=' + encodeURIComponent(termo),
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'article, .item, .post, .resultado',
-        link: 'h2 a, h3 a, .entry-title a'
-    })
-});
-
-const novelastorrent = construirFonteHtml({
-    id: 'novelastorrent',
-    nome: 'Novelas Torrent',
-    bases: [
-        'https://novelastorrent.com',
-        'https://www.novelastorrent.com',
-        'https://novelasbr.net'
-    ],
-    categoriaPadrao: 'novelas',
-    confiabilidade: 66,
-    montarBusca: (base, termo) => base + '/?s=' + encodeURIComponent(termo),
-    lerLista: ($, ctx) => lerCardsPadrao($, ctx, {
-        item: 'article, .item, .post, .resultado',
-        link: 'h2 a, h3 a, .entry-title a'
-    })
-});
-
-/* ---------------------------------------------------------------------------
-   Fontes internacionais com bom indice de releases DUPLO AUDIO / PT-BR
---------------------------------------------------------------------------- */
-
-const apibay = construirFonteJson({
-    id: 'apibay',
-    nome: 'The Pirate Bay (API)',
-    bases: ['https://apibay.org'],
-    categoriaPadrao: 'filmes',
-    confiabilidade: 72,
-    montarBusca: (base, termo) => base + '/q.php?q=' + encodeURIComponent(termo) + '&cat=0',
-    lerLista: (dados, ctx) => {
-        if (!Array.isArray(dados)) return [];
-        return dados
-            .filter((x) => x && x.info_hash && x.info_hash !== '0000000000000000000000000000000000000000')
-            .map((x) => ({
-                titulo: limparTitulo(x.name),
-                tituloBruto: x.name,
-                infoHash: String(x.info_hash).toLowerCase(),
-                seeds: parseInt(x.seeders, 10) || 0,
-                leechers: parseInt(x.leechers, 10) || 0,
-                tamanhoBytes: parseInt(x.size, 10) || 0,
-                magnet: montarMagnet(x.info_hash, x.name),
-                base: ctx.base,
-                urlFonte: ctx.url
-            }));
-    }
-});
-
-const yts = construirFonteJson({
-    id: 'yts',
-    nome: 'YTS',
-    bases: ['https://yts.mx', 'https://yts.lt', 'https://yts.rs'],
-    categoriaPadrao: 'filmes',
-    confiabilidade: 76,
-    montarBusca: (base, termo) =>
-        base + '/api/v2/list_movies.json?limit=20&query_term=' + encodeURIComponent(termo),
-    lerLista: (dados, ctx) => {
-        const filmes = dados && dados.data && Array.isArray(dados.data.movies) ? dados.data.movies : [];
-        const itens = [];
-        for (const filme of filmes) {
-            for (const t of filme.torrents || []) {
-                itens.push({
-                    titulo: limparTitulo(filme.title_long || filme.title) + ' ' + (t.quality || '') + ' ' + (t.type || ''),
-                    tituloBruto: filme.title_long || filme.title,
-                    infoHash: String(t.hash || '').toLowerCase(),
-                    seeds: parseInt(t.seeds, 10) || 0,
-                    leechers: parseInt(t.peers, 10) || 0,
-                    tamanhoBytes: parseBytes(t.size),
-                    poster: filme.medium_cover_image || filme.large_cover_image || null,
-                    sinopse: filme.summary || '',
-                    ano: filme.year ? String(filme.year) : null,
-                    magnet: montarMagnet(t.hash, filme.title_long || filme.title),
-                    base: ctx.base,
-                    urlFonte: ctx.url
-                });
-            }
-        }
-        return itens;
-    }
-});
-
-const FONTES = [
-    comandotorrents,
-    torrentdosfilmes,
-    bludv,
-    bjshare,
-    redetorrent,
-    animestorrent,
-    animetorrents,
-    doramastorrent,
-    novelastorrent,
-    apibay,
-    yts
+const TODOS = [
+  require('./commandotorrents'),
+  require('./lapumia'),
+  require('./redetorrent'),
+  require('./bludv'),
+  require('./torrentdosfilmes'),
+  require('./torrent9'),
+  require('./torrentio'),
+  require('./yts'),
+  require('./piratebay'),
+  require('./eztv'),
+  require('./solidtorrents'),
+  require('./torrentgalaxy'),
+  require('./x1337')
 ];
 
-module.exports = { FONTES };
-'@
+function ativos() {
+  const env = String(process.env.SCRAPERS_ENABLED || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+  if (!env.length) return TODOS;
+  return TODOS.filter(function (s) { return env.indexOf(s.name) !== -1; });
+}
 
-# ===========================================================================
-#  src/sources/index.js
-# ===========================================================================
-$Arquivos['src/sources/index.js'] = @'
+async function executar(ctx) {
+  const lista = ativos();
+  const tarefas = lista.map(async function (s) {
+    const t0 = Date.now();
+    if (s.supports && !s.supports(ctx)) {
+      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: [], ms: 0, erro: null };
+    }
+    try {
+      const itens = await s.search(ctx);
+      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: Array.isArray(itens) ? itens : [], ms: Date.now() - t0, erro: null };
+    } catch (e) {
+      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: [], ms: Date.now() - t0, erro: e.message };
+    }
+  });
+  return Promise.all(tarefas);
+}
+
+module.exports = { executar: executar, todos: TODOS, ativos: ativos };
+'@
+Write-ProjectFile 'src/scrapers/index.js' $scrapersIndex
+
+# ======================================================================
+Write-Step 'Legendas + player'
+
+# ----------------------------------------------------------------------
+$subtitulosJs = @'
 'use strict';
 
-const { FONTES } = require('./sites');
-const config = require('../config');
-const { mapLimit, comPrazo } = require('../util/pool');
-const { criar } = require('../util/logger');
-const http = require('../util/http');
-const {
-    detectarIdioma,
-    detectarQualidade,
-    detectarCategoria,
-    chaveDedupe,
-    limparTitulo
-} = require('../util/text');
-const { infoHashDe, montarMagnet, validarInfoHash } = require('../util/magnet');
+/**
+ * Suporte a legendas: detecta arquivos de legenda dentro do proprio torrent
+ * e converte para WebVTT (unico formato que o <track> do navegador entende).
+ */
 
-const log = criar('fontes');
+const EXT = /\.(srt|ass|ssa|vtt|sub|sbv)$/i;
 
-const cacheBuscas = new Map();
-const cacheStatus = { em: 0, dados: null };
+function ehLegenda(nome) { return EXT.test(String(nome || '')); }
 
-function fontesAtivas() {
-    return FONTES.filter((f) => !config.FONTES_OFF.includes(f.id));
+function extensao(nome) {
+  const m = /\.([a-z0-9]+)$/i.exec(String(nome || ''));
+  return m ? m[1].toLowerCase() : 'srt';
 }
 
-function fontePorId(id) {
-    return FONTES.find((f) => f.id === id) || null;
+function idiomaDe(nome) {
+  const n = String(nome || '').toLowerCase();
+  if (/pt[\s._-]?br|ptbr|portugu|brasil|\bpt\b|\bpor\b|\bbr\b/.test(n)) return { code: 'pt-BR', label: 'Portugues (BR)' };
+  if (/english|\beng\b|\ben\b|ingles/.test(n)) return { code: 'en', label: 'Ingles' };
+  if (/spanish|espa|castellano|latino|\bes\b/.test(n)) return { code: 'es', label: 'Espanhol' };
+  if (/french|franc|\bfr\b/.test(n)) return { code: 'fr', label: 'Frances' };
+  return { code: 'pt-BR', label: 'Legenda' };
 }
 
-function pontuar(item) {
-    const texto = [item.titulo, item.tituloBruto, item.sinopse].filter(Boolean).join(' ');
-    const idioma = detectarIdioma(texto);
-    const qualidade = detectarQualidade(texto);
-
-    let pontos = 0;
-    pontos += Math.min(Number(item.seeds) || 0, 600) * 0.35;
-    pontos += idioma.pontos;
-    pontos += qualidade.peso;
-    pontos += (Number(item.confiabilidade) || 0) * 0.3;
-
-    if (!item.infoHash && !item.magnet) pontos -= 12;
-    if (item.magnet && !item.infoHash) pontos -= 4;
-
-    const gb = (Number(item.tamanhoBytes) || 0) / (1024 ** 3);
-    if (gb > 0 && gb < 0.15) pontos -= 7;
-    if (gb > 70) pontos -= 5;
-    if (gb >= 0.7 && gb <= 25) pontos += 5;
-
-    return { pontos: Math.round(pontos * 100) / 100, idioma, qualidade };
+/** Decodifica respeitando arquivos antigos em Windows-1252 (comum no BR). */
+function decodificar(buffer) {
+  const utf8 = buffer.toString('utf8');
+  if (utf8.indexOf('\uFFFD') === -1) return utf8;
+  return buffer.toString('latin1');
 }
 
-function normalizarItem(item, fonte, categoriaPedida) {
-    const titulo = limparTitulo(item.titulo || item.tituloBruto || '');
-    if (!titulo) return null;
-
-    const hash = item.infoHash
-        ? String(item.infoHash).toLowerCase()
-        : infoHashDe(item.magnet || '');
-
-    const magnet = item.magnet
-        ? item.magnet
-        : hash
-            ? montarMagnet(hash, titulo)
-            : null;
-
-    const base = {
-        titulo,
-        tituloBruto: item.tituloBruto || item.titulo || titulo,
-        infoHash: validarInfoHash(hash) ? hash : null,
-        magnet,
-        seeds: Number(item.seeds) || 0,
-        leechers: Number(item.leechers) || 0,
-        tamanhoBytes: Number(item.tamanhoBytes) || 0,
-        poster: item.poster || null,
-        sinopse: item.sinopse || '',
-        ano: item.ano || null,
-        detalheUrl: item.detalheUrl || null,
-        torrentUrl: item.torrentUrl || null,
-        base: item.base || null,
-        fonte: fonte.id,
-        fonteNome: fonte.nome,
-        confiabilidade: fonte.confiabilidade,
-        categoria: detectarCategoria([titulo, item.sinopse].join(' '), fonte.categoriaPadrao || categoriaPedida)
-    };
-
-    const score = pontuar(base);
-    base.idioma = score.idioma;
-    base.qualidade = score.qualidade.rotulo;
-    base.pontuacao = score.pontos;
-    base.chave = chaveDedupe(titulo);
-
-    return base;
+function srtParaVtt(texto) {
+  const corpo = String(texto)
+    .replace(/^\uFEFF/, '')
+    .replace(/\r+/g, '')
+    .replace(/(\d{1,2}:\d{2}:\d{2}),(\d{1,3})/g, '$1.$2')
+    .replace(/^WEBVTT\s*/i, '');
+  return 'WEBVTT\n\n' + corpo.replace(/\n{3,}/g, '\n\n').trim() + '\n';
 }
 
-function mesclar(a, b) {
-    const melhor = a.pontuacao >= b.pontuacao ? a : b;
-    const outro = melhor === a ? b : a;
-
-    melhor.seeds = Math.max(a.seeds, b.seeds);
-    melhor.leechers = Math.max(a.leechers, b.leechers);
-    melhor.poster = melhor.poster || outro.poster;
-    melhor.sinopse = melhor.sinopse || outro.sinopse;
-    melhor.ano = melhor.ano || outro.ano;
-    melhor.magnet = melhor.magnet || outro.magnet;
-    melhor.infoHash = melhor.infoHash || outro.infoHash;
-    melhor.torrentUrl = melhor.torrentUrl || outro.torrentUrl;
-    melhor.detalheUrl = melhor.detalheUrl || outro.detalheUrl;
-    melhor.fontesExtras = [...new Set([...(melhor.fontesExtras || []), outro.fonte])];
-
-    return melhor;
+function tempoAss(valor) {
+  const m = /(\d+):(\d{2}):(\d{2})[.,](\d{1,2})/.exec(String(valor || '').trim());
+  if (!m) return null;
+  const cs = m[4].padEnd(3, '0').slice(0, 3);
+  return m[1].padStart(2, '0') + ':' + m[2] + ':' + m[3] + '.' + cs;
 }
 
-function deduplicar(itens) {
-    const porHash = new Map();
-    const semHash = new Map();
-
-    for (const item of itens) {
-        if (item.infoHash) {
-            const atual = porHash.get(item.infoHash);
-            porHash.set(item.infoHash, atual ? mesclar(atual, item) : item);
-        } else {
-            const atual = semHash.get(item.chave);
-            semHash.set(item.chave, atual ? mesclar(atual, item) : item);
-        }
-    }
-
-    const hashados = [...porHash.values()];
-    const chavesComHash = new Set(
-        hashados.flatMap((i) => [i.chave, chaveDedupe(i.titulo)])
-    );
-
-    const restantes = [...semHash.values()].filter(
-        (i) => !chavesComHash.has(i.chave) || (i.magnet && !i.infoHash)
-    );
-
-    return hashados.concat(restantes);
+function assParaVtt(texto) {
+  const saida = ['WEBVTT', ''];
+  let n = 0;
+  String(texto).replace(/\r/g, '').split('\n').forEach(function (linha) {
+    if (linha.indexOf('Dialogue:') !== 0) return;
+    const partes = linha.slice('Dialogue:'.length).split(',');
+    if (partes.length < 10) return;
+    const ini = tempoAss(partes[1]);
+    const fim = tempoAss(partes[2]);
+    const txt = partes.slice(9).join(',').replace(/\{[^}]*\}/g, '').replace(/\\N|\\n/g, '\n').trim();
+    if (!ini || !fim || !txt) return;
+    n++;
+    saida.push(String(n), ini + ' --> ' + fim, txt, '');
+  });
+  return saida.join('\n');
 }
 
-async function buscarEmFonte(fonte, termo, opcoes) {
-    const inicio = Date.now();
-    const limite = (opcoes && opcoes.limitePorFonte) || 18;
-
-    try {
-        const resposta = await comPrazo(
-            fonte.buscar(termo, { limite }),
-            (opcoes && opcoes.timeoutFonte) || 22000,
-            'busca ' + fonte.id
-        );
-
-        let itens = (resposta.itens || [])
-            .map((i) => normalizarItem(Object.assign({}, i, { urlFonte: resposta.url }), fonte, opcoes.categoria))
-            .filter(Boolean);
-
-        // Resolve magnet nos detalhes das melhores entradas sem hash direto.
-        if (opcoes.resolverMagnet !== false) {
-            const pendentes = itens.filter((i) => !i.magnet && i.detalheUrl).slice(0, 8);
-            await mapLimit(pendentes, 3, async (item) => {
-                try {
-                    const detalhe = await comPrazo(
-                        fonte.resolver(item),
-                        18000,
-                        'detalhe ' + fonte.id
-                    );
-                    const magnet = (detalhe.magnets || [])[0];
-                    if (magnet) {
-                        item.magnet = magnet;
-                        item.infoHash = infoHashDe(magnet);
-                    }
-                    if (!item.torrentUrl && detalhe.torrents && detalhe.torrents.length) {
-                        item.torrentUrl = detalhe.torrents[0];
-                    }
-                    const rescore = pontuar(item);
-                    item.pontuacao = rescore.pontos;
-                    item.idioma = rescore.idioma;
-                } catch (_) { /* detalhe opcional */ }
-            });
-            itens = itens.filter((i) => i.magnet || i.detalheUrl);
-        }
-
-        return {
-            fonte: fonte.id,
-            nome: fonte.nome,
-            ok: true,
-            ms: Date.now() - inicio,
-            total: itens.length,
-            itens
-        };
-    } catch (erro) {
-        log.aviso('fonte falhou', fonte.id, '-', erro.message);
-        return { fonte: fonte.id, nome: fonte.nome, ok: false, ms: Date.now() - inicio, erro: erro.message, total: 0, itens: [] };
-    }
+function converter(texto, ext) {
+  const e = String(ext || 'srt').toLowerCase();
+  if (e === 'vtt') return /^WEBVTT/i.test(texto) ? texto : 'WEBVTT\n\n' + texto;
+  if (e === 'ass' || e === 'ssa') return assParaVtt(texto);
+  return srtParaVtt(texto);
 }
 
-async function buscar(termo, opcoes) {
-    const opt = Object.assign(
-        {
-            categoria: 'todos',
-            limitePorFonte: 18,
-            resolverMagnet: true,
-            apenasPtBr: config.APENAS_PTBR,
-            pagina: 1,
-            porPagina: 60
-        },
-        opcoes || {}
-    );
-
-    const consulta = String(termo || '').trim();
-    if (!consulta) return { termo: consulta, total: 0, itens: [], fontes: [], categorias: {} };
-
-    const chaveCache = [consulta.toLowerCase(), opt.categoria, opt.apenasPtBr, opt.limitePorFonte].join('|');
-    const emCache = cacheBuscas.get(chaveCache);
-    if (emCache && Date.now() - emCache.em < config.TTL_BUSCA_MS) {
-        return Object.assign({}, emCache.dados, { cache: true });
-    }
-
-    const ativas = fontesAtivas();
-    const resultados = await mapLimit(ativas, config.FONTES_CONCORRENCIA, (fonte) =>
-        buscarEmFonte(fonte, consulta, opt)
-    );
-
-    let itens = resultados.flatMap((r) => r.itens || []);
-    itens = deduplicar(itens);
-
-    if (opt.categoria && opt.categoria !== 'todos') {
-        itens = itens.filter((i) => i.categoria === opt.categoria);
-    }
-
-    if (opt.apenasPtBr) {
-        const comPtBr = itens.filter((i) => i.idioma && i.idioma.ptbr);
-        if (comPtBr.length >= 3) itens = comPtBr;
-    }
-
-    itens.sort((a, b) => b.pontuacao - a.pontuacao);
-
-    const porCategoria = {};
-    for (const item of itens) {
-        porCategoria[item.categoria] = (porCategoria[item.categoria] || 0) + 1;
-    }
-
-    const pagina = Math.max(1, Number(opt.pagina) || 1);
-    const porPagina = Math.max(1, Number(opt.porPagina) || 60);
-    const fatiado = itens.slice((pagina - 1) * porPagina, pagina * porPagina);
-
-    const dados = {
-        termo: consulta,
-        total: itens.length,
-        pagina,
-        porPagina,
-        totalPaginas: Math.max(1, Math.ceil(itens.length / porPagina)),
-        categorias: porCategoria,
-        itens: fatiado,
-        fontes: resultados.map((r) => ({
-            fonte: r.fonte,
-            nome: r.nome,
-            ok: r.ok,
-            ms: r.ms,
-            total: r.total,
-            erro: r.erro || null
-        }))
-    };
-
-    cacheBuscas.set(chaveCache, { em: Date.now(), dados });
-    if (cacheBuscas.size > 120) {
-        const maisAntiga = [...cacheBuscas.entries()].sort((a, b) => a[1].em - b[1].em)[0];
-        if (maisAntiga) cacheBuscas.delete(maisAntiga[0]);
-    }
-
-    return dados;
-}
-
-async function statusFontes(forcar) {
-    if (!forcar && cacheStatus.dados && Date.now() - cacheStatus.em < config.TTL_STATUS_MS) {
-        return cacheStatus.dados;
-    }
-
-    const relatorio = await mapLimit(fontesAtivas(), 6, async (fonte) => {
-        const base = fonte.bases[0];
-        const teste = await http.ping(base, { tentativas: 0, timeout: 9000 });
-        let buscaTeste = null;
-        if (true) {
-            try {
-                const r = await comPrazo(fonte.buscar('dublado', { limite: 3 }), 16000, 'teste');
-                buscaTeste = { ok: true, total: (r.itens || []).length };
-            } catch (erro) {
-                buscaTeste = { ok: false, erro: erro.message };
-            }
-        }
-        return {
-            id: fonte.id,
-            nome: fonte.nome,
-            categoriaPadrao: fonte.categoriaPadrao,
-            confiabilidade: fonte.confiabilidade,
-            bases: fonte.bases,
-            baseTestada: base,
-            online: teste.ok || !!(buscaTeste && buscaTeste.ok),
-            status: teste.status || null,
-            ms: teste.ms,
-            erro: teste.erro || null,
-            buscaTeste
-        };
-    });
-
-    const dados = {
-        em: new Date().toISOString(),
-        total: relatorio.length,
-        online: relatorio.filter((r) => r.online).length,
-        fontes: relatorio
-    };
-
-    cacheStatus.em = Date.now();
-    cacheStatus.dados = dados;
-    return dados;
-}
-
-function limparCache() {
-    cacheBuscas.clear();
-    cacheStatus.em = 0;
-    cacheStatus.dados = null;
-}
-
-module.exports = { buscar, statusFontes, fontesAtivas, fontePorId, limparCache, pontuar };
+module.exports = { ehLegenda: ehLegenda, extensao: extensao, idiomaDe: idiomaDe, decodificar: decodificar, converter: converter };
 '@
+Write-ProjectFile 'src/subtitulos.js' $subtitulosJs
 
-# ===========================================================================
-#  src/catalogo.js
-# ===========================================================================
-$Arquivos['src/catalogo.js'] = @'
+# ----------------------------------------------------------------------
+$streamerJs = @'
 'use strict';
 
-const fs = require('fs');
-const config = require('./config');
-const { criar } = require('./util/logger');
-const { chaveDedupe } = require('./util/text');
-
-const log = criar('catalogo');
-
-const CATEGORIAS = ['filmes', 'series', 'animes', 'doramas', 'novelas', 'curtas', 'documentarios'];
-const MAX_POR_CATEGORIA = 400;
-
-let estado = { atualizadoEm: null, versao: 3, categorias: {} };
-let carregado = false;
-let gravando = false;
-
-function carregar() {
-    if (carregado) return estado;
-    carregado = true;
-    try {
-        if (fs.existsSync(config.CATALOGO_ARQ)) {
-            const bruto = JSON.parse(fs.readFileSync(config.CATALOGO_ARQ, 'utf8'));
-            if (bruto && bruto.categorias) estado = bruto;
-            log.info('catalogo carregado de', config.CATALOGO_ARQ);
-        }
-    } catch (erro) {
-        log.aviso('falha ao ler catalogo:', erro.message);
-    }
-    for (const c of CATEGORIAS) if (!estado.categorias[c]) estado.categorias[c] = [];
-    return estado;
-}
-
-function gravar() {
-    if (gravando) return;
-    gravando = true;
-    try {
-        estado.atualizadoEm = new Date().toISOString();
-        fs.writeFileSync(config.CATALOGO_ARQ, JSON.stringify(estado), 'utf8');
-    } catch (erro) {
-        log.aviso('falha ao gravar catalogo:', erro.message);
-    } finally {
-        gravando = false;
-    }
-}
-
-function adicionar(categoria, itens) {
-    carregar();
-    const alvo = estado.categorias[categoria] || (estado.categorias[categoria] = []);
-    const indice = new Map(alvo.map((i) => [i.infoHash || chaveDedupe(i.titulo), i]));
-
-    for (const item of itens || []) {
-        const chave = item.infoHash || chaveDedupe(item.titulo);
-        const existente = indice.get(chave);
-        if (existente) {
-            if (item.pontuacao > existente.pontuacao) Object.assign(existente, item);
-            continue;
-        }
-        indice.set(chave, item);
-        alvo.push(item);
-    }
-
-    alvo.sort((a, b) => (b.pontuacao || 0) - (a.pontuacao || 0));
-    if (alvo.length > MAX_POR_CATEGORIA) alvo.length = MAX_POR_CATEGORIA;
-    estado.categorias[categoria] = alvo;
-    return alvo.length;
-}
-
-function listar(categoria, opcoes) {
-    carregar();
-    const opt = opcoes || {};
-    const pagina = Math.max(1, Number(opt.pagina) || 1);
-    const porPagina = Math.max(1, Number(opt.porPagina) || 60);
-
-    let itens;
-    if (!categoria || categoria === 'inicio') {
-        const amostra = [];
-        for (const c of ['filmes', 'series', 'animes', 'doramas', 'novelas', 'curtas']) {
-            amostra.push(...(estado.categorias[c] || []).slice(0, 40));
-        }
-        itens = amostra.sort((a, b) => (b.pontuacao || 0) - (a.pontuacao || 0));
-    } else {
-        itens = estado.categorias[categoria] || [];
-    }
-
-    if (opt.termo) {
-        const alvo = String(opt.termo).toLowerCase();
-        itens = itens.filter((i) => String(i.titulo).toLowerCase().includes(alvo));
-    }
-
-    const total = itens.length;
-    return {
-        categoria: categoria || 'inicio',
-        total,
-        pagina,
-        porPagina,
-        totalPaginas: Math.max(1, Math.ceil(total / porPagina)),
-        atualizadoEm: estado.atualizadoEm,
-        itens: itens.slice((pagina - 1) * porPagina, pagina * porPagina)
-    };
-}
-
-function resumo() {
-    carregar();
-    const contagem = {};
-    for (const c of CATEGORIAS) contagem[c] = (estado.categorias[c] || []).length;
-    return {
-        atualizadoEm: estado.atualizadoEm,
-        total: Object.values(contagem).reduce((a, b) => a + b, 0),
-        categorias: contagem
-    };
-}
-
-module.exports = { CATEGORIAS, carregar, gravar, adicionar, listar, resumo };
-'@
-
-# ===========================================================================
-#  src/torrent/engine.js
-# ===========================================================================
-$Arquivos['src/torrent/engine.js'] = @'
-'use strict';
+/**
+ * Player P2P blindado + legendas + limpeza absoluta de disco.
+ *
+ *  - announce list massiva no magnet, no add() e re-anuncio a cada 6s
+ *  - timeout com retentativas automaticas
+ *  - cada job vive em cache/<jobId> e a pasta e destruida ao fechar
+ *  - legendas do proprio torrent sao coletadas e servidas em WebVTT
+ */
 
 const fs = require('fs');
 const path = require('path');
-const config = require('../config');
-const { criar } = require('./../util/logger');
-const { TRACKERS_PADRAO, infoHashDe, montarMagnet } = require('../util/magnet');
-const ff = require('../util/ffmpeg');
+const crypto = require('crypto');
+const WebTorrent = require('webtorrent');
+const trackers = require('./trackers');
+const subtitulos = require('./subtitulos');
 
-const log = criar('webtorrent');
+const TRACKERS = trackers.TRACKERS;
+const appendTrackers = trackers.appendTrackers;
 
-const EXTENSOES_VIDEO = ['.mp4', '.mkv', '.avi', '.webm', '.mov', '.m4v', '.mpg', '.mpeg', '.ts', '.flv', '.ogv'];
+const cacheSetting = process.env.TORRENT_CACHE_DIR || 'cache';
+const CACHE_ROOT = path.isAbsolute(cacheSetting) ? cacheSetting : path.join(__dirname, '..', cacheSetting);
 
-let ModuloWebTorrent = null;
-let cliente = null;
-let temporizador = null;
-let encerrando = false;
+const CACHE_MODE = (process.env.CACHE_MODE || 'session').toLowerCase();
+const METADATA_TIMEOUT = Number(process.env.METADATA_TIMEOUT || 40) * 1000;
+const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT || 12 * 60 * 1000);
+const MAX_JOBS = Number(process.env.MAX_JOBS || 3);
+const MAX_CONNS = Number(process.env.MAX_CONNS || 200);
+const MIN_BUFFER_PERCENT = Number(process.env.MIN_BUFFER_PERCENT || 3);
+const MIN_BUFFER_MB = Number(process.env.MIN_BUFFER_MB || 8);
+const MAX_SUBS = Number(process.env.MAX_SUBS || 8);
 
-const ativos = new Map();
+fs.mkdirSync(CACHE_ROOT, { recursive: true });
 
-async function carregarWebTorrent() {
-    if (ModuloWebTorrent) return ModuloWebTorrent;
-    const mod = await import('webtorrent');
-    ModuloWebTorrent = mod && mod.default ? mod.default : mod && mod.WebTorrent ? mod.WebTorrent : mod;
-    return ModuloWebTorrent;
-}
+const client = new WebTorrent({
+  maxConns: MAX_CONNS, dht: true, tracker: true, lsd: true, utp: true, webSeeds: true
+});
 
-async function obterCliente() {
-    if (cliente) return cliente;
-    const WebTorrent = await carregarWebTorrent();
+client.on('error', function (e) { console.error('[webtorrent] ' + e.message); });
+client.on('warning', function (e) { console.warn('[webtorrent] ' + e.message); });
 
-    fs.mkdirSync(config.TORRENT_DIR, { recursive: true });
+const jobs = new Map();
 
-    cliente = new WebTorrent({
-        maxConns: 90,
-        dht: true,
-        tracker: true,
-        lsd: true,
-        utp: true
-    });
-
-    cliente.on('error', (erro) => log.aviso('erro no cliente:', erro.message));
-
-    temporizador = setInterval(() => {
-        varrer().catch((e) => log.debug('varredura:', e.message));
-    }, 15000);
-
-    log.info('cliente WebTorrent iniciado (max ativos = ' + config.MAX_TORRENTS_ATIVOS + ')');
-    return cliente;
-}
-
-function montarMagnetSeguro(entrada) {
-    const hash = infoHashDe(entrada);
-    if (!hash) return null;
-    if (String(entrada).startsWith('magnet:')) {
-        return /tr=/.test(entrada) ? entrada : montarMagnet(hash);
-    }
-    return montarMagnet(hash);
-}
-
-function escolherArquivo(torrent) {
-    const arquivos = torrent.files || [];
-    if (!arquivos.length) return null;
-
-    const videos = arquivos.filter((f) => EXTENSOES_VIDEO.includes(path.extname(f.name).toLowerCase()));
-    const lista = videos.length ? videos : arquivos;
-
-    const pontuar = (arquivo) => {
-        let peso = arquivo.length;
-        const nome = arquivo.name.toLowerCase();
-        if (/1080p/.test(nome)) peso *= 1.7;
-        else if (/720p/.test(nome)) peso *= 1.45;
-        if (/(sample|trailer|extra|featurette)/.test(nome)) peso *= 0.3;
-        if (/(\bs\d{1,2}e\d{1,2}\b)/.test(nome) && lista.length > 4) peso *= 0.85;
-        return peso;
-    };
-
-    return lista.slice().sort((a, b) => pontuar(b) - pontuar(a))[0];
-}
-
-function removerPasta(caminho) {
-    return new Promise((resolver) => {
-        const tentar = (n) => {
-            try {
-                fs.rmSync(caminho, { recursive: true, force: true });
-                resolver(true);
-            } catch (_) {
-                if (n <= 0) return resolver(false);
-                setTimeout(() => tentar(n - 1), 350);
-            }
-        };
-        tentar(5);
-    });
-}
-
-function tamanhoPasta(caminho, profundidade) {
-    const nivel = profundidade == null ? 0 : profundidade;
-    if (nivel > 6) return 0;
-    let total = 0;
-    let entradas = [];
-    try {
-        entradas = fs.readdirSync(caminho, { withFileTypes: true });
-    } catch (_) {
-        return 0;
-    }
-    for (const entrada of entradas) {
-        const completo = path.join(caminho, entrada.name);
-        try {
-            if (entrada.isDirectory()) total += tamanhoPasta(completo, nivel + 1);
-            else total += fs.statSync(completo).size;
-        } catch (_) { /* ignorado */ }
-    }
-    return total;
-}
-
-async function destruir(infoHash) {
-    const registro = ativos.get(infoHash);
-    if (!registro) return false;
-    ativos.delete(infoHash);
-
-    await new Promise((resolver) => {
-        let pronto = false;
-        const finalizar = () => {
-            if (pronto) return;
-            pronto = true;
-            resolver();
-        };
-        try {
-            registro.torrent.destroy({ destroyStore: true }, finalizar);
-        } catch (_) {
-            finalizar();
-        }
-        setTimeout(finalizar, 5000);
-    });
-
-    await removerPasta(path.join(config.TORRENT_DIR, infoHash));
-    log.info('despejado do cache:', infoHash.slice(0, 12));
-    return true;
-}
-
-async function liberarEspaco() {
-    while (ativos.size >= config.MAX_TORRENTS_ATIVOS) {
-        const ordenados = [...ativos.values()].sort((a, b) => a.ultimoAcesso - b.ultimoAcesso);
-        const alvo = ordenados[0];
-        if (!alvo) break;
-        await destruir(alvo.infoHash);
-    }
-
-    const limiteBytes = config.MAX_CACHE_GB * (1024 ** 3);
-    if (limiteBytes > 0 && tamanhoPasta(config.TORRENT_DIR) > limiteBytes) {
-        const ordenados = [...ativos.values()].sort((a, b) => a.ultimoAcesso - b.ultimoAcesso);
-        for (const alvo of ordenados) {
-            await destruir(alvo.infoHash);
-            if (tamanhoPasta(config.TORRENT_DIR) <= limiteBytes) break;
-        }
-    }
-}
-
-async function varrer() {
-    if (encerrando) return;
-    const agora = Date.now();
-    const limiteOciosidade = config.TORRENT_IDLE_MIN * 60 * 1000;
-
-    for (const registro of [...ativos.values()]) {
-        const ocioso = agora - registro.ultimoAcesso;
-        const concluido = registro.torrent.progress >= 0.999;
-        if (ocioso > limiteOciosidade && (concluido || ocioso > limiteOciosidade * 2)) {
-            await destruir(registro.infoHash);
-        }
-    }
-
-    if (ativos.size === 0) {
-        await liberarEspaco();
-    }
-}
-
-async function abrir(entrada, opcoes) {
-    const opt = opcoes || {};
-    const infoHash = infoHashDe(entrada);
-    if (!infoHash) throw new Error('magnet ou infohash invalido');
-
-    const existente = ativos.get(infoHash);
-    if (existente) {
-        existente.ultimoAcesso = Date.now();
-        return existente;
-    }
-
-    await liberarEspaco();
-
-    const cli = await obterCliente();
-    const magnet = montarMagnetSeguro(entrada);
-    const pasta = path.join(config.TORRENT_DIR, infoHash);
-    const prazo = opt.timeoutMs || 75000;
-
-    const torrent = await new Promise((resolver, rejeitar) => {
-        let finalizado = false;
-
-        const finalizar = (fn, valor) => {
-            if (finalizado) return;
-            finalizado = true;
-            clearTimeout(timer);
-            fn(valor);
-        };
-
-        const instancia = cli.add(
-            magnet,
-            {
-                path: pasta,
-                announce: TRACKERS_PADRAO,
-                destroyStoreOnDestroy: true
-            },
-            (t) => finalizar(resolver, t || instancia)
-        );
-
-        const timer = setTimeout(() => {
-            if (finalizado) return;
-            try { instancia.destroy({ destroyStore: true }); } catch (_) { /* noop */ }
-            finalizar(rejeitar, new Error('tempo esgotado buscando peers/metadados (' + Math.round(prazo / 1000) + 's)'));
-        }, prazo);
-
-        instancia.on('error', (erro) => finalizar(rejeitar, erro));
-        instancia.on('warning', (aviso) => log.debug('aviso torrent:', aviso && aviso.message));
-    });
-
-    const arquivo = escolherArquivo(torrent);
-    if (!arquivo) {
-        try { torrent.destroy({ destroyStore: true }); } catch (_) { /* noop */ }
-        throw new Error('nenhum arquivo reproduzivel encontrado no torrent');
-    }
-
-    const registro = {
-        infoHash,
-        torrent,
-        arquivo,
-        indiceArquivo: torrent.files.indexOf(arquivo),
-        criadoEm: Date.now(),
-        ultimoAcesso: Date.now(),
-        nome: torrent.name
-    };
-
-    ativos.set(infoHash, registro);
-
-    try {
-        torrent.files.forEach((f) => { if (f !== arquivo) f.deselect(); });
-        arquivo.select();
-    } catch (_) { /* noop */ }
-
-    log.info('torrent ativo:', infoHash.slice(0, 12), '-', torrent.name, '(' + torrent.files.length + ' arquivos)');
-    return registro;
-}
-
-async function aguardarMinimo(registro, bytesMinimos, prazoMs) {
-    const alvo = Math.min(bytesMinimos, registro.arquivo.length);
-    const limite = Date.now() + (prazoMs || 45000);
-
-    while (Date.now() < limite) {
-        if (registro.torrent.downloaded >= alvo || registro.torrent.progress >= 0.02) return true;
-        if (registro.torrent.numPeers === 0 && Date.now() > limite - 20000) return false;
-        await new Promise((r) => setTimeout(r, 400));
-    }
-    return registro.torrent.downloaded > 0;
-}
-
-function estatisticas(infoHash) {
-    const registro = ativos.get(infoHash);
-    if (!registro) return null;
-    const t = registro.torrent;
-    return {
-        infoHash,
-        nome: t.name,
-        peers: t.numPeers,
-        progresso: Math.round((t.progress || 0) * 10000) / 100,
-        baixado: t.downloaded,
-        tamanho: t.length,
-        velocidadeDown: t.downloadSpeed,
-        velocidadeUp: t.uploadSpeed,
-        restanteSeg: t.timeRemaining,
-        ativo: true
-    };
-}
-
-function listarAtivos() {
-    return [...ativos.values()].map((r) => ({
-        infoHash: r.infoHash,
-        nome: r.nome,
-        arquivo: r.arquivo.name,
-        ociosoSeg: Math.round((Date.now() - r.ultimoAcesso) / 1000),
-        progresso: Math.round((r.torrent.progress || 0) * 10000) / 100,
-        peers: r.torrent.numPeers
-    }));
-}
-
-async function limparTudo() {
-    for (const hash of [...ativos.keys()]) {
-        await destruir(hash);
-    }
-    await removerPasta(config.TORRENT_DIR);
-    fs.mkdirSync(config.TORRENT_DIR, { recursive: true });
-    return true;
-}
-
-function caminhoArquivo(registro, indice) {
-    const arquivo = indice == null ? registro.arquivo : registro.torrent.files[indice];
-    if (!arquivo) return null;
-    return path.join(registro.torrent.path || path.join(config.TORRENT_DIR, registro.infoHash), arquivo.path);
-}
-
-function encerrar() {
-    encerrando = true;
-    if (temporizador) clearInterval(temporizador);
-    if (cliente) {
-        try { cliente.destroy(); } catch (_) { /* noop */ }
-    }
-    cliente = null;
-    ativos.clear();
-}
-
-module.exports = {
-    EXTENSOES_VIDEO,
-    abrir,
-    destruir,
-    varrer,
-    aguardarMinimo,
-    estatisticas,
-    listarAtivos,
-    limparTudo,
-    caminhoArquivo,
-    encerrar,
-    ff
-};
-'@
-
-# ===========================================================================
-#  src/routes/api.js
-# ===========================================================================
-$Arquivos['src/routes/api.js'] = @'
-'use strict';
-
-const express = require('express');
-const path = require('path');
-const config = require('../config');
-const fontes = require('../sources');
-const motor = require('../torrent/engine');
-const catalogo = require('../catalogo');
-const ff = require('../util/ffmpeg');
-const http = require('../util/http');
-const { criar } = require('../util/logger');
-const { infoHashDe } = require('../util/magnet');
-
-const log = criar('api');
-const rotas = express.Router();
-
-function ah(fn) {
-    return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-}
-
-const MIMES = {
-    '.mp4': 'video/mp4',
-    '.m4v': 'video/mp4',
-    '.mov': 'video/mp4',
-    '.webm': 'video/webm',
-    '.mkv': 'video/x-matroska',
-    '.avi': 'video/x-msvideo',
-    '.ts': 'video/mp2t',
-    '.flv': 'video/x-flv',
-    '.ogv': 'video/ogg'
+const VIDEO_EXT = /\.(mp4|m4v|mkv|webm|avi|mov|ogv|ogg|ts|mpg|mpeg|flv)$/i;
+const MIME = {
+  mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska',
+  avi: 'video/x-msvideo', mov: 'video/quicktime', ogv: 'video/ogg', ts: 'video/mp2t'
 };
 
-function mimeDe(nome) {
-    return MIMES[path.extname(String(nome || '')).toLowerCase()] || 'application/octet-stream';
+function mimeFor(nome) {
+  const ext = String(nome).split('.').pop().toLowerCase();
+  return MIME[ext] || 'application/octet-stream';
 }
 
-/* --------------------------------------------------------------------------
-   Saude / fontes
--------------------------------------------------------------------------- */
+function agora() { return Date.now(); }
 
-rotas.get('/api/saude', (req, res) => {
-    res.json({
-        ok: true,
-        versao: 3,
-        uptimeSeg: Math.round(process.uptime()),
-        torrentsAtivos: motor.listarAtivos().length,
-        catalogo: catalogo.resumo(),
-        ffmpeg: ff.caminhoDoBinario()
+/* ----------------------------- limpeza ----------------------------- */
+
+function apagarPasta(dir, tentativa) {
+  const n = tentativa || 0;
+  if (!dir) return;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (!fs.existsSync(dir)) return;
+  } catch (e) { }
+  if (n < 6) setTimeout(function () { apagarPasta(dir, n + 1); }, 300 * (n + 1));
+}
+
+function limparOrfaos() {
+  if (CACHE_MODE === 'keep') return;
+  try {
+    fs.readdirSync(CACHE_ROOT).forEach(function (nome) {
+      const p = path.join(CACHE_ROOT, nome);
+      try { if (fs.statSync(p).isDirectory()) apagarPasta(p); } catch (e) { }
     });
-});
+  } catch (e) { }
+}
+limparOrfaos();
 
-rotas.get('/api/fontes', ah(async (req, res) => {
-    const relatorio = await fontes.statusFontes(req.query.forcar === '1');
-    res.json(relatorio);
-}));
+/* ------------------------------- job ------------------------------- */
 
-rotas.get('/api/categorias', (req, res) => {
-    res.json({
-        categorias: [
-            { id: 'inicio', rotulo: 'Início' },
-            { id: 'filmes', rotulo: 'Filmes' },
-            { id: 'series', rotulo: 'Séries' },
-            { id: 'animes', rotulo: 'Animes' },
-            { id: 'doramas', rotulo: 'Doramas' },
-            { id: 'novelas', rotulo: 'Novelas' },
-            { id: 'curtas', rotulo: 'Curtas' },
-            { id: 'documentarios', rotulo: 'Documentários' }
-        ]
-    });
-});
+function start(params) {
+  const magnet = appendTrackers(params.magnet);
+  if (!magnet) throw new Error('Magnet link invalido.');
 
-/* --------------------------------------------------------------------------
-   Busca
--------------------------------------------------------------------------- */
+  if (jobs.size >= MAX_JOBS) destruirMaisAntigo();
 
-rotas.get('/api/buscar', ah(async (req, res) => {
-    const termo = String(req.query.q || '').trim();
-    if (!termo) return res.json({ termo: '', total: 0, itens: [], fontes: [] });
+  const id = crypto.randomBytes(8).toString('hex');
+  const dir = path.join(CACHE_ROOT, id);
+  fs.mkdirSync(dir, { recursive: true });
 
-    const dados = await fontes.buscar(termo, {
-        categoria: req.query.categoria || 'todos',
-        pagina: Number(req.query.pagina) || 1,
-        porPagina: Math.min(120, Number(req.query.porPagina) || 60),
-        apenasPtBr: req.query.ptbr === undefined ? config.APENAS_PTBR : req.query.ptbr !== '0',
-        resolverMagnet: req.query.magnet !== '0'
-    });
+  const job = {
+    id: id, dir: dir,
+    createdAt: agora(), lastAccess: agora(),
+    state: 'conectando',
+    message: 'Conectando aos peers...',
+    magnet: magnet,
+    titulo: params.titulo || '',
+    qualidade: params.qualidade || '',
+    fileIdx: (params.fileIdx === undefined || params.fileIdx === null || params.fileIdx === '') ? null : Number(params.fileIdx),
+    peers: 0, progress: 0, buffer: 0, speed: 0, downloaded: 0, total: 0,
+    fileName: '', streamUrl: null, canPlay: false,
+    subs: [], subsSelecionadas: [],
+    tentativas: 0, torrent: null, file: null, nudge: null, timers: []
+  };
 
-    res.json(dados);
-}));
+  jobs.set(id, job);
+  attach(job);
+  return job;
+}
 
-rotas.get('/api/catalogo', (req, res) => {
-    res.json(catalogo.listar(req.query.categoria || 'inicio', {
-        pagina: Number(req.query.pagina) || 1,
-        porPagina: Math.min(120, Number(req.query.porPagina) || 60),
-        termo: req.query.termo || ''
-    }));
-});
+function limparTimers(job) {
+  if (job.nudge) { clearInterval(job.nudge); job.nudge = null; }
+  (job.timers || []).forEach(function (t) { clearTimeout(t); });
+  job.timers = [];
+}
 
-/* --------------------------------------------------------------------------
-   Proxy de imagens (evita bloqueio de hotlink dos sites BR)
--------------------------------------------------------------------------- */
+function attach(job) {
+  let torrent;
+  try {
+    torrent = client.add(job.magnet, { path: job.dir, announce: TRACKERS });
+  } catch (err) {
+    job.state = 'erro';
+    job.message = 'Nao foi possivel abrir o magnet: ' + err.message;
+    return;
+  }
 
-rotas.get('/api/img', ah(async (req, res) => {
-    const alvo = String(req.query.u || '');
-    if (!/^https?:\/\//i.test(alvo)) return res.status(400).end();
+  job.torrent = torrent;
+  job.state = 'conectando';
+  job.message = 'Procurando peers em ' + TRACKERS.length + ' trackers...';
+  try { torrent.strategy = 'sequential'; } catch (e) { }
 
-    const resposta = await http.binario(alvo, {
-        referer: req.query.ref || undefined,
-        tentativas: 1,
-        timeout: 12000
-    });
-
-    res.setHeader('Content-Type', resposta.headers['content-type'] || 'image/jpeg');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.send(resposta.buffer);
-}));
-
-/* --------------------------------------------------------------------------
-   Metadados do torrent
--------------------------------------------------------------------------- */
-
-rotas.get('/api/torrent/:infoHash', ah(async (req, res) => {
-    const registro = await motor.abrir(req.params.infoHash);
-    const caminho = motor.caminhoArquivo(registro);
-    const info = await ff.probe(caminho, { timeoutMs: 25000 });
-    const plano = ff.planejar(info);
-
-    res.json({
-        infoHash: registro.infoHash,
-        nome: registro.torrent.name,
-        tamanho: registro.torrent.length,
-        indice: registro.indiceArquivo,
-        arquivo: registro.arquivo.name,
-        arquivoTamanho: registro.arquivo.length,
-        modo: plano.modo,
-        motivo: plano.motivo,
-        tecnico: info,
-        arquivos: registro.torrent.files.map((f, i) => ({
-            indice: i,
-            nome: f.name,
-            tamanho: f.length,
-            video: motor.EXTENSOES_VIDEO.includes(path.extname(f.name).toLowerCase())
-        })),
-        estatisticas: motor.estatisticas(registro.infoHash)
-    });
-}));
-
-rotas.get('/api/status/:infoHash', ah(async (req, res) => {
-    const stats = motor.estatisticas(req.params.infoHash);
-    if (!stats) return res.status(404).json({ ativo: false });
-    res.json(stats);
-}));
-
-/* --------------------------------------------------------------------------
-   Streaming direto (Range / 206)
--------------------------------------------------------------------------- */
-
-rotas.get('/stream/:infoHash/:indice?', ah(async (req, res) => {
-    const registro = await motor.abrir(req.params.infoHash);
-    const indice = req.params.indice == null ? registro.indiceArquivo : Number(req.params.indice);
-    const arquivo = registro.torrent.files[indice];
-    if (!arquivo) return res.status(404).end();
-
-    await motor.aguardarMinimo(registro, 2 * 1024 * 1024, 30000);
-    registro.ultimoAcesso = Date.now();
-
-    const total = arquivo.length;
-    const cabecalho = req.headers.range;
-    let inicio = 0;
-    let fim = total - 1;
-
-    if (cabecalho) {
-        const m = /bytes=(\d*)-(\d*)/.exec(cabecalho);
-        if (m) {
-            if (m[1]) inicio = parseInt(m[1], 10);
-            if (m[2]) fim = parseInt(m[2], 10);
-            if (Number.isNaN(inicio) || inicio < 0) inicio = 0;
-            if (Number.isNaN(fim) || fim >= total) fim = total - 1;
-            if (inicio > fim) inicio = 0;
-        }
+  job.nudge = setInterval(function () {
+    if (job.state === 'pronto') return;
+    job.peers = torrent.numPeers || 0;
+    if (job.peers === 0) {
+      TRACKERS.forEach(function (t) { try { torrent.addTracker(t); } catch (e) { } });
+      job.message = 'Reforcando announce list (' + TRACKERS.length + ' trackers)...';
     }
+  }, 6000);
 
-    res.status(cabecalho ? 206 : 200);
-    res.setHeader('Content-Type', mimeDe(arquivo.name));
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Content-Length', fim - inicio + 1);
-    res.setHeader('Cache-Control', 'no-store');
-    if (cabecalho) res.setHeader('Content-Range', 'bytes ' + inicio + '-' + fim + '/' + total);
+  job.timers.push(setTimeout(function () {
+    if (job.state === 'pronto') return;
+    job.message = 'Metadados demorando. Tentando trackers alternativos...';
+  }, 14000));
 
-    const stream = arquivo.createReadStream({ start: inicio, end: fim });
-    stream.on('error', (erro) => {
-        log.debug('stream encerrado:', erro.message);
-        try { res.end(); } catch (_) { /* noop */ }
+  job.timers.push(setTimeout(function () {
+    if (job.state === 'pronto') return;
+    if (job.tentativas < 2) {
+      job.tentativas += 1;
+      job.message = 'Tentativa ' + job.tentativas + ' expirada. Reiniciando...';
+      restart(job);
+    } else {
+      job.state = 'erro';
+      job.message = 'Tempo esgotado: nenhum peer respondeu.';
+      limparTimers(job);
+    }
+  }, METADATA_TIMEOUT));
+
+  torrent.on('metadata', function () {
+    job.state = 'metadados';
+    job.message = 'Metadados recebidos. Selecionando video...';
+    setTimeout(function () { onReady(job); }, 400);
+  });
+
+  torrent.on('ready', function () { onReady(job); });
+  torrent.on('noPeers', function () { job.message = 'Sem peers no momento, reforcando trackers...'; });
+  torrent.on('wire', function () { job.peers = torrent.numPeers || 0; });
+
+  torrent.on('download', function () {
+    job.progress = torrent.progress || 0;
+    job.speed = torrent.downloadSpeed || 0;
+    job.downloaded = torrent.downloaded || 0;
+    job.peers = torrent.numPeers || 0;
+    if (job.file) {
+      job.buffer = (job.file.progress || 0) * 100;
+      if (!job.canPlay) {
+        const baixado = job.file.downloaded || 0;
+        if (job.buffer >= MIN_BUFFER_PERCENT || baixado >= MIN_BUFFER_MB * 1024 * 1024) {
+          job.canPlay = true;
+          job.state = 'pronto';
+          job.message = 'Buffer pronto.';
+        }
+      }
+    }
+  });
+
+  torrent.on('error', function (err) {
+    job.state = 'erro';
+    job.message = 'Erro no torrent: ' + err.message;
+    limparTimers(job);
+  });
+
+  torrent.on('warning', function (e) { console.warn('[torrent] ' + e.message); });
+}
+
+function restart(job) {
+  limparTimers(job);
+  try { if (job.torrent) job.torrent.destroy({ destroyStore: false }); } catch (e) { }
+  job.torrent = null;
+  job.state = 'conectando';
+  job.peers = 0;
+  setTimeout(function () { if (job.state !== 'pronto' && !job.torrent) attach(job); }, 500);
+}
+
+function pickFile(torrent, fileIdx) {
+  const files = torrent.files || [];
+  if (!files.length) return null;
+  if (fileIdx !== null && fileIdx >= 0 && files[fileIdx]) {
+    const cand = files[fileIdx];
+    if (VIDEO_EXT.test(cand.name)) return cand;
+    const vids = files.filter(function (f) { return VIDEO_EXT.test(f.name); });
+    if (vids.length <= 1) return cand;
+  }
+  const vids = files.filter(function (f) { return VIDEO_EXT.test(f.name); });
+  const pool = vids.length ? vids : files;
+  return pool.slice().sort(function (a, b) { return b.length - a.length; })[0] || null;
+}
+
+function coletarSubs(torrent, video) {
+  const base = String(video.name).replace(/\.[^.]+$/, '').toLowerCase();
+  return (torrent.files || [])
+    .map(function (f, i) { return { f: f, i: i }; })
+    .filter(function (x) { return subtitulos.ehLegenda(x.f.name); })
+    .sort(function (a, b) {
+      const ca = String(a.f.name).toLowerCase().indexOf(base) === 0 ? 0 : 1;
+      const cb = String(b.f.name).toLowerCase().indexOf(base) === 0 ? 0 : 1;
+      return ca - cb || a.f.length - b.f.length;
+    })
+    .slice(0, MAX_SUBS)
+    .map(function (x, idx) {
+      const lang = subtitulos.idiomaDe(x.f.name);
+      return { idx: idx, fileIndex: x.i, nome: String(x.f.name).split('/').pop(), code: lang.code, label: lang.label };
     });
-    req.on('close', () => { try { stream.destroy(); } catch (_) { /* noop */ } });
+}
+
+function onReady(job) {
+  if (job.file) return;
+  const torrent = job.torrent;
+  if (!torrent) return;
+
+  const file = pickFile(torrent, job.fileIdx);
+  if (!file) {
+    job.state = 'erro';
+    job.message = 'Nenhum arquivo de video neste torrent.';
+    limparTimers(job);
+    return;
+  }
+
+  job.file = file;
+  job.fileName = file.name;
+  job.total = file.length;
+  job.streamUrl = '/api/play/stream?jobId=' + job.id;
+  job.state = 'bufferizando';
+  job.message = 'Conectando aos peers (buffer)...';
+
+  job.subs = coletarSubs(torrent, file);
+  const manter = [file].concat(job.subs.map(function (s) { return torrent.files[s.fileIndex]; }));
+  manter.forEach(function (f) { try { f.select(); } catch (e) { } });
+  (torrent.files || []).forEach(function (f) {
+    if (manter.indexOf(f) === -1) { try { f.deselect(); } catch (e) { } }
+  });
+}
+
+/* ------------------------------- HTTP ------------------------------ */
+
+function handle(jobId, req, res) {
+  const job = jobs.get(jobId);
+  if (!job) { res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Job nao encontrado.'); return; }
+  job.lastAccess = agora();
+
+  if (job.state === 'erro') { res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end(job.message); return; }
+
+  const file = job.file;
+  if (!file) { res.writeHead(202, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Aguardando metadados...'); return; }
+
+  const total = file.length;
+  const base = {
+    'content-type': mimeFor(file.name),
+    'accept-ranges': 'bytes',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+    'access-control-expose-headers': 'content-range,content-length,accept-ranges'
+  };
+
+  if (req.method === 'HEAD') { res.writeHead(200, Object.assign({ 'content-length': total }, base)); res.end(); return; }
+
+  const range = req.headers.range;
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range);
+    let start = m && m[1] ? parseInt(m[1], 10) : 0;
+    let end = m && m[2] ? parseInt(m[2], 10) : total - 1;
+    if (isNaN(start) || start < 0) start = 0;
+    if (isNaN(end) || end >= total) end = total - 1;
+    if (start > end) { res.writeHead(416, Object.assign({ 'content-range': 'bytes */' + total }, base)); res.end(); return; }
+    res.writeHead(206, Object.assign({
+      'content-range': 'bytes ' + start + '-' + end + '/' + total,
+      'content-length': end - start + 1
+    }, base));
+    const stream = file.createReadStream({ start: start, end: end });
+    stream.on('error', function () { try { res.end(); } catch (e) { } });
+    res.on('close', function () { try { stream.destroy(); } catch (e) { } });
     stream.pipe(res);
-}));
+    return;
+  }
 
-/* --------------------------------------------------------------------------
-   Transcode / remux on-the-fly (fMP4)
--------------------------------------------------------------------------- */
+  res.writeHead(200, Object.assign({ 'content-length': total }, base));
+  const stream = file.createReadStream();
+  stream.on('error', function () { try { res.end(); } catch (e) { } });
+  res.on('close', function () { try { stream.destroy(); } catch (e) { } });
+  stream.pipe(res);
+}
 
-rotas.get('/transcode/:infoHash/:indice?', ah(async (req, res) => {
-    const registro = await motor.abrir(req.params.infoHash);
-    const indice = req.params.indice == null ? registro.indiceArquivo : Number(req.params.indice);
-    const arquivo = registro.torrent.files[indice];
-    if (!arquivo) return res.status(404).end();
+/* ---------------------------- legendas ----------------------------- */
 
-    await motor.aguardarMinimo(registro, 4 * 1024 * 1024, 40000);
-    registro.ultimoAcesso = Date.now();
-
-    const caminho = motor.caminhoArquivo(registro, indice);
-    const info = await ff.probe(caminho, { timeoutMs: 25000 });
-    const plano = ff.planejar(info);
-
-    const seek = Number(req.query.t) || 0;
-
-    res.status(200);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('Accept-Ranges', 'none');
-
-    const processo = ff.converter(caminho, { seek, plano });
-
-    let erroFfmpeg = '';
-    processo.stderr.on('data', (d) => { erroFfmpeg += d.toString(); });
-    processo.on('error', (erro) => {
-        log.erro('ffmpeg falhou:', erro.message);
-        try { res.end(); } catch (_) { /* noop */ }
+function lerArquivo(file, limite) {
+  return new Promise(function (resolve, reject) {
+    const pedacos = [];
+    let total = 0;
+    let resolvido = false;
+    const stream = file.createReadStream();
+    const fim = function (erro) {
+      if (resolvido) return;
+      resolvido = true;
+      clearTimeout(timer);
+      if (erro) reject(erro); else resolve(subtitulos.decodificar(Buffer.concat(pedacos)));
+    };
+    const timer = setTimeout(function () { try { stream.destroy(); } catch (e) { } fim(); }, 25000);
+    stream.on('data', function (c) {
+      pedacos.push(c);
+      total += c.length;
+      if (total > (limite || 4 * 1024 * 1024)) { try { stream.destroy(); } catch (e) { } fim(); }
     });
-    processo.on('close', (codigo) => {
-        if (codigo !== 0 && erroFfmpeg) log.debug('ffmpeg saiu com', codigo, erroFfmpeg.slice(-400));
-        try { res.end(); } catch (_) { /* noop */ }
-    });
+    stream.on('end', function () { fim(); });
+    stream.on('close', function () { fim(); });
+    stream.on('error', function (e) { fim(e); });
+  });
+}
 
-    processo.stdout.pipe(res);
+async function legenda(jobId, idx) {
+  const job = jobs.get(jobId);
+  if (!job || !job.subs || !job.subs[idx]) return null;
+  const sub = job.subs[idx];
+  const file = job.torrent && job.torrent.files[sub.fileIndex];
+  if (!file) return null;
+  job.lastAccess = agora();
+  const texto = await lerArquivo(file);
+  return {
+    nome: sub.nome,
+    code: sub.code,
+    label: sub.label,
+    vtt: subtitulos.converter(texto, subtitulos.extensao(file.name))
+  };
+}
 
-    req.on('close', () => {
-        try { processo.kill('SIGKILL'); } catch (_) { /* noop */ }
-    });
-}));
+/* ------------------------------ status ----------------------------- */
 
-/* --------------------------------------------------------------------------
-   Cache
--------------------------------------------------------------------------- */
+function status(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return null;
+  job.lastAccess = agora();
+  const t = job.torrent;
+  return {
+    id: job.id,
+    state: job.state,
+    message: job.message,
+    titulo: job.titulo,
+    qualidade: job.qualidade,
+    fileName: job.fileName,
+    peers: t ? (t.numPeers || 0) : job.peers,
+    progress: t ? (t.progress || 0) : 0,
+    buffer: job.buffer || 0,
+    speed: t ? (t.downloadSpeed || 0) : 0,
+    downloaded: t ? (t.downloaded || 0) : 0,
+    total: job.total || 0,
+    canPlay: !!job.canPlay,
+    minBuffer: MIN_BUFFER_PERCENT,
+    subs: job.subs ? job.subs.map(function (s) { return { idx: s.idx, nome: s.nome, code: s.code, label: s.label }; }) : [],
+    elapsed: Math.round((agora() - job.createdAt) / 1000),
+    streamUrl: job.streamUrl
+  };
+}
 
-rotas.get('/api/cache', (req, res) => {
-    res.json({ ativos: motor.listarAtivos() });
-});
+function stop(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return false;
+  limparTimers(job);
+  jobs.delete(jobId);
 
-rotas.delete('/api/cache', ah(async (req, res) => {
-    const alvo = req.query.infoHash;
-    if (alvo) {
-        const ok = await motor.destruir(alvo);
-        return res.json({ ok, removido: alvo });
-    }
-    await motor.limparTudo();
-    fontes.limparCache();
-    res.json({ ok: true });
-}));
+  const dir = job.dir;
+  const finalizar = function () { if (CACHE_MODE !== 'keep') apagarPasta(dir); };
 
-rotas.post('/api/cache/limpar', ah(async (req, res) => {
-    await motor.limparTudo();
-    fontes.limparCache();
-    res.json({ ok: true });
-}));
+  try {
+    if (job.torrent) job.torrent.destroy({ destroyStore: true }, function () { finalizar(); });
+    else finalizar();
+  } catch (e) { finalizar(); }
+  return true;
+}
 
-/* --------------------------------------------------------------------------
-   Erros
--------------------------------------------------------------------------- */
+function destruirMaisAntigo() {
+  let alvo = null;
+  jobs.forEach(function (j) { if (!alvo || j.lastAccess < alvo.lastAccess) alvo = j; });
+  if (alvo) stop(alvo.id);
+}
 
-rotas.use((erro, req, res, next) => {
-    log.aviso(req.method, req.originalUrl, '->', erro.message);
-    if (res.headersSent) return next(erro);
-    res.status(500).json({
-        erro: erro.message,
-        dica: /tempo esgotado/i.test(erro.message)
-            ? 'Poucos seeds no magnet. Tente outra fonte/qualidade.'
-            : undefined
-    });
-});
+function stopTudo() { Array.from(jobs.keys()).forEach(function (id) { stop(id); }); }
 
-module.exports = rotas;
+setInterval(function () {
+  const t = agora();
+  jobs.forEach(function (j) { if (t - j.lastAccess > IDLE_TIMEOUT) stop(j.id); });
+}, 45000);
+
+process.on('SIGINT', function () { try { client.destroy(); } catch (e) { } stopTudo(); process.exit(0); });
+process.on('SIGTERM', function () { try { client.destroy(); } catch (e) { } stopTudo(); process.exit(0); });
+
+module.exports = {
+  start: start, status: status, stop: stop, stopTudo: stopTudo,
+  handle: handle, legenda: legenda, jobs: jobs, CACHE_ROOT: CACHE_ROOT
+};
 '@
+Write-ProjectFile 'src/streamer.js' $streamerJs
 
-# ===========================================================================
-#  server.js
-# ===========================================================================
-$Arquivos['server.js'] = @'
+# ======================================================================
+Write-Step 'Servidor'
+
+# ----------------------------------------------------------------------
+$serverJs = @'
 'use strict';
+
+/**
+ * CineP2P 4.0 - API desacoplada (Capacitor/Cordova ready).
+ */
+
+require('dotenv').config();
+
+if (typeof fetch !== 'function') { console.error('Node.js 18+ necessario.'); process.exit(1); }
 
 const path = require('path');
 const express = require('express');
-const compression = require('compression');
-const cors = require('cors');
 
-const config = require('./src/config');
-const rotas = require('./src/routes/api');
-const motor = require('./src/torrent/engine');
-const catalogo = require('./src/catalogo');
-const { log } = require('./src/util/logger');
-const ff = require('./src/util/ffmpeg');
+const tmdb = require('./src/tmdb');
+const magnets = require('./src/magnets');
+const streamer = require('./src/streamer');
+
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '0.0.0.0';
+const VERSAO = '4.0.0';
 
 const app = express();
-
 app.disable('x-powered-by');
-app.use(compression({ threshold: 1024 }));
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 
-app.use((req, res, next) => {
-    if (/^\/(api|stream|transcode)\//.test(req.path)) {
-        log.debug(req.method, req.originalUrl);
-    }
-    next();
+app.use(function (req, res, next) {
+  res.setHeader('access-control-allow-origin', '*');
+  res.setHeader('access-control-allow-headers', 'content-type,range,accept');
+  res.setHeader('access-control-expose-headers', 'content-range,content-length,accept-ranges');
+  res.setHeader('access-control-allow-methods', 'GET,HEAD,POST,OPTIONS');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  next();
 });
 
-app.use(rotas);
+function fail(res, err, status) {
+  const code = (err && err.code === 'TMDB_NOT_CONFIGURED') ? 503 : (status || 500);
+  console.error('[api] ' + (err && err.message));
+  res.status(code).json({ error: (err && err.message) ? err.message : 'Erro interno.' });
+}
 
-app.use('/api', (req, res) => res.status(404).json({ erro: 'rota nao encontrada', rota: req.originalUrl }));
+/* ------------------------------ config ----------------------------- */
 
-app.use(express.static(path.join(config.RAIZ, 'public'), { maxAge: '1h' }));
-
-app.get('*', (req, res) => {
-    res.sendFile(path.join(config.RAIZ, 'public', 'index.html'));
+app.get('/api/health', function (req, res) {
+  res.json({ ok: true, versao: VERSAO, tmdb: tmdb.isConfigured(), uptime: Math.round(process.uptime()) });
 });
 
-catalogo.carregar();
-
-const servidor = app.listen(config.PORT, config.HOST, () => {
-    const bin = ff.caminhoDoBinario();
-    log.info('cinep2p v3 no ar em http://localhost:' + config.PORT);
-    log.info('cache P2P      :', config.TORRENT_DIR);
-    log.info('max torrents   :', config.MAX_TORRENTS_ATIVOS, '| ociosidade:', config.TORRENT_IDLE_MIN + 'min');
-    log.info('ffmpeg         :', bin.ffmpeg);
-    log.info('catalogo       :', JSON.stringify(catalogo.resumo()));
+app.get('/api/config', function (req, res) {
+  res.json({
+    versao: VERSAO,
+    tmdbConfigurado: tmdb.isConfigured(),
+    idioma: tmdb.cfg().language,
+    cache: streamer.CACHE_ROOT,
+    minBuffer: Number(process.env.MIN_BUFFER_PERCENT || 3)
+  });
 });
 
-function desligar(sinal) {
-    log.info('encerrando (' + sinal + ')...');
-    servidor.close(() => {
-        motor.encerrar();
-        process.exit(0);
+app.get('/api/generos', async function (req, res) {
+  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
+  try { res.json({ generos: await tmdb.generos(tipo) }); } catch (err) { fail(res, err); }
+});
+
+/* ------------------------------- home ------------------------------ */
+
+app.get('/api/home', async function (req, res) {
+  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
+  try {
+    const base = tipo === 'tv'
+      ? [tmdb.list('/tv/popular', null, 'tv'), tmdb.list('/tv/top_rated', null, 'tv'), tmdb.list('/trending/tv/week', null, 'tv')]
+      : [tmdb.list('/movie/popular', null, 'movie'), tmdb.list('/movie/top_rated', null, 'movie'), tmdb.list('/trending/movie/week', null, 'movie')];
+
+    const r = await Promise.all(base.concat([
+      tmdb.lancamentos(tipo),
+      tmdb.porGenero(tipo, tipo === 'tv' ? 10759 : 28),
+      tmdb.porGenero(tipo, 35),
+      tmdb.porGenero(tipo, 16),
+      tmdb.porGenero(tipo, tipo === 'tv' ? 9648 : 53),
+      tmdb.porGenero(tipo, 27)
+    ]));
+
+    const hero = (r[2] && r[2][0]) || (r[0] && r[0][0]) || null;
+    const rows = [
+      { titulo: 'Lancamentos (Ultimo Ano)', itens: (r[3] || []).slice(0, 20) },
+      { titulo: 'Populares', itens: (r[0] || []).slice(0, 20) },
+      { titulo: 'Em Alta Agora', itens: (r[2] || []).slice(0, 20) },
+      { titulo: 'Mais Bem Avaliados', itens: (r[1] || []).slice(0, 20) },
+      { titulo: 'Acao', itens: (r[4] || []).slice(0, 20) },
+      { titulo: 'Comedia', itens: (r[5] || []).slice(0, 20) },
+      { titulo: 'Animacao', itens: (r[6] || []).slice(0, 20) },
+      { titulo: 'Suspense', itens: (r[7] || []).slice(0, 20) },
+      { titulo: 'Terror', itens: (r[8] || []).slice(0, 20) }
+    ].filter(function (x) { return x.itens.length; });
+
+    res.json({ tipo: tipo, hero: hero, rows: rows, atualizado: Date.now() });
+  } catch (err) { fail(res, err); }
+});
+
+/* ---------------------------- catalogo ----------------------------- */
+
+app.get('/api/filmes/populares', async function (req, res) {
+  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
+  try { res.json({ itens: await tmdb.list(tipo === 'tv' ? '/tv/popular' : '/movie/popular', { page: req.query.pagina || 1 }, tipo) }); }
+  catch (err) { fail(res, err); }
+});
+
+app.get('/api/filmes/lancamentos', async function (req, res) {
+  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
+  try { res.json({ itens: await tmdb.lancamentos(tipo) }); } catch (err) { fail(res, err); }
+});
+
+app.get('/api/filmes/top', async function (req, res) {
+  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
+  try { res.json({ itens: await tmdb.list(tipo === 'tv' ? '/tv/top_rated' : '/movie/top_rated', { page: req.query.pagina || 1 }, tipo) }); }
+  catch (err) { fail(res, err); }
+});
+
+app.get('/api/filmes/genero/:id', async function (req, res) {
+  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
+  try { res.json({ itens: await tmdb.porGenero(tipo, req.params.id, req.query.pagina) }); }
+  catch (err) { fail(res, err); }
+});
+
+app.get('/api/media/:tipo/:id', async function (req, res) {
+  const tipo = req.params.tipo === 'tv' ? 'tv' : 'movie';
+  try { res.json(await tmdb.detalhes(tipo, req.params.id)); } catch (err) { fail(res, err); }
+});
+
+app.get('/api/buscar', async function (req, res) {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.json({ itens: [] });
+  try { res.json({ itens: await tmdb.buscar(q, req.query.tipo || null) }); } catch (err) { fail(res, err); }
+});
+
+/* ---------------------------- torrents ----------------------------- */
+
+app.get('/api/torrent', async function (req, res) {
+  const q = req.query;
+  const ctx = {
+    titulo: q.titulo || q.query || '',
+    tituloOriginal: q.tituloOriginal || '',
+    ano: q.ano || '',
+    imdbId: q.imdbId || null,
+    tipo: q.tipo === 'tv' ? 'tv' : 'movie',
+    temporada: Number(q.temporada) || 1,
+    episodio: Number(q.episodio) || 1
+  };
+  if (!ctx.titulo && !ctx.imdbId) return res.status(400).json({ error: 'Informe titulo ou imdbId.' });
+  try {
+    const r = await magnets.buscar(ctx);
+    res.json({
+      melhor: r.melhor,
+      fontes: r.fontes,
+      ptbr: r.ptbr,
+      total: r.total,
+      ptbrTotal: r.ptbrTotal,
+      confirmados: r.confirmados,
+      ms: r.ms,
+      scrapers: r.scrapers
     });
-    setTimeout(() => process.exit(0), 6000);
-}
+  } catch (err) { fail(res, err); }
+});
 
-process.on('SIGINT', () => desligar('SIGINT'));
-process.on('SIGTERM', () => desligar('SIGTERM'));
-process.on('unhandledRejection', (e) => log.aviso('promise rejeitada:', e && e.message));
+/* ------------------------------ player ----------------------------- */
+
+app.get('/api/play', function (req, res) {
+  if (!req.query.magnet) return res.status(400).json({ error: 'Parametro magnet obrigatorio.' });
+  try {
+    const job = streamer.start({
+      magnet: String(req.query.magnet),
+      fileIdx: req.query.fileIdx,
+      titulo: req.query.titulo,
+      qualidade: req.query.qualidade
+    });
+    res.json({ jobId: job.id, statusUrl: '/api/play/status?jobId=' + job.id, streamUrl: '/api/play/stream?jobId=' + job.id });
+  } catch (err) { fail(res, err); }
+});
+
+app.get('/api/play/status', function (req, res) {
+  const s = streamer.status(String(req.query.jobId || ''));
+  if (!s) return res.status(404).json({ error: 'Job nao encontrado.' });
+  res.json(s);
+});
+
+app.get('/api/play/stream', function (req, res) { streamer.handle(String(req.query.jobId || ''), req, res); });
+
+app.get('/api/play/subs', function (req, res) {
+  const s = streamer.status(String(req.query.jobId || ''));
+  if (!s) return res.status(404).json({ error: 'Job nao encontrado.' });
+  res.json({ subs: s.subs || [] });
+});
+
+app.get('/api/play/subtitle', async function (req, res) {
+  try {
+    const r = await streamer.legenda(String(req.query.jobId || ''), Number(req.query.idx) || 0);
+    if (!r) { res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Legenda indisponivel.'); return; }
+    res.writeHead(200, {
+      'content-type': 'text/vtt; charset=utf-8',
+      'cache-control': 'no-store',
+      'access-control-allow-origin': '*'
+    });
+    res.end(r.vtt);
+  } catch (err) { fail(res, err); }
+});
+
+app.all('/api/play/stop', function (req, res) {
+  const id = String((req.query && req.query.jobId) || '');
+  res.json({ parado: id ? streamer.stop(id) : (streamer.stopTudo(), true) });
+});
+
+app.use('/api', function (req, res) { res.status(404).json({ error: 'Rota nao encontrada: ' + req.originalUrl }); });
+
+/* ---------------------------- estaticos ---------------------------- */
+
+app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
+app.get('*', function (req, res) { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
+
+app.listen(PORT, HOST, function () {
+  console.log('');
+  console.log('  CineP2P ' + VERSAO + ' -> http://localhost:' + PORT);
+  console.log('  Cache (apagado ao fechar o player): ' + streamer.CACHE_ROOT);
+  if (!tmdb.isConfigured()) console.log('  ATENCAO: TMDB_API_KEY ausente no .env');
+  console.log('');
+});
 '@
+Write-ProjectFile 'server.js' $serverJs
 
-# ===========================================================================
-#  worker.js
-# ===========================================================================
-$Arquivos['worker.js'] = @'
-'use strict';
+# ======================================================================
+Write-Step 'Frontend'
 
-/*
- * worker.js - daemon de aquecimento do catalogo e manutencao do cache.
- *
- *   node worker.js          -> roda um ciclo e mantem intervalo de 6h
- *   node worker.js --once   -> roda um ciclo e sai
- *   node worker.js --fontes -> apenas testa a saude das fontes
- */
-
-const config = require('./src/config');
-const fontes = require('./src/sources');
-const catalogo = require('./src/catalogo');
-const motor = require('./src/torrent/engine');
-const { criar } = require('./src/util/logger');
-
-const log = criar('worker');
-
-const INTERVALO_MS = Number(process.env.CINE_WORKER_INTERVALO_MIN || 360) * 60 * 1000;
-
-const CONSULTAS = {
-    filmes: [
-        'filme dublado 1080p',
-        'filme dublado 720p',
-        'filme dual audio 1080p',
-        'lancamento dublado',
-        'filme nacional 1080p',
-        'animacao dublada 1080p',
-        'filme legendado pt br 1080p'
-    ],
-    series: [
-        'serie dublada 1080p',
-        'serie completa dublada',
-        'serie dual audio 1080p',
-        'temporada completa dublada 720p',
-        'serie legendada 1080p'
-    ],
-    animes: [
-        'anime dublado 1080p',
-        'anime dublado 720p',
-        'anime dual audio 1080p',
-        'anime completo dublado',
-        'anime legendado 1080p'
-    ],
-    doramas: [
-        'dorama dublado 1080p',
-        'dorama legendado 1080p',
-        'dorama completo dublado',
-        'kdrama dublado 720p',
-        'drama coreano dublado'
-    ],
-    novelas: [
-        'novela dublada completa',
-        'novela mexicana dublada 1080p',
-        'novela turca dublada',
-        'telenovela completa',
-        'novela legendada 720p'
-    ],
-    curtas: [
-        'curta animacao dublado',
-        'curta metragem nacional',
-        'curtas animados dublados'
-    ]
-};
-
-async function ciclo() {
-    const inicio = Date.now();
-    log.info('iniciando ciclo de aquecimento do catalogo');
-    let total = 0;
-
-    for (const categoria of Object.keys(CONSULTAS)) {
-        for (const termo of CONSULTAS[categoria]) {
-            try {
-                const dados = await fontes.buscar(termo, {
-                    categoria,
-                    limitePorFonte: 20,
-                    apenasPtBr: true,
-                    resolverMagnet: false
-                });
-
-                const uteis = (dados.itens || []).filter(
-                    (i) => i.magnet && (i.idioma ? i.idioma.ptbr : true)
-                );
-
-                if (uteis.length) {
-                    const tamanho = catalogo.adicionar(categoria, uteis);
-                    total += uteis.length;
-                    log.info('[' + categoria + '] "' + termo + '" ->', uteis.length, 'itens (catalogo:', tamanho + ')');
-                }
-            } catch (erro) {
-                log.aviso('[' + categoria + '] "' + termo + '" falhou:', erro.message);
-            }
-        }
-    }
-
-    catalogo.gravar();
-    log.info('ciclo concluido em', ((Date.now() - inicio) / 1000).toFixed(1) + 's | itens processados:', total);
-    log.info('resumo do catalogo:', JSON.stringify(catalogo.resumo()));
-}
-
-async function testarFontes() {
-    const relatorio = await fontes.statusFontes(true);
-    log.info('fontes online:', relatorio.online + '/' + relatorio.total);
-    for (const f of relatorio.fontes) {
-        const marca = f.online ? 'OK ' : 'OFF';
-        log.info(' ' + marca + ' ' + f.nome.padEnd(24, ' ') + ' ' + (f.erro || f.ms + 'ms') + ' busca=' + JSON.stringify(f.buscaTeste));
-    }
-}
-
-(async () => {
-    const args = process.argv.slice(2);
-
-    if (args.includes('--fontes')) {
-        await testarFontes();
-        motor.encerrar();
-        process.exit(0);
-    }
-
-    if (args.includes('--once')) {
-        await ciclo();
-        motor.encerrar();
-        process.exit(0);
-    }
-
-    await ciclo();
-    setInterval(() => {
-        ciclo().catch((e) => log.erro('ciclo falhou:', e.message));
-    }, INTERVALO_MS);
-})();
-'@
-
-# ===========================================================================
-#  scripts/atualizar-fontes.js
-# ===========================================================================
-$Arquivos['scripts/atualizar-fontes.js'] = @'
-'use strict';
-
-/*
- * CLI de diagnostico das fontes de indexacao.
- *
- *   node scripts/atualizar-fontes.js            -> testa todas as fontes
- *   node scripts/atualizar-fontes.js --limpar-cache
- *   node scripts/atualizar-fontes.js "termo"    -> busca real e mostra ranking
- */
-
-const fontes = require('../src/sources');
-const motor = require('../src/torrent/engine');
-const { formatarBytes } = require('../src/util/text');
-
-const CINZA = '\x1b[90m';
-const VERDE = '\x1b[32m';
-const AMARELO = '\x1b[33m';
-const VERMELHO = '\x1b[31m';
-const CIANO = '\x1b[36m';
-const RESET = '\x1b[0m';
-
-function linha() {
-    console.log(CINZA + '-'.repeat(88) + RESET);
-}
-
-async function testarFontes() {
-    console.log(CIANO + '\nTESTE DE SAUDE DAS FONTES DE INDEXACAO\n' + RESET);
-    const relatorio = await fontes.statusFontes(true);
-
-    for (const f of relatorio.fontes) {
-        const marca = f.online ? VERDE + '[ONLINE]' + RESET : VERMELHO + '[OFFLINE]' + RESET;
-        const teste = f.buscaTeste
-            ? f.buscaTeste.ok
-                ? VERDE + f.buscaTeste.total + ' resultados' + RESET
-                : AMARELO + 'busca falhou: ' + f.buscaTeste.erro + RESET
-            : CINZA + 'sem teste de busca' + RESET;
-
-        console.log(marca + ' ' + f.nome.padEnd(26, ' ') + ' ' + CINZA + f.baseTestada.padEnd(36, ' ') + RESET + ' ' + teste);
-        if (!f.online && f.erro) console.log('         ' + CINZA + f.erro + RESET);
-    }
-
-    console.log('\n' + CIANO + 'Resumo:' + RESET + ' ' + relatorio.online + '/' + relatorio.total + ' fontes respondendo\n');
-}
-
-async function buscar(termo) {
-    console.log(CIANO + '\nBUSCA: "' + termo + '"\n' + RESET);
-    const inicio = Date.now();
-    const dados = await fontes.buscar(termo, { categoria: 'todos', apenasPtBr: false });
-
-    console.log(CINZA + 'total: ' + dados.total + ' | tempo: ' + (Date.now() - inicio) + 'ms\n' + RESET);
-
-    for (const f of dados.fontes) {
-        const marca = f.ok ? VERDE + 'ok' + RESET : VERMELHO + 'falha' + RESET;
-        console.log(' ' + marca + ' ' + f.nome.padEnd(24, ' ') + ' ' + String(f.total).padStart(3, ' ') + ' itens  ' + CINZA + f.ms + 'ms' + RESET);
-    }
-
-    linha();
-    for (const item of dados.itens.slice(0, 25)) {
-        const idioma = item.idioma.ptbr ? VERDE + item.idioma.rotulo.padEnd(11, ' ') + RESET : CINZA + 'Original   ' + RESET;
-        console.log(
-            idioma +
-            ' ' + String(item.qualidade).padEnd(6, ' ') +
-            ' ' + String(item.seeds).padStart(5, ' ') + ' seeds' +
-            ' ' + formatarBytes(item.tamanhoBytes).padStart(9, ' ') +
-            ' ' + CIANO + String(item.pontuacao).padStart(7, ' ') + RESET +
-            '  ' + item.titulo.slice(0, 62)
-        );
-    }
-    console.log('');
-}
-
-(async () => {
-    const args = process.argv.slice(2);
-
-    if (args.includes('--limpar-cache')) {
-        await motor.limparTudo();
-        console.log(VERDE + 'cache de torrents limpo.' + RESET);
-        motor.encerrar();
-        process.exit(0);
-    }
-
-    const termo = args.find((a) => !a.startsWith('--'));
-    if (termo) await buscar(termo);
-    else await testarFontes();
-
-    motor.encerrar();
-    process.exit(0);
-})();
-'@
-
-# ===========================================================================
-#  public/index.html
-# ===========================================================================
-$Arquivos['public/index.html'] = @'
+# ----------------------------------------------------------------------
+$indexHtml = @'
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="theme-color" content="#0a0b0f" />
-<title>CineP2P - Filmes, Séries, Animes, Doramas e Novelas</title>
-<meta name="description" content="Streaming P2P de conteúdo em português: filmes, séries, animes, doramas, novelas e curtas via WebTorrent." />
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-<link rel="stylesheet" href="/style.css" />
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff2e63'/%3E%3Cpath d='M12 9l12 7-12 7z' fill='%23fff'/%3E%3C/svg%3E" />
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0b">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>CineP2P</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/placeholder.svg">
+<link rel="preconnect" href="https://image.tmdb.org">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/player.css">
 </head>
 <body>
 
-<header class="topo">
-  <div class="topo-linha">
-    <a class="marca" href="/">CINE<span>P2P</span></a>
+<header class="topbar">
+  <button class="icon-btn" id="menuBtn" aria-label="Abrir menu">
+    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+  </button>
 
-    <nav class="abas" id="abas" aria-label="Categorias"></nav>
+  <a class="brand" id="brand" href="#">Cine<span>P2P</span></a>
 
-    <div class="topo-acoes">
-      <form class="busca" id="form-busca" role="search">
-        <svg class="busca-icone" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 2a8 8 0 105.3 14L21 21.7 22.4 20.3 16.7 14.6A8 8 0 0010 2zm0 2a6 6 0 110 12 6 6 0 010-12z"/></svg>
-        <input id="campo-busca" type="search" placeholder="Buscar filme, série, anime, dorama, novela..." autocomplete="off" spellcheck="false" />
-        <button type="submit">Buscar</button>
-      </form>
+  <nav class="topnav" id="topnav">
+    <button class="nav-link active" data-view="inicio">Inicio</button>
+    <button class="nav-link" data-view="buscar">Buscar</button>
+    <button class="nav-link" data-view="historico">Historico</button>
+    <button class="nav-link" data-view="lista">Minha Lista</button>
+    <button class="nav-link" data-view="categorias">Categorias</button>
+  </nav>
 
-      <select id="ordenacao" class="controle" title="Ordenar">
-        <option value="seeds">Mais seeds</option>
-        <option value="qualidade">Melhor qualidade</option>
-        <option value="ptbr">Mais dublado</option>
-        <option value="tamanho">Menor arquivo</option>
-      </select>
-
-      <button class="controle icone" id="btn-fontes" title="Status das fontes">Fontes</button>
-      <button class="controle icone" id="btn-cache" title="Limpar cache de torrents">Cache</button>
-    </div>
+  <div class="topbar-actions">
+    <button class="chip" id="tipoToggle">Filmes</button>
+    <button class="icon-btn" id="searchBtn" aria-label="Buscar">
+      <svg viewBox="0 0 24 24" width="21" height="21"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2" fill="none"/><path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
   </div>
-
-  <div class="faixa-info" id="faixa-info" hidden></div>
 </header>
 
-<main class="conteudo">
+<aside id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <span class="brand">Cine<span>P2P</span></span>
+    <button class="icon-btn" id="drawerClose" aria-label="Fechar">
+      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+  <nav class="drawer-nav">
+    <button class="nav-link" data-view="inicio">Inicio</button>
+    <button class="nav-link" data-view="buscar">Buscar</button>
+    <button class="nav-link" data-view="historico">Historico</button>
+    <button class="nav-link" data-view="lista">Minha Lista</button>
+    <button class="nav-link" data-view="categorias">Categorias</button>
+  </nav>
+  <p class="drawer-foot">CineP2P 4.0 &middot; audio PT-BR priorizado</p>
+</aside>
+<div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
 
-  <section class="hero" id="hero" hidden>
-    <div class="hero-fundo" id="hero-fundo"></div>
-    <div class="hero-corpo">
-      <span class="hero-etiqueta" id="hero-etiqueta">Destaque</span>
-      <h1 id="hero-titulo"></h1>
-      <p id="hero-sinopse"></p>
-      <div class="hero-tags" id="hero-tags"></div>
-      <div class="hero-acoes">
-        <button class="btn primario" id="hero-play">
-          <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg> Assistir agora
-        </button>
-        <button class="btn secundario" id="hero-favorito">+ Minha Lista</button>
-      </div>
-    </div>
+<main id="app">
+  <section id="view-inicio" class="view">
+    <section id="hero" class="hero"></section>
+    <div id="rows" class="rows"></div>
   </section>
 
-  <div class="trilho-controles">
-    <h2 id="titulo-secao">Início</h2>
-    <div class="chips" id="chips">
-      <button class="chip ativo" data-ptbr="1">Só PT-BR</button>
-      <button class="chip" data-ptbr="0">Todas as línguas</button>
-      <button class="chip" id="chip-favoritos">Minha Lista</button>
+  <section id="view-buscar" class="view hidden">
+    <div class="searchbar">
+      <input id="searchInput" type="search" placeholder="Buscar filmes, series..." autocomplete="off">
+      <button class="btn small" id="searchGo">Buscar</button>
     </div>
-  </div>
+    <div id="searchResults" class="grid"></div>
+  </section>
 
-  <section id="grade" class="grade"></section>
-  <div class="vazio" id="vazio" hidden></div>
+  <section id="view-lista" class="view hidden">
+    <h1 class="view-title">Minha Lista</h1>
+    <div id="listaGrid" class="grid"></div>
+  </section>
 
-  <div class="paginacao" id="paginacao" hidden>
-    <button class="btn secundario" id="pagina-anterior">Anterior</button>
-    <span id="pagina-atual"></span>
-    <button class="btn secundario" id="pagina-proxima">Próxima</button>
-  </div>
+  <section id="view-historico" class="view hidden">
+    <h1 class="view-title">Historico</h1>
+    <div id="historicoGrid" class="grid"></div>
+    <button class="btn ghost limpar" id="limparHistorico">Limpar historico</button>
+  </section>
+
+  <section id="view-categorias" class="view hidden">
+    <h1 class="view-title">Categorias</h1>
+    <div id="categoriasChips" class="chips"></div>
+    <div id="categoriasGrid" class="grid"></div>
+  </section>
 </main>
 
-<footer class="rodape">
-  <span>CineP2P v3 - agregação multi-fonte PT-BR via WebTorrent + FFmpeg</span>
-  <span id="rodape-fontes"></span>
-</footer>
+<nav class="bottom-nav">
+  <button class="bn-item active" data-view="inicio">
+    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <span>Inicio</span>
+  </button>
+  <button class="bn-item" data-view="buscar">
+    <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2" fill="none"/><path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <span>Buscar</span>
+  </button>
+  <button class="bn-item" data-view="lista">
+    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 4.6-7 9-7 9z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <span>Lista</span>
+  </button>
+  <button class="bn-item" data-view="historico">
+    <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <span>Historico</span>
+  </button>
+</nav>
 
-<!-- ====================== MODAL PLAYER ====================== -->
-<div class="modal" id="modal" hidden>
-  <div class="modal-caixa">
-    <button class="fechar" id="btn-fechar" title="Fechar (Esc)">&times;</button>
-
-    <div class="player-area">
-      <video id="video" controls playsinline preload="metadata"></video>
-      <div class="player-overlay" id="player-overlay">
-        <div class="spinner"></div>
-        <p id="overlay-texto">Conectando aos peers...</p>
-      </div>
-    </div>
-
-    <div class="player-info">
-      <div class="player-cabecalho">
-        <h3 id="player-titulo">--</h3>
-        <div class="player-badges" id="player-badges"></div>
-      </div>
-
-      <div class="medidor" id="medidor" hidden>
-        <div class="medidor-barra"><span id="medidor-preenchido"></span></div>
-        <div class="medidor-dados">
-          <span id="medidor-peers">0 peers</span>
-          <span id="medidor-velocidade">0 KB/s</span>
-          <span id="medidor-progresso">0%</span>
-        </div>
-      </div>
-
-      <div class="player-controles">
-        <label class="campo">
-          <span>Fonte</span>
-          <select id="seletor-fonte"></select>
-        </label>
-        <label class="campo">
-          <span>Modo</span>
-          <select id="seletor-modo">
-            <option value="auto">Automático</option>
-            <option value="direto">Direto (sem conversão)</option>
-            <option value="transcode">Converter (compatibilidade)</option>
-          </select>
-        </label>
-        <button class="btn secundario" id="btn-magnet">Copiar magnet</button>
-        <button class="btn secundario" id="btn-liberar">Liberar torrent</button>
-      </div>
-
-      <p class="player-nota" id="player-nota"></p>
-      <p class="player-erro" id="player-erro" hidden></p>
-    </div>
+<div id="modal" class="modal hidden">
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <button class="modal-close" data-close aria-label="Fechar">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+    <div id="modalBody" class="modal-body"></div>
   </div>
 </div>
 
-<!-- ====================== MODAL FONTES ====================== -->
-<div class="modal" id="modal-fontes" hidden>
-  <div class="modal-caixa estreita">
-    <button class="fechar" id="btn-fechar-fontes">&times;</button>
-    <h3>Status dos indexadores</h3>
-    <p class="nota">Verificação em tempo real das fontes PT-BR. Bases fora do ar são contornadas automaticamente pelo fallback de TLD.</p>
-    <div id="lista-fontes" class="lista-fontes"></div>
-    <button class="btn primario" id="btn-reverificar">Reverificar</button>
+<!-- ============================ PLAYER ============================ -->
+<div id="player" class="player hidden">
+  <video id="video" playsinline webkit-playsinline preload="metadata"></video>
+
+  <div class="pv-top" id="pvTop">
+    <button class="pv-btn" id="pvClose" aria-label="Voltar">
+      <svg viewBox="0 0 24 24" width="24" height="24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <div class="pv-title" id="pvTitle">Reproduzindo</div>
+    <button class="pv-btn pv-txt" id="pvFontes">Fontes</button>
+  </div>
+
+  <div class="pv-center" id="pvCenter">
+    <div class="pv-spinner"></div>
+    <p class="pv-msg" id="pvMsg">Conectando aos peers...</p>
+    <div class="pv-bar"><i id="pvFill"></i></div>
+    <p class="pv-stats" id="pvStats"></p>
+    <p class="pv-fonte" id="pvFonte"></p>
+  </div>
+
+  <div class="pv-bottom" id="pvBottom">
+    <div class="pv-seek" id="pvSeek">
+      <div class="pv-seek-track"><i id="pvProgress"></i></div>
+      <div class="pv-seek-knob" id="pvKnob"></div>
+    </div>
+    <div class="pv-row">
+      <button class="pv-btn" id="pvPlay" aria-label="Play/Pause">
+        <svg id="icoPlay" viewBox="0 0 24 24" width="26" height="26"><path d="M7 4.5v15l13-7.5z" fill="currentColor"/></svg>
+        <svg id="icoPause" class="hidden" viewBox="0 0 24 24" width="26" height="26"><path d="M7 4.5h4v15H7zM13 4.5h4v15h-4z" fill="currentColor"/></svg>
+      </button>
+      <button class="pv-btn" id="pvBack30" aria-label="Voltar 30 segundos">
+        <svg viewBox="0 0 24 24" width="26" height="26"><path d="M11 5V2L6 6l5 4V7a6 6 0 1 1-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><text x="12" y="17" font-size="8" font-weight="700" fill="currentColor" text-anchor="middle">30</text></svg>
+      </button>
+      <button class="pv-btn" id="pvFwd30" aria-label="Avancar 30 segundos">
+        <svg viewBox="0 0 24 24" width="26" height="26"><path d="M13 5V2l5 4-5 4V7a6 6 0 1 0 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><text x="12" y="17" font-size="8" font-weight="700" fill="currentColor" text-anchor="middle">30</text></svg>
+      </button>
+      <span class="pv-time" id="pvTime">0:00 / 0:00</span>
+      <span class="pv-spacer"></span>
+      <button class="pv-btn" id="pvMute" aria-label="Volume">
+        <svg id="icoVol" viewBox="0 0 24 24" width="24" height="24"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <svg id="icoMudo" class="hidden" viewBox="0 0 24 24" width="24" height="24"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor"/><path d="M15 9l5 6M20 9l-5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <button class="pv-btn pv-cc" id="pvCC" aria-label="Legendas">CC</button>
+      <button class="pv-btn" id="pvFull" aria-label="Tela cheia">
+        <svg viewBox="0 0 24 24" width="24" height="24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="pv-sheet hidden" id="pvSheet">
+    <div class="pv-sheet-head">
+      <strong id="pvSheetTitle">Fontes</strong>
+      <button class="pv-btn" id="pvSheetClose" aria-label="Fechar">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="pv-sheet-body" id="pvSheetBody"></div>
   </div>
 </div>
 
+<div id="toast" class="toast hidden"></div>
+
+<script src="/config.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
 '@
+Write-ProjectFile 'public/index.html' $indexHtml
 
-# ===========================================================================
-#  public/style.css
-# ===========================================================================
-$Arquivos['public/style.css'] = @'
-/* =========================================================================
-   cinep2p :: tema escuro inspirado em agregadores de streaming
-   ========================================================================= */
+# ----------------------------------------------------------------------
+$playerCss = @'
+/* ================= CineP2P - player imediato + controles ================= */
 
-:root {
-    --fundo: #0a0b0f;
-    --fundo-2: #101219;
-    --fundo-3: #171a23;
-    --borda: #232734;
-    --texto: #eef0f6;
-    --texto-fraco: #9aa1b4;
-    --acento: #ff2e63;
-    --acento-2: #6c5ce7;
-    --verde: #22c55e;
-    --amarelo: #facc15;
-    --raio: 12px;
-    --sombra: 0 18px 45px rgba(0, 0, 0, .55);
+.player{position:fixed;inset:0;z-index:120;background:#000;display:flex;align-items:center;justify-content:center}
+.player video{width:100%;height:100%;max-height:100%;object-fit:contain;background:#000}
+
+.pv-btn{
+  border:0;background:rgba(0,0,0,.42);color:#fff;border-radius:50%;
+  width:44px;height:44px;display:grid;place-items:center;cursor:pointer;
+  transition:background .15s, transform .12s;flex:0 0 auto;
 }
+.pv-btn:active{transform:scale(.92);background:rgba(255,255,255,.18)}
+.pv-btn.pv-txt{width:auto;border-radius:999px;padding:0 16px;font-weight:700;font-size:13.5px}
+.pv-btn.pv-cc{font-weight:800;font-size:13px;letter-spacing:.5px}
+.pv-btn.ativo{background:var(--brand);color:#fff}
+.pv-btn:disabled{opacity:.4}
 
-* { box-sizing: border-box; }
-
-[hidden] { display: none !important; }
-
-html, body {
-    margin: 0;
-    padding: 0;
-    background: var(--fundo);
-    color: var(--texto);
-    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-    -webkit-font-smoothing: antialiased;
+.pv-top{
+  position:absolute;top:0;left:0;right:0;z-index:5;
+  display:flex;align-items:center;gap:10px;padding:10px 12px;
+  padding-top:calc(10px + env(safe-area-inset-top));
+  background:linear-gradient(180deg,rgba(0,0,0,.85),transparent);
+  transition:opacity .25s;
 }
+.pv-title{flex:1;font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 2px 8px #000}
 
-a { color: inherit; text-decoration: none; }
-button, input, select { font-family: inherit; }
-
-/* ---------------------------------- topo --------------------------------- */
-
-.topo {
-    position: sticky;
-    top: 0;
-    z-index: 40;
-    background: linear-gradient(180deg, rgba(10, 11, 15, .98) 0%, rgba(10, 11, 15, .88) 100%);
-    backdrop-filter: blur(14px);
-    border-bottom: 1px solid var(--borda);
+.pv-center{
+  position:absolute;inset:0;z-index:3;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:14px;text-align:center;padding:30px;
+  background:radial-gradient(600px 400px at 50% 50%, rgba(20,24,34,.9), #000 75%);
+  transition:opacity .3s, visibility .3s;
 }
-
-.topo-linha {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-    padding: 12px 22px;
-    flex-wrap: wrap;
+.pv-center.oculto{opacity:0;visibility:hidden}
+.pv-msg{margin:0;font-size:15px;font-weight:600}
+.pv-stats{margin:0;font-size:12.5px;color:#9aa2b1}
+.pv-fonte{margin:0;font-size:11.5px;color:#5f6878;max-width:80vw;line-height:1.5}
+.pv-bar{width:min(340px,78vw);height:6px;border-radius:99px;background:#20242e;overflow:hidden}
+.pv-bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--brand),#ff7b73);transition:width .3s}
+.pv-spinner{
+  width:40px;height:40px;border-radius:50%;
+  border:3px solid rgba(255,255,255,.14);border-top-color:var(--brand);
+  animation:girar .85s linear infinite;
 }
+@keyframes girar{to{transform:rotate(360deg)}}
+.pv-erro{color:#ff8f88;font-size:13.5px;line-height:1.6;max-width:420px}
 
-.marca {
-    font-size: 22px;
-    font-weight: 800;
-    letter-spacing: -.5px;
-    white-space: nowrap;
+.pv-bottom{
+  position:absolute;left:0;right:0;bottom:0;z-index:5;
+  padding:10px 14px calc(14px + env(safe-area-inset-bottom));
+  background:linear-gradient(0deg,rgba(0,0,0,.92),transparent);
+  transition:opacity .25s;
 }
-.marca span { color: var(--acento); }
-
-.abas {
-    display: flex;
-    gap: 4px;
-    flex: 1;
-    flex-wrap: wrap;
+.pv-seek{position:relative;height:26px;display:flex;align-items:center;cursor:pointer;touch-action:none}
+.pv-seek-track{position:relative;width:100%;height:5px;border-radius:99px;background:rgba(255,255,255,.22);overflow:hidden}
+.pv-seek-track i{display:block;height:100%;width:0;background:var(--brand)}
+.pv-seek-knob{
+  position:absolute;top:50%;left:0;width:14px;height:14px;border-radius:50%;
+  background:#fff;transform:translate(-50%,-50%);box-shadow:0 2px 8px rgba(0,0,0,.7);
+  pointer-events:none;
 }
+.pv-row{display:flex;align-items:center;gap:6px;margin-top:4px}
+.pv-time{font-size:12.5px;color:#c8cfda;margin-left:6px;font-variant-numeric:tabular-nums}
+.pv-spacer{flex:1}
 
-.aba {
-    padding: 8px 14px;
-    border-radius: 999px;
-    font-size: 13.5px;
-    font-weight: 600;
-    color: var(--texto-fraco);
-    border: 1px solid transparent;
-    cursor: pointer;
-    background: transparent;
-    transition: .15s;
+.player.controles-ocultos .pv-top,
+.player.controles-ocultos .pv-bottom{opacity:0;pointer-events:none}
+.player.controles-ocultos{cursor:none}
+
+.pv-sheet{
+  position:absolute;right:0;top:0;bottom:0;z-index:9;width:min(420px,92vw);
+  background:rgba(12,13,17,.97);backdrop-filter:blur(10px);
+  border-left:1px solid #24272f;display:flex;flex-direction:column;
+  animation:entrarSheet .18s ease;
 }
-.aba:hover { color: var(--texto); background: var(--fundo-3); }
-.aba.ativo {
-    color: #fff;
-    background: linear-gradient(135deg, var(--acento), #b81f47);
-    border-color: transparent;
-    box-shadow: 0 6px 20px rgba(255, 46, 99, .28);
+@keyframes entrarSheet{from{transform:translateX(30px);opacity:.5}to{transform:translateX(0);opacity:1}}
+.pv-sheet-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid #24272f}
+.pv-sheet-body{flex:1;overflow:auto;padding:12px 14px 30px}
+.pv-fonte-item{
+  display:flex;justify-content:space-between;align-items:center;gap:10px;
+  padding:11px 12px;border:1px solid #24272f;border-radius:11px;margin-bottom:8px;
+  background:rgba(255,255,255,.02);cursor:pointer;
 }
+.pv-fonte-item.atual{border-color:var(--brand);background:rgba(229,9,20,.12)}
+.pv-fonte-item:active{background:rgba(255,255,255,.07)}
+.pv-fonte-nome{font-size:12.5px;color:#d9dfe9;line-height:1.35;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.pv-fonte-tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px;font-size:11px;color:#9aa2b1}
+.pv-badge{font-weight:800;padding:2px 7px;border-radius:6px;background:rgba(51,198,255,.16);color:var(--accent)}
+.pv-badge.br{background:rgba(61,220,132,.18);color:var(--ok)}
+.pv-badge.ruim{background:rgba(255,255,255,.08);color:#8d95a5}
+.pv-legenda-item{display:flex;justify-content:space-between;padding:13px;border-radius:11px;margin-bottom:6px;cursor:pointer;border:1px solid #24272f}
+.pv-legenda-item.atual{border-color:var(--brand);background:rgba(229,9,20,.12)}
+.pv-vazio{color:#9aa2b1;font-size:13px;text-align:center;padding:26px 10px;line-height:1.6}
 
-.topo-acoes { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-
-.busca {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: var(--fundo-3);
-    border: 1px solid var(--borda);
-    border-radius: 999px;
-    padding: 6px 6px 6px 12px;
-    min-width: 280px;
-    transition: .15s;
-}
-.busca:focus-within { border-color: var(--acento); box-shadow: 0 0 0 3px rgba(255, 46, 99, .14); }
-.busca-icone { width: 16px; height: 16px; fill: var(--texto-fraco); flex: none; }
-.busca input {
-    flex: 1;
-    background: transparent;
-    border: 0;
-    outline: 0;
-    color: var(--texto);
-    font-size: 14px;
-    padding: 5px 0;
-}
-.busca button {
-    border: 0;
-    border-radius: 999px;
-    padding: 8px 16px;
-    background: var(--acento);
-    color: #fff;
-    font-weight: 700;
-    font-size: 13px;
-    cursor: pointer;
-}
-.busca button:hover { filter: brightness(1.1); }
-
-.controle {
-    background: var(--fundo-3);
-    color: var(--texto);
-    border: 1px solid var(--borda);
-    border-radius: 10px;
-    padding: 9px 12px;
-    font-size: 13px;
-    cursor: pointer;
-}
-.controle:hover { border-color: var(--acento); }
-.controle.icone { font-weight: 600; }
-
-.faixa-info {
-    padding: 8px 22px;
-    background: rgba(108, 92, 231, .14);
-    border-top: 1px solid rgba(108, 92, 231, .3);
-    color: #cfc8ff;
-    font-size: 12.5px;
-}
-
-/* --------------------------------- hero ---------------------------------- */
-
-.conteudo { max-width: 1520px; margin: 0 auto; padding: 22px; }
-
-.hero {
-    position: relative;
-    border-radius: 18px;
-    overflow: hidden;
-    min-height: 340px;
-    display: flex;
-    align-items: flex-end;
-    margin-bottom: 30px;
-    border: 1px solid var(--borda);
-    background: var(--fundo-2);
-}
-.hero-fundo {
-    position: absolute;
-    inset: 0;
-    background-size: cover;
-    background-position: center 22%;
-    filter: saturate(1.1);
-}
-.hero-fundo::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(90deg, rgba(10, 11, 15, .97) 8%, rgba(10, 11, 15, .72) 45%, rgba(10, 11, 15, .25) 100%),
-                linear-gradient(0deg, var(--fundo) 2%, transparent 60%);
-}
-.hero-corpo { position: relative; padding: 32px; max-width: 660px; }
-.hero-etiqueta {
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 800;
-    letter-spacing: 1.4px;
-    text-transform: uppercase;
-    color: var(--acento);
-    margin-bottom: 10px;
-}
-.hero h1 { margin: 0 0 10px; font-size: 38px; line-height: 1.08; font-weight: 800; letter-spacing: -.9px; }
-.hero p { margin: 0 0 14px; color: var(--texto-fraco); font-size: 14.5px; line-height: 1.55; max-height: 88px; overflow: hidden; }
-.hero-tags { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 16px; }
-.hero-acoes { display: flex; gap: 10px; flex-wrap: wrap; }
-
-/* ---------------------------------- chips -------------------------------- */
-
-.trilho-controles {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-    margin-bottom: 16px;
-}
-.trilho-controles h2 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -.4px; }
-.chips { display: flex; gap: 7px; flex-wrap: wrap; }
-.chip {
-    background: var(--fundo-3);
-    border: 1px solid var(--borda);
-    color: var(--texto-fraco);
-    border-radius: 999px;
-    padding: 7px 14px;
-    font-size: 12.5px;
-    font-weight: 600;
-    cursor: pointer;
-}
-.chip:hover { color: var(--texto); }
-.chip.ativo { background: rgba(255, 46, 99, .16); border-color: var(--acento); color: #ffb3c6; }
-
-/* ---------------------------------- grade -------------------------------- */
-
-.grade {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(176px, 1fr));
-    gap: 18px;
-}
-
-.card {
-    background: var(--fundo-2);
-    border: 1px solid var(--borda);
-    border-radius: var(--raio);
-    overflow: hidden;
-    cursor: pointer;
-    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
-    display: flex;
-    flex-direction: column;
-    position: relative;
-}
-.card:hover { transform: translateY(-5px); border-color: rgba(255, 46, 99, .55); box-shadow: var(--sombra); }
-
-.card-poster {
-    position: relative;
-    aspect-ratio: 2 / 3;
-    background: linear-gradient(160deg, #191d28, #0d0f15);
-    overflow: hidden;
-}
-.card-poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.card-poster .sem-poster {
-    position: absolute;
-    inset: 0;
-    display: grid;
-    place-items: center;
-    font-size: 30px;
-    font-weight: 800;
-    color: #2b3040;
-}
-
-.card-badges {
-    position: absolute;
-    top: 8px;
-    left: 8px;
-    right: 8px;
-    display: flex;
-    gap: 5px;
-    flex-wrap: wrap;
-}
-
-.selo {
-    font-size: 10px;
-    font-weight: 800;
-    letter-spacing: .4px;
-    text-transform: uppercase;
-    padding: 3px 7px;
-    border-radius: 6px;
-    backdrop-filter: blur(6px);
-    background: rgba(10, 11, 15, .78);
-    border: 1px solid rgba(255, 255, 255, .14);
-}
-.selo.dublado { background: rgba(34, 197, 94, .9); border-color: transparent; color: #04220f; }
-.selo.dual { background: rgba(108, 92, 231, .92); border-color: transparent; color: #fff; }
-.selo.legendado { background: rgba(250, 204, 21, .9); border-color: transparent; color: #241c00; }
-.selo.qualidade { background: rgba(255, 46, 99, .92); border-color: transparent; color: #fff; }
-
-.card-seeds {
-    position: absolute;
-    bottom: 8px;
-    right: 8px;
-    font-size: 10.5px;
-    font-weight: 700;
-    padding: 3px 7px;
-    border-radius: 6px;
-    background: rgba(10, 11, 15, .8);
-    color: var(--verde);
-}
-
-.card-corpo { padding: 10px 11px 12px; display: flex; flex-direction: column; gap: 5px; flex: 1; }
-.card-titulo {
-    font-size: 13px;
-    font-weight: 600;
-    line-height: 1.32;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    min-height: 34px;
-}
-.card-meta { font-size: 11px; color: var(--texto-fraco); display: flex; gap: 7px; flex-wrap: wrap; }
-.card-fonte { font-size: 10.5px; color: #6f7689; }
-
-.card-favorito {
-    position: absolute;
-    top: 7px;
-    right: 7px;
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
-    border: 1px solid rgba(255, 255, 255, .2);
-    background: rgba(10, 11, 15, .72);
-    color: #fff;
-    font-size: 13px;
-    cursor: pointer;
-    display: grid;
-    place-items: center;
-    z-index: 3;
-}
-.card-favorito.ativo { background: var(--acento); border-color: transparent; }
-
-/* --------------------------------- esqueletos ---------------------------- */
-
-.esqueleto { pointer-events: none; }
-.esqueleto .card-poster { animation: pulsar 1.35s infinite; }
-.esqueleto .linha-falsa { height: 11px; border-radius: 5px; background: #1c202b; margin-top: 6px; }
-@keyframes pulsar { 0%, 100% { opacity: 1 } 50% { opacity: .45 } }
-
-/* ---------------------------------- botoes ------------------------------- */
-
-.btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    border: 0;
-    border-radius: 10px;
-    padding: 11px 18px;
-    font-size: 13.5px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: .15s;
-}
-.btn svg { width: 17px; height: 17px; fill: currentColor; }
-.btn.primario { background: var(--acento); color: #fff; }
-.btn.primario:hover { filter: brightness(1.12); }
-.btn.secundario { background: var(--fundo-3); color: var(--texto); border: 1px solid var(--borda); }
-.btn.secundario:hover { border-color: var(--acento); }
-.btn:disabled { opacity: .5; cursor: not-allowed; }
-
-/* -------------------------------- paginacao ------------------------------ */
-
-.paginacao { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 34px 0; }
-.paginacao span { color: var(--texto-fraco); font-size: 13px; }
-
-.vazio { text-align: center; padding: 70px 20px; color: var(--texto-fraco); }
-.vazio strong { display: block; font-size: 18px; color: var(--texto); margin-bottom: 8px; }
-
-.rodape {
-    border-top: 1px solid var(--borda);
-    padding: 22px;
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
-    color: #626879;
-    font-size: 12px;
-}
-
-/* ---------------------------------- modal -------------------------------- */
-
-.modal {
-    position: fixed;
-    inset: 0;
-    background: rgba(4, 5, 8, .9);
-    backdrop-filter: blur(9px);
-    z-index: 90;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-    overflow: auto;
-}
-
-.modal-caixa {
-    position: relative;
-    width: min(1080px, 100%);
-    background: var(--fundo-2);
-    border: 1px solid var(--borda);
-    border-radius: 16px;
-    overflow: hidden;
-    box-shadow: var(--sombra);
-}
-.modal-caixa.estreita { width: min(620px, 100%); padding: 26px; }
-
-.fechar {
-    position: absolute;
-    top: 12px;
-    right: 12px;
-    z-index: 5;
-    width: 34px;
-    height: 34px;
-    border-radius: 50%;
-    border: 1px solid rgba(255, 255, 255, .18);
-    background: rgba(10, 11, 15, .8);
-    color: #fff;
-    font-size: 19px;
-    cursor: pointer;
-    line-height: 1;
-}
-
-.player-area { position: relative; background: #000; aspect-ratio: 16 / 9; }
-.player-area video { width: 100%; height: 100%; display: block; background: #000; }
-
-.player-overlay {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
-    background: rgba(4, 5, 8, .82);
-    color: var(--texto-fraco);
-    font-size: 13.5px;
-    text-align: center;
-    padding: 20px;
-}
-.spinner {
-    width: 38px;
-    height: 38px;
-    border: 3px solid rgba(255, 255, 255, .16);
-    border-top-color: var(--acento);
-    border-radius: 50%;
-    animation: girar .8s linear infinite;
-}
-@keyframes girar { to { transform: rotate(360deg) } }
-
-.player-info { padding: 18px 20px 22px; }
-.player-cabecalho { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; }
-.player-cabecalho h3 { margin: 0; font-size: 17px; font-weight: 700; line-height: 1.35; }
-.player-badges { display: flex; gap: 6px; flex-wrap: wrap; }
-
-.medidor { margin: 16px 0 4px; }
-.medidor-barra { height: 6px; border-radius: 999px; background: var(--fundo-3); overflow: hidden; }
-.medidor-barra span { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, var(--acento-2), var(--acento)); transition: width .4s; }
-.medidor-dados { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--texto-fraco); margin-top: 7px; }
-
-.player-controles { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; align-items: flex-end; }
-.campo { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; color: var(--texto-fraco); }
-.campo select {
-    background: var(--fundo-3);
-    border: 1px solid var(--borda);
-    color: var(--texto);
-    border-radius: 9px;
-    padding: 9px 11px;
-    font-size: 12.5px;
-    min-width: 190px;
-}
-
-.player-nota { margin: 14px 0 0; font-size: 12px; color: #6f7689; }
-.player-erro { margin: 10px 0 0; font-size: 12.5px; color: #ff8fa3; }
-
-.lista-fontes { display: flex; flex-direction: column; gap: 8px; margin: 16px 0; max-height: 52vh; overflow: auto; }
-.linha-fonte {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 12px;
-    border: 1px solid var(--borda);
-    border-radius: 10px;
-    background: var(--fundo-3);
-    font-size: 12.5px;
-}
-.ponto { width: 9px; height: 9px; border-radius: 50%; flex: none; }
-.ponto.ok { background: var(--verde); box-shadow: 0 0 10px var(--verde); }
-.ponto.off { background: var(--acento); box-shadow: 0 0 10px var(--acento); }
-.linha-fonte .nome { font-weight: 600; flex: 1; }
-.linha-fonte .detalhe { color: var(--texto-fraco); font-size: 11.5px; }
-.nota { color: var(--texto-fraco); font-size: 12.5px; line-height: 1.5; }
-
-/* --------------------------------- mobile -------------------------------- */
-
-@media (max-width: 860px) {
-    .topo-linha { padding: 10px 14px; gap: 10px; }
-    .abas { order: 3; width: 100%; overflow-x: auto; flex-wrap: nowrap; }
-    .busca { min-width: 100%; order: 1; }
-    .hero h1 { font-size: 27px; }
-    .hero-corpo { padding: 20px; }
-    .grade { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
-    .conteudo { padding: 14px; }
+@media (min-width:860px){
+  .pv-time{font-size:13.5px}
+  .pv-btn{width:48px;height:48px}
+  .player:fullscreen .pv-center{background:radial-gradient(700px 500px at 50% 50%, rgba(20,24,34,.92), #000 78%)}
 }
 '@
+Write-ProjectFile 'public/player.css' $playerCss
 
-# ===========================================================================
-#  public/app.js
-# ===========================================================================
-$Arquivos['public/app.js'] = @'
+# ----------------------------------------------------------------------
+$appJs = @'
 'use strict';
 
-/* =========================================================================
-   cinep2p :: front-end
-   ========================================================================= */
+/* =====================================================================
+   CineP2P 4.0 - frontend vanilla (mobile-first, Capacitor-ready)
+   Player abre IMEDIATAMENTE; toda a informacao tecnica fica dentro do video.
+   ===================================================================== */
 
-const CATEGORIAS = [
-    { id: 'inicio', rotulo: 'Início' },
-    { id: 'filmes', rotulo: 'Filmes' },
-    { id: 'series', rotulo: 'Séries' },
-    { id: 'animes', rotulo: 'Animes' },
-    { id: 'doramas', rotulo: 'Doramas' },
-    { id: 'novelas', rotulo: 'Novelas' },
-    { id: 'curtas', rotulo: 'Curtas' },
-    { id: 'documentarios', rotulo: 'Documentários' }
-];
+const API_BASE = String(window.CINEP2P_API_BASE || '').replace(/\/+$/, '');
+const PLACEHOLDER = '/placeholder.svg';
 
-const estado = {
-    categoria: 'inicio',
-    termo: '',
-    pagina: 1,
-    ptbr: true,
-    ordenacao: 'seeds',
-    modo: 'catalogo',
-    itens: [],
-    carregando: false,
-    favoritos: new Set(),
-    player: null
+const $ = function (s, r) { return (r || document).querySelector(s); };
+const $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+
+const LS = {
+  get: function (k, d) { try { const v = window.localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
+  set: function (k, v) { try { window.localStorage.setItem(k, JSON.stringify(v)); } catch (e) { } },
+  del: function (k) { try { window.localStorage.removeItem(k); } catch (e) { } }
 };
 
-const $ = (id) => document.getElementById(id);
+const K = { lista: 'cinep2p:lista', historico: 'cinep2p:historico', continuar: 'cinep2p:continuar', tipo: 'cinep2p:tipo' };
 
-/* ------------------------------- utilitarios ------------------------------ */
+const state = {
+  view: 'inicio',
+  tipo: LS.get(K.tipo, 'movie'),
+  generos: [],
+  media: null,
+  job: null,
+  poll: null,
+  podeTocar: false,
+  streamUrl: null,
+  buscaTimer: null,
+  ultimoSalvar: 0,
+  fontes: [],
+  melhor: null,
+  subs: [],
+  legendaAtiva: null,
+  esconderTimer: null,
+  arrastandoSeek: false
+};
 
-function formatarBytes(bytes) {
-    const n = Number(bytes) || 0;
-    if (!n) return '--';
-    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let i = 0;
-    let v = n;
-    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-    return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + ' ' + u[i];
+const els = {
+  hero: $('#hero'), rows: $('#rows'),
+  searchInput: $('#searchInput'), searchResults: $('#searchResults'),
+  listaGrid: $('#listaGrid'), historicoGrid: $('#historicoGrid'),
+  categoriasChips: $('#categoriasChips'), categoriasGrid: $('#categoriasGrid'),
+  modal: $('#modal'), modalBody: $('#modalBody'),
+  toast: $('#toast'), drawer: $('#drawer'), drawerBackdrop: $('#drawerBackdrop'),
+  tipoToggle: $('#tipoToggle'),
+  player: $('#player'), video: $('#video'),
+  pvTop: $('#pvTop'), pvBottom: $('#pvBottom'), pvCenter: $('#pvCenter'),
+  pvTitle: $('#pvTitle'), pvMsg: $('#pvMsg'), pvStats: $('#pvStats'), pvFill: $('#pvFill'),
+  pvFonte: $('#pvFonte'), pvTime: $('#pvTime'), pvProgress: $('#pvProgress'), pvKnob: $('#pvKnob'),
+  pvSeek: $('#pvSeek'), pvSheet: $('#pvSheet'), pvSheetBody: $('#pvSheetBody'), pvSheetTitle: $('#pvSheetTitle'),
+  icoPlay: $('#icoPlay'), icoPause: $('#icoPause'), icoVol: $('#icoVol'), icoMudo: $('#icoMudo')
+};
+
+/* ------------------------------ utils ------------------------------ */
+
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+  });
 }
 
-function escapar(texto) {
-    return String(texto == null ? '' : texto)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+function fmtSize(b) {
+  const n = Number(b);
+  if (!n || n <= 0) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v = v / 1024; i++; }
+  return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + ' ' + u[i];
 }
 
-function urlPoster(item) {
-    if (!item.poster) return null;
-    return '/api/img?u=' + encodeURIComponent(item.poster) + (item.base ? '&ref=' + encodeURIComponent(item.base) : '');
+function fmtSpeed(b) { const n = Number(b); return n > 0 ? fmtSize(n) + '/s' : '0 B/s'; }
+
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) s = 0;
+  s = Math.floor(s);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(sec).padStart(2, '0');
 }
 
-function selos(item) {
-    const selos = [];
-    const idioma = item.idioma || {};
-    if (idioma.dublado) selos.push('<span class="selo dublado">Dublado</span>');
-    else if (idioma.dual) selos.push('<span class="selo dual">Dual Áudio</span>');
-    else if (idioma.legendado) selos.push('<span class="selo legendado">Legendado</span>');
-    if (item.qualidade && item.qualidade !== 'SD') selos.push('<span class="selo qualidade">' + escapar(item.qualidade) + '</span>');
-    if (item.ano) selos.push('<span class="selo">' + escapar(item.ano) + '</span>');
-    return selos.join('');
+let toastTimer = null;
+function toast(msg, tipo) {
+  els.toast.textContent = msg;
+  els.toast.className = 'toast' + (tipo === 'error' ? ' error' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { els.toast.classList.add('hidden'); }, 4600);
 }
 
-function toast(mensagem) {
-    const faixa = $('faixa-info');
-    faixa.textContent = mensagem;
-    faixa.hidden = false;
-    clearTimeout(toast.timer);
-    toast.timer = setTimeout(() => { faixa.hidden = true; }, 4200);
-}
-
-function salvarFavoritos() {
-    try {
-        localStorage.setItem('cinep2p:favoritos', JSON.stringify([...estado.favoritos]));
-    } catch (_) { /* noop */ }
-}
-
-function carregarFavoritos() {
-    try {
-        const bruto = JSON.parse(localStorage.getItem('cinep2p:favoritos') || '[]');
-        estado.favoritos = new Set(bruto);
-    } catch (_) { estado.favoritos = new Set(); }
-}
-
-function chaveItem(item) {
-    return item.infoHash || item.titulo;
-}
-
-/* --------------------------------- render -------------------------------- */
-
-function montarAbas() {
-    const container = $('abas');
-    container.innerHTML = CATEGORIAS
-        .map((c) => '<button class="aba' + (c.id === estado.categoria ? ' ativo' : '') + '" data-cat="' + c.id + '">' + c.rotulo + '</button>')
-        .join('');
-
-    container.querySelectorAll('.aba').forEach((botao) => {
-        botao.addEventListener('click', () => {
-            estado.categoria = botao.dataset.cat;
-            estado.modo = 'catalogo';
-            estado.termo = '';
-            estado.pagina = 1;
-            $('campo-busca').value = '';
-            montarAbas();
-            carregar();
-        });
+function url(path, params) {
+  const u = new URL(API_BASE + path, API_BASE ? API_BASE + '/' : window.location.origin);
+  if (params) {
+    Object.keys(params).forEach(function (k) {
+      const v = params[k];
+      if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, v);
     });
+  }
+  return u.toString();
 }
 
-function esqueletos(quantidade) {
-    return new Array(quantidade).fill(0).map(() =>
-        '<div class="card esqueleto"><div class="card-poster"></div><div class="card-corpo"><div class="linha-falsa" style="width:80%"></div><div class="linha-falsa" style="width:45%"></div></div></div>'
-    ).join('');
+async function api(path, params) {
+  const res = await fetch(url(path, params));
+  let data = {};
+  try { data = await res.json(); } catch (e) { data = {}; }
+  if (!res.ok) throw new Error(data.error || ('Erro HTTP ' + res.status));
+  return data;
 }
 
-function ordenar(itens) {
-    const lista = itens.slice();
-    switch (estado.ordenacao) {
-        case 'qualidade':
-            lista.sort((a, b) => (b.qualidade || '').localeCompare(a.qualidade || '') || b.seeds - a.seeds);
-            break;
-        case 'ptbr':
-            lista.sort((a, b) => (b.idioma && b.idioma.pontos ? b.idioma.pontos : 0) - (a.idioma && a.idioma.pontos ? a.idioma.pontos : 0));
-            break;
-        case 'tamanho':
-            lista.sort((a, b) => (a.tamanhoBytes || 1e15) - (b.tamanhoBytes || 1e15));
-            break;
-        default:
-            lista.sort((a, b) => (b.seeds || 0) - (a.seeds || 0));
-    }
-    return lista;
+/* ------------------------------ cards ------------------------------ */
+
+function cardHtml(item, opts) {
+  const o = opts || {};
+  const prog = (o.progresso && item.progresso)
+    ? '<div class="card-progress"><i style="width:' + Math.min(100, item.progresso) + '%"></i></div>' : '';
+  const img = '<img loading="lazy" src="' + esc(item.poster || item.backdrop || PLACEHOLDER) +
+    '" alt="' + esc(item.titulo || '') + '" onerror="this.onerror=null;this.src=\'' + PLACEHOLDER + '\'">';
+  return '<button class="card" data-card data-id="' + esc(item.id) + '" data-tipo="' + esc(item.tipo || 'movie') + '">' +
+      '<div class="card-img">' + img + prog + '</div>' +
+      '<div class="card-meta"><span>' + esc(item.ano || '') + '</span>' +
+      (item.nota ? '<span>&#9733; ' + item.nota.toFixed(1) + '</span>' : '') + '</div>' +
+      '<div class="card-title">' + esc(item.titulo || '') + '</div>' +
+    '</button>';
 }
 
-function cardHtml(item) {
-    const poster = urlPoster(item);
-    const fav = estado.favoritos.has(chaveItem(item));
-    return '' +
-        '<article class="card" data-hash="' + escapar(item.infoHash || '') + '" data-titulo="' + escapar(item.titulo) + '">' +
-            '<button class="card-favorito' + (fav ? ' ativo' : '') + '" title="Minha Lista">' + (fav ? '★' : '☆') + '</button>' +
-            '<div class="card-poster">' +
-                (poster ? '<img loading="lazy" src="' + poster + '" alt="" onerror="this.style.display=\'none\'" />' : '') +
-                '<div class="sem-poster">' + escapar((item.titulo || '?').charAt(0).toUpperCase()) + '</div>' +
-                '<div class="card-badges">' + selos(item) + '</div>' +
-                '<span class="card-seeds">' + (item.seeds || 0) + ' seeds</span>' +
-            '</div>' +
-            '<div class="card-corpo">' +
-                '<div class="card-titulo">' + escapar(item.titulo) + '</div>' +
-                '<div class="card-meta"><span>' + escapar(item.categoria || '') + '</span><span>' + formatarBytes(item.tamanhoBytes) + '</span></div>' +
-                '<div class="card-fonte">' + escapar(item.fonteNome || '') + '</div>' +
-            '</div>' +
-        '</article>';
+function gridHtml(itens, opts) {
+  if (!itens || !itens.length) return '<p class="vazio">Nada por aqui ainda.</p>';
+  return itens.map(function (i) { return cardHtml(i, opts); }).join('');
 }
 
-function renderizar() {
-    const grade = $('grade');
-    const vazio = $('vazio');
-    const itens = ordenar(estado.itens);
+/* ------------------------------ views ------------------------------ */
 
-    if (!itens.length) {
-        grade.innerHTML = '';
-        vazio.hidden = false;
-        vazio.innerHTML = '<strong>Nada encontrado</strong>Tente outro termo, remova o filtro "Só PT-BR" ou mude a categoria.';
-        return;
-    }
-
-    vazio.hidden = true;
-    grade.innerHTML = itens.map(cardHtml).join('');
-
-    grade.querySelectorAll('.card').forEach((el) => {
-        el.addEventListener('click', (ev) => {
-            if (ev.target.closest('.card-favorito')) return;
-            const hash = el.dataset.hash;
-            const item = estado.itens.find((i) => (i.infoHash || '') === hash && i.titulo === el.dataset.titulo)
-                || estado.itens.find((i) => i.titulo === el.dataset.titulo);
-            if (item) abrirPlayer(item);
-        });
-    });
-
-    grade.querySelectorAll('.card-favorito').forEach((botao) => {
-        botao.addEventListener('click', (ev) => {
-            ev.stopPropagation();
-            const card = botao.closest('.card');
-            const item = estado.itens.find((i) => i.titulo === card.dataset.titulo);
-            if (!item) return;
-            const chave = chaveItem(item);
-            if (estado.favoritos.has(chave)) estado.favoritos.delete(chave);
-            else estado.favoritos.add(chave);
-            salvarFavoritos();
-            botao.classList.toggle('ativo');
-            botao.textContent = estado.favoritos.has(chave) ? '★' : '☆';
-        });
-    });
-
-    renderizarHero(itens[0]);
+function setView(nome) {
+  state.view = nome;
+  ['inicio', 'buscar', 'lista', 'historico', 'categorias'].forEach(function (v) {
+    const el = $('#view-' + v);
+    if (el) el.classList.toggle('hidden', v !== nome);
+  });
+  $$('.nav-link, .bn-item').forEach(function (b) { b.classList.toggle('active', b.dataset.view === nome); });
+  window.scrollTo({ top: 0 });
+  if (nome === 'lista') renderLista();
+  if (nome === 'historico') renderHistorico();
+  if (nome === 'categorias') renderCategorias();
+  if (nome === 'buscar') setTimeout(function () { els.searchInput.focus(); }, 120);
 }
 
-function renderizarHero(item) {
-    const hero = $('hero');
-    if (!item) { hero.hidden = true; return; }
+function abrirDrawer() { els.drawer.classList.remove('hidden'); els.drawerBackdrop.classList.remove('hidden'); }
+function fecharDrawer() { els.drawer.classList.add('hidden'); els.drawerBackdrop.classList.add('hidden'); }
 
-    hero.hidden = false;
-    const poster = urlPoster(item);
-    $('hero-fundo').style.backgroundImage = poster ? 'url("' + poster + '")' : 'none';
-    $('hero-etiqueta').textContent = (item.idioma && item.idioma.rotulo) || 'Destaque';
-    $('hero-titulo').textContent = item.titulo;
-    $('hero-sinopse').textContent = item.sinopse || 'Sem sinopse disponível. ' + (item.seeds || 0) + ' seeds ativos na rede.';
-    $('hero-tags').innerHTML = selos(item) + '<span class="selo">' + formatarBytes(item.tamanhoBytes) + '</span>';
+/* ------------------------------- home ------------------------------ */
 
-    $('hero-play').onclick = () => abrirPlayer(item);
-    $('hero-favorito').onclick = () => {
-        const chave = chaveItem(item);
-        if (estado.favoritos.has(chave)) estado.favoritos.delete(chave);
-        else estado.favoritos.add(chave);
-        salvarFavoritos();
-        toast(estado.favoritos.has(chave) ? 'Adicionado à Minha Lista' : 'Removido da Minha Lista');
-        renderizar();
-    };
+function skeleton() {
+  let html = '';
+  for (let i = 0; i < 3; i++) {
+    html += '<div class="row"><div class="sk sk-title"></div><div class="scroller">';
+    for (let j = 0; j < 6; j++) html += '<div class="sk sk-card"></div>';
+    html += '</div></div>';
+  }
+  return html;
 }
 
-function atualizarPaginacao(dados) {
-    const pag = $('paginacao');
-    if (!dados || dados.totalPaginas <= 1) { pag.hidden = true; return; }
-    pag.hidden = false;
-    $('pagina-atual').textContent = 'Página ' + dados.pagina + ' de ' + dados.totalPaginas + ' (' + dados.total + ' itens)';
-    $('pagina-anterior').disabled = dados.pagina <= 1;
-    $('pagina-proxima').disabled = dados.pagina >= dados.totalPaginas;
+function renderHero(item) {
+  if (!item) { els.hero.innerHTML = ''; els.hero.style.backgroundImage = 'none'; return; }
+  els.hero.style.backgroundImage = 'url("' + (item.backdrop || item.poster || PLACEHOLDER) + '")';
+  els.hero.innerHTML =
+    '<div class="hero-inner">' +
+      '<p class="hero-kicker">Destaque de hoje</p>' +
+      '<h1 class="hero-title">' + esc(item.titulo) + '</h1>' +
+      '<p class="hero-meta">' + esc(item.ano || '') +
+        (item.nota ? ' &middot; &#9733; ' + item.nota.toFixed(1) : '') + '</p>' +
+      '<p class="hero-sinopse">' + esc(item.sinopse || '') + '</p>' +
+      '<div class="hero-actions">' +
+        '<button class="btn primary" id="heroAssistir">Assistir agora</button>' +
+        '<button class="btn ghost" id="heroTrailer">Assistir trailer</button>' +
+        '<button class="btn ghost" id="heroFavoritar">Favoritar</button>' +
+      '</div>' +
+    '</div>';
+  $('#heroAssistir').addEventListener('click', function () { assistir(item); });
+  $('#heroTrailer').addEventListener('click', function () { abrirDetalhes(item.tipo || 'movie', item.id, true); });
+  $('#heroFavoritar').addEventListener('click', function () { alternarFavorito(item); });
 }
 
-/* --------------------------------- cargas -------------------------------- */
-
-async function carregar() {
-    if (estado.carregando) return;
-    estado.carregando = true;
-
-    const titulo = CATEGORIAS.find((c) => c.id === estado.categoria);
-    $('titulo-secao').textContent = estado.termo
-        ? 'Resultados para "' + estado.termo + '"'
-        : titulo ? titulo.rotulo : 'Início';
-
-    if (estado.categoria === 'favoritos') {
-        estado.itens = [...estado.favoritos].map((chave) => {
-            const encontrado = estado.itens.find((i) => chaveItem(i) === chave);
-            return encontrado || { titulo: chave, infoHash: chave.length === 40 ? chave : null, seeds: 0 };
-        });
-        renderizar();
-        estado.carregando = false;
-        return;
-    }
-
-    $('grade').innerHTML = esqueletos(12);
-
-    try {
-        const parametros = new URLSearchParams({ pagina: String(estado.pagina), porPagina: '60' });
-        let url;
-
-        if (estado.termo) {
-            parametros.set('q', estado.termo);
-            parametros.set('categoria', estado.categoria === 'inicio' ? 'todos' : estado.categoria);
-            parametros.set('ptbr', estado.ptbr ? '1' : '0');
-            url = '/api/buscar?' + parametros.toString();
-        } else {
-            parametros.set('categoria', estado.categoria);
-            url = '/api/catalogo?' + parametros.toString();
-        }
-
-        const resposta = await fetch(url);
-        const dados = await resposta.json();
-
-        estado.itens = dados.itens || [];
-        renderizar();
-        atualizarPaginacao(dados);
-
-        if (estado.termo && dados.fontes) {
-            const ok = dados.fontes.filter((f) => f.ok).length;
-            $('rodape-fontes').textContent = ok + '/' + dados.fontes.length + ' indexadores responderam';
-            if (!estado.itens.length && ok === 0) {
-                toast('Nenhuma fonte respondeu. Verifique sua conexão ou clique em "Fontes".');
-            }
-        }
-
-        if (!estado.termo) {
-            const atualizado = dados.atualizadoEm ? new Date(dados.atualizadoEm).toLocaleString('pt-BR') : 'nunca';
-            $('rodape-fontes').textContent = 'catálogo aquecido: ' + atualizado;
-        }
-    } catch (erro) {
-        toast('Erro ao carregar: ' + erro.message);
-        $('grade').innerHTML = '';
-    } finally {
-        estado.carregando = false;
-    }
+function rowHtml(titulo, itens, opts) {
+  return '<section class="row"><h2>' + esc(titulo) + '</h2><div class="scroller">' +
+    itens.map(function (i) { return cardHtml(i, opts); }).join('') + '</div></section>';
 }
 
-/* --------------------------------- player -------------------------------- */
-
-async function abrirPlayer(item) {
-    const modal = $('modal');
-    const video = $('video');
-
-    estado.player = { item, modo: null, infoHash: null, indice: null, polling: null, transcode: false, alvoSeek: 0 };
-
-    modal.hidden = false;
-    document.body.style.overflow = 'hidden';
-
-    video.pause();
-    video.removeAttribute('src');
-    video.load();
-
-    $('player-titulo').textContent = item.titulo;
-    $('player-badges').innerHTML = selos(item);
-    $('player-erro').hidden = true;
-    $('player-nota').textContent = 'Fonte: ' + (item.fonteNome || 'desconhecida') + ' | ' + (item.seeds || 0) + ' seeds | ' + formatarBytes(item.tamanhoBytes);
-    $('seletor-fonte').innerHTML = '<option value="' + escapar(item.infoHash || item.magnet || '') + '">' + escapar(item.fonteNome + ' - ' + item.qualidade) + '</option>';
-
-    if (!item.infoHash && !item.magnet) {
-        mostrarErro('Este item não expõe magnet direto. Abra o link da fonte original.');
-        return;
-    }
-
-    overlay('Buscando metadados do torrent...', true);
-    $('medidor').hidden = false;
-
-    try {
-        const referencia = encodeURIComponent(item.infoHash || item.magnet);
-        const resposta = await fetch('/api/torrent/' + referencia);
-
-        if (!resposta.ok) {
-            const erro = await resposta.json().catch(() => ({ erro: 'falha ao abrir torrent' }));
-            throw new Error(erro.erro || 'falha ao abrir torrent');
-        }
-
-        const meta = await resposta.json();
-        estado.player.infoHash = meta.infoHash;
-        estado.player.indice = meta.indice;
-
-        $('seletor-fonte').innerHTML = (meta.arquivos || [])
-            .filter((a) => a.video)
-            .map((a) => '<option value="' + a.indice + '"' + (a.indice === meta.indice ? ' selected' : '') + '>' + escapar(a.nome.slice(0, 70)) + ' (' + formatarBytes(a.tamanho) + ')</option>')
-            .join('') || '<option value="' + meta.indice + '">' + escapar(meta.arquivo) + '</option>';
-
-        $('player-nota').textContent = 'Modo: ' + meta.modo + ' (' + (meta.motivo || '') + ') | ' + meta.nome;
-        iniciarReproducao(meta.modo === 'direto' ? 'direto' : 'transcode');
-    } catch (erro) {
-        mostrarErro(erro.message);
-        overlay('Falha: ' + erro.message, false);
-    }
+async function carregarInicio() {
+  els.rows.innerHTML = skeleton();
+  try {
+    const data = await api('/api/home', { tipo: state.tipo });
+    renderHero(data.hero);
+    let html = '';
+    const continuar = LS.get(K.continuar, []);
+    if (continuar.length) html += rowHtml('Continue Assistindo', continuar, { progresso: true });
+    data.rows.forEach(function (r) { html += rowHtml(r.titulo, r.itens, {}); });
+    els.rows.innerHTML = html || '<p class="vazio">Sem resultados.</p>';
+  } catch (e) {
+    els.rows.innerHTML = '<p class="vazio">' + esc(e.message) + '</p>';
+    if (/TMDB_API_KEY/.test(e.message)) mostrarAviso();
+    toast(e.message, 'error');
+  }
 }
 
-function overlay(texto, girando) {
-    const el = $('player-overlay');
-    el.hidden = false;
-    el.querySelector('.spinner').style.display = girando ? 'block' : 'none';
-    $('overlay-texto').textContent = texto;
+function mostrarAviso() {
+  if ($('#aviso')) return;
+  const div = document.createElement('div');
+  div.id = 'aviso';
+  div.className = 'aviso';
+  div.innerHTML = 'Configure a chave do TMDb no <code>.env</code>: <code>TMDB_API_KEY=sua_chave</code> e reinicie.';
+  els.rows.parentNode.insertBefore(div, els.rows);
 }
 
-function mostrarErro(mensagem) {
-    const el = $('player-erro');
-    el.hidden = false;
-    el.textContent = mensagem;
+/* ------------------------------ buscar ----------------------------- */
+
+async function buscar(termo) {
+  const q = String(termo || '').trim();
+  if (q.length < 2) { els.searchResults.innerHTML = ''; return; }
+  els.searchResults.innerHTML = '<p class="vazio">Buscando...</p>';
+  try {
+    const data = await api('/api/buscar', { q: q, tipo: state.tipo });
+    els.searchResults.innerHTML = gridHtml(data.itens, {});
+  } catch (e) { els.searchResults.innerHTML = '<p class="vazio">' + esc(e.message) + '</p>'; }
 }
 
-function iniciarReproducao(modo) {
-    const video = $('video');
-    const player = estado.player;
-    if (!player || !player.infoHash) return;
+/* ----------------------- lista / historico / cats ------------------ */
 
-    player.modo = modo;
-    player.transcode = modo !== 'direto';
+function renderLista() { els.listaGrid.innerHTML = gridHtml(LS.get(K.lista, []), {}); }
+function renderHistorico() { els.historicoGrid.innerHTML = gridHtml(LS.get(K.historico, []), { progresso: true }); }
 
-    const base = player.transcode
-        ? '/transcode/' + player.infoHash + '/' + player.indice
-        : '/stream/' + player.infoHash + '/' + player.indice;
-
-    video.src = player.transcode && player.alvoSeek ? base + '?t=' + Math.floor(player.alvoSeek) : base;
-
-    overlay('Conectando aos peers...', true);
-
-    video.onloadedmetadata = () => {
-        if (player.transcode && player.alvoSeek) {
-            try { video.currentTime = Math.max(0, player.alvoSeek - Math.floor(player.alvoSeek)); } catch (_) { /* noop */ }
-            player.alvoSeek = 0;
-        }
-    };
-
-    video.oncanplay = () => { $('player-overlay').hidden = true; };
-
-    video.onerror = () => {
-        if (player.modo === 'direto') {
-            overlay('Container incompatível, convertendo...', true);
-            iniciarReproducao('transcode');
-            return;
-        }
-        mostrarErro('Não foi possível reproduzir. Tente outro arquivo ou outra fonte.');
-        overlay('Erro na reprodução.', false);
-    };
-
-    video.onwaiting = () => overlay('Armazenando buffer...', true);
-    video.onplaying = () => { $('player-overlay').hidden = true; };
-
-    video.onseeked = () => {
-        if (player.transcode && player.alvoSeek) {
-            const alvo = Math.floor(player.alvoSeek);
-            player.alvoSeek = 0;
-            video.src = '/transcode/' + player.infoHash + '/' + player.indice + '?t=' + alvo;
-            overlay('Buscando ' + new Date(alvo * 1000).toISOString().substr(11, 8) + '...', true);
-        }
-    };
-
-    const promessa = video.play();
-    if (promessa && promessa.catch) promessa.catch(() => { /* autoplay bloqueado */ });
-
-    iniciarPolling();
+function renderCategorias() {
+  els.categoriasChips.innerHTML = state.generos.map(function (g) {
+    return '<button class="chip" data-genero="' + g.id + '">' + esc(g.nome) + '</button>';
+  }).join('') || '<p class="vazio">Carregando...</p>';
+  $$('#categoriasChips .chip').forEach(function (b) {
+    b.addEventListener('click', function () { abrirGenero(b.dataset.genero, b.textContent); });
+  });
 }
 
-function iniciarPolling() {
-    pararPolling();
-    const player = estado.player;
-    if (!player) return;
-
-    player.polling = setInterval(async () => {
-        try {
-            const r = await fetch('/api/status/' + player.infoHash);
-            if (!r.ok) return;
-            const s = await r.json();
-
-            $('medidor-preenchido').style.width = Math.min(100, s.progresso || 0) + '%';
-            $('medidor-peers').textContent = (s.peers || 0) + ' peers';
-            $('medidor-velocidade').textContent = formatarBytes(s.velocidadeDown) + '/s';
-            $('medidor-progresso').textContent = (s.progresso || 0).toFixed(1) + '%';
-
-            if (!s.peers && s.progresso < 5) {
-                overlay('Procurando peers... (o magnet pode estar lento)', true);
-            }
-        } catch (_) { /* noop */ }
-    }, 1500);
+async function abrirGenero(id, nome) {
+  els.categoriasGrid.innerHTML = '<p class="vazio">Carregando ' + esc(nome) + '...</p>';
+  try {
+    const data = await api('/api/filmes/genero/' + id, { tipo: state.tipo });
+    els.categoriasGrid.innerHTML = gridHtml(data.itens, {});
+  } catch (e) { els.categoriasGrid.innerHTML = '<p class="vazio">' + esc(e.message) + '</p>'; }
 }
 
-function pararPolling() {
-    if (estado.player && estado.player.polling) clearInterval(estado.player.polling);
+function chaveItem(i) { return (i.tipo || 'movie') + ':' + i.id; }
+function resumo(i) {
+  return { id: i.id, tipo: i.tipo || 'movie', titulo: i.titulo, poster: i.poster, backdrop: i.backdrop, ano: i.ano, nota: i.nota };
+}
+
+function alternarFavorito(item) {
+  const lista = LS.get(K.lista, []);
+  const chave = chaveItem(item);
+  if (lista.some(function (i) { return chaveItem(i) === chave; })) {
+    LS.set(K.lista, lista.filter(function (i) { return chaveItem(i) !== chave; }));
+    toast('Removido da Minha Lista');
+  } else {
+    lista.unshift(resumo(item));
+    LS.set(K.lista, lista.slice(0, 120));
+    toast('Adicionado a Minha Lista');
+  }
+  if (state.view === 'lista') renderLista();
+}
+
+function marcarHistorico(item) {
+  const h = LS.get(K.historico, []).filter(function (i) { return chaveItem(i) !== chaveItem(item); });
+  h.unshift(Object.assign(resumo(item), { atualizado: Date.now() }));
+  LS.set(K.historico, h.slice(0, 80));
+}
+
+function salvarProgresso(seg, dur) {
+  if (!state.media || !dur) return;
+  const pct = Math.min(100, (seg / dur) * 100);
+  if (pct < 1 || pct > 98) return;
+  const chave = chaveItem(state.media);
+  const lista = LS.get(K.continuar, []).filter(function (i) { return chaveItem(i) !== chave; });
+  lista.unshift(Object.assign(resumo(state.media), { progresso: pct, atualizado: Date.now() }));
+  LS.set(K.continuar, lista.slice(0, 15));
+}
+
+/* ------------------------------ detalhes --------------------------- */
+
+function abrirModal(html) {
+  els.modalBody.innerHTML = html;
+  els.modal.classList.remove('hidden');
+  document.body.classList.add('no-scroll');
+}
+function fecharModal() {
+  els.modal.classList.add('hidden');
+  els.modalBody.innerHTML = '';
+  if (els.player.classList.contains('hidden')) document.body.classList.remove('no-scroll');
+}
+
+async function abrirDetalhes(tipo, id, abrirTrailer) {
+  abrirModal('<p class="vazio">Carregando...</p>');
+  try {
+    const m = await api('/api/media/' + tipo + '/' + id);
+    state.media = m;
+    renderDetalhes(m, abrirTrailer);
+  } catch (e) { abrirModal('<p class="vazio">' + esc(e.message) + '</p>'); }
+}
+
+function renderDetalhes(m, abrirTrailer) {
+  const generos = (m.generos || []).map(function (g) { return g.nome; }).join(' &middot; ');
+  const elenco = (m.elenco || []).map(function (c) {
+    return '<div class="elenco-item"><div class="elenco-foto">' +
+      (c.foto ? '<img loading="lazy" src="' + esc(c.foto) + '" alt="' + esc(c.nome) + '" onerror="this.onerror=null;this.src=\'' + PLACEHOLDER + '\'">' : '') +
+      '</div><span>' + esc(c.nome) + '</span></div>';
+  }).join('');
+
+  els.modalBody.innerHTML =
+    '<div class="details" style="--bd:url(\'' + (m.backdrop || m.poster || PLACEHOLDER) + '\')">' +
+      '<div class="details-top">' +
+        '<div class="details-poster"><img src="' + esc(m.poster || PLACEHOLDER) + '" alt="' + esc(m.titulo) + '" onerror="this.onerror=null;this.src=\'' + PLACEHOLDER + '\'"></div>' +
+        '<div class="details-head">' +
+          '<h2>' + esc(m.titulo) + '</h2>' +
+          '<p class="details-meta">' + esc(m.ano || '') +
+            (m.nota ? ' &middot; &#9733; ' + m.nota.toFixed(1) : '') +
+            (m.duracao ? ' &middot; ' + m.duracao + ' min' : '') +
+            (m.tipo === 'tv' ? ' &middot; Serie' : '') + '</p>' +
+          (generos ? '<p class="details-gen">' + generos + '</p>' : '') +
+        '</div>' +
+      '</div>' +
+      '<div class="details-body">' +
+        '<p class="details-sinopse">' + esc(m.sinopse || 'Sinopse nao disponivel.') + '</p>' +
+        '<div class="details-actions">' +
+          '<button class="btn primary big" id="btnAssistir">Assistir agora</button>' +
+          '<div class="linha">' +
+            (m.trailer ? '<button class="btn ghost" id="btnTrailer">Trailer</button>' : '') +
+            '<button class="btn ghost" id="btnFavoritar">Favoritar</button>' +
+            (m.imdbId ? '<a class="btn ghost" target="_blank" rel="noreferrer" href="https://www.imdb.com/title/' + esc(m.imdbId) + '/">IMDb</a>' : '') +
+          '</div>' +
+        '</div>' +
+        (elenco ? '<div class="elenco"><h3>Elenco</h3><div class="elenco-list">' + elenco + '</div></div>' : '') +
+      '</div>' +
+    '</div>';
+
+  $('#btnAssistir').addEventListener('click', function () { fecharModal(); assistir(m); });
+  if ($('#btnTrailer')) $('#btnTrailer').addEventListener('click', function () { mostrarTrailer(m.trailer); });
+  $('#btnFavoritar').addEventListener('click', function () { alternarFavorito(m); });
+  if (abrirTrailer && m.trailer) mostrarTrailer(m.trailer);
+}
+
+function mostrarTrailer(trailer) {
+  if (!trailer) return;
+  const box = document.createElement('div');
+  box.className = 'trailer';
+  box.innerHTML = '<iframe src="https://www.youtube.com/embed/' + esc(trailer.key) +
+    '?autoplay=1&rel=0&playsinline=1" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+  els.modalBody.appendChild(box);
+  box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+/* =============================== PLAYER ============================ */
+
+function abrirPlayer(titulo) {
+  state.podeTocar = false;
+  state.streamUrl = null;
+  state.subs = [];
+  state.legendaAtiva = null;
+  els.video.removeAttribute('src');
+  $$('#video track').forEach(function (t) { t.remove(); });
+  els.video.load();
+  els.pvTitle.textContent = titulo || 'Reproduzindo';
+  els.pvCenter.classList.remove('oculto');
+  els.pvCenter.innerHTML =
+    '<div class="pv-spinner"></div>' +
+    '<p class="pv-msg" id="pvMsg">Buscando fontes PT-BR...</p>' +
+    '<div class="pv-bar"><i id="pvFill"></i></div>' +
+    '<p class="pv-stats" id="pvStats"></p>' +
+    '<p class="pv-fonte" id="pvFonte"></p>';
+  els.pvMsg = $('#pvMsg'); els.pvStats = $('#pvStats'); els.pvFill = $('#pvFill'); els.pvFonte = $('#pvFonte');
+  els.pvFill.style.width = '0%';
+  els.pvStats.textContent = '';
+  els.pvFonte.textContent = '';
+  els.pvProgress.style.width = '0%';
+  els.pvKnob.style.left = '0%';
+  els.pvTime.textContent = '0:00 / 0:00';
+  els.pvSheet.classList.add('hidden');
+  els.player.classList.remove('hidden', 'controles-ocultos');
+  document.body.classList.add('no-scroll');
+  mostrarControles();
 }
 
 function fecharPlayer() {
-    const video = $('video');
-    pararPolling();
-    try { video.pause(); } catch (_) { /* noop */ }
-    video.removeAttribute('src');
-    video.load();
-    $('modal').hidden = true;
-    document.body.style.overflow = '';
-    estado.player = null;
+  if (state.job) {
+    const jobId = state.job;
+    state.job = null;
+    fetch(url('/api/play/stop', { jobId: jobId }), { keepalive: true }).catch(function () { });
+  }
+  clearTimeout(state.poll);
+  clearTimeout(state.esconderTimer);
+  try { els.video.pause(); } catch (e) { }
+  els.video.removeAttribute('src');
+  els.video.load();
+  els.player.classList.add('hidden');
+  els.player.classList.remove('controles-ocultos');
+  document.body.classList.remove('no-scroll');
+  if (state.view === 'inicio') carregarInicio();
 }
 
-/* ---------------------------------- fontes -------------------------------- */
+/** Clicou em assistir: player aparece JÁ, sem modal nenhum. */
+async function assistir(media) {
+  state.media = media;
+  marcarHistorico(media);
+  abrirPlayer(media.titulo);
 
-async function abrirFontes(forcar) {
-    $('modal-fontes').hidden = false;
-    $('lista-fontes').innerHTML = '<p class="nota">Verificando...</p>';
+  const params = {
+    titulo: media.titulo,
+    tituloOriginal: media.tituloOriginal,
+    ano: media.ano,
+    imdbId: media.imdbId,
+    tipo: media.tipo
+  };
 
-    try {
-        const r = await fetch('/api/fontes' + (forcar ? '?forcar=1' : ''));
-        const dados = await r.json();
-
-        $('lista-fontes').innerHTML = (dados.fontes || []).map((f) =>
-            '<div class="linha-fonte">' +
-                '<span class="ponto ' + (f.online ? 'ok' : 'off') + '"></span>' +
-                '<span class="nome">' + escapar(f.nome) + '</span>' +
-                '<span class="detalhe">' + (f.online ? (f.ms + 'ms') : 'offline') +
-                (f.buscaTeste && f.buscaTeste.ok ? ' | ' + f.buscaTeste.total + ' resultados' : '') +
-                '</span>' +
-            '</div>'
-        ).join('') || '<p class="nota">Sem fontes ativas.</p>';
-    } catch (erro) {
-        $('lista-fontes').innerHTML = '<p class="nota">Erro: ' + escapar(erro.message) + '</p>';
+  try {
+    const data = await api('/api/torrent', params);
+    state.fontes = data.fontes || [];
+    state.melhor = data.melhor;
+    if (!state.melhor) {
+      erroPlayer('Nenhum torrent encontrado. Tente pelo titulo original.');
+      return;
     }
+    els.pvFonte.textContent = 'Fonte selecionada: ' + state.melhor.source + ' - ' + (state.melhor.ptbr ? state.melhor.ptbr.audio : '');
+    iniciarJob(state.melhor);
+  } catch (e) {
+    erroPlayer(e.message);
+  }
 }
 
-/* --------------------------------- eventos -------------------------------- */
+async function iniciarJob(fonte) {
+  if (!fonte) return;
+  if (state.job) {
+    const antigo = state.job;
+    state.job = null;
+    fetch(url('/api/play/stop', { jobId: antigo }), { keepalive: true }).catch(function () { });
+  }
+  clearTimeout(state.poll);
+  state.podeTocar = false;
+  state.legendaAtiva = null;
+  state.subs = [];
+  els.video.removeAttribute('src');
+  $$('#video track').forEach(function (t) { t.remove(); });
+  els.video.load();
+  els.pvCenter.classList.remove('oculto');
+  els.pvMsg.textContent = 'Conectando aos peers...';
+  els.pvFill.style.width = '0%';
 
-function ligarEventos() {
-    $('form-busca').addEventListener('submit', (ev) => {
-        ev.preventDefault();
-        const termo = $('campo-busca').value.trim();
-        estado.termo = termo;
-        estado.modo = termo ? 'busca' : 'catalogo';
-        estado.pagina = 1;
-        if (termo) estado.categoria = estado.categoria === 'inicio' ? 'inicio' : estado.categoria;
-        carregar();
+  try {
+    const data = await api('/api/play', {
+      magnet: fonte.magnet,
+      fileIdx: fonte.fileIdx,
+      titulo: fonte.title,
+      qualidade: fonte.quality
     });
-
-    $('campo-busca').addEventListener('input', (ev) => {
-        if (!ev.target.value.trim() && estado.termo) {
-            estado.termo = '';
-            estado.pagina = 1;
-            carregar();
-        }
-    });
-
-    $('ordenacao').addEventListener('change', (ev) => {
-        estado.ordenacao = ev.target.value;
-        renderizar();
-    });
-
-    document.querySelectorAll('.chip[data-ptbr]').forEach((chip) => {
-        chip.addEventListener('click', () => {
-            document.querySelectorAll('.chip[data-ptbr]').forEach((c) => c.classList.remove('ativo'));
-            chip.classList.add('ativo');
-            estado.ptbr = chip.dataset.ptbr === '1';
-            estado.pagina = 1;
-            if (estado.termo) carregar();
-        });
-    });
-
-    $('chip-favoritos').addEventListener('click', () => {
-        estado.categoria = estado.categoria === 'favoritos' ? 'inicio' : 'favoritos';
-        $('chip-favoritos').classList.toggle('ativo');
-        montarAbas();
-        carregar();
-    });
-
-    $('pagina-anterior').addEventListener('click', () => { if (estado.pagina > 1) { estado.pagina--; carregar(); window.scrollTo({ top: 0, behavior: 'smooth' }); } });
-    $('pagina-proxima').addEventListener('click', () => { estado.pagina++; carregar(); window.scrollTo({ top: 0, behavior: 'smooth' }); });
-
-    $('btn-fontes').addEventListener('click', () => abrirFontes(false));
-    $('btn-reverificar').addEventListener('click', () => abrirFontes(true));
-    $('btn-fechar-fontes').addEventListener('click', () => { $('modal-fontes').hidden = true; });
-
-    $('btn-cache').addEventListener('click', async () => {
-        const r = await fetch('/api/cache', { method: 'DELETE' });
-        toast(r.ok ? 'Cache de torrents liberado.' : 'Falha ao limpar cache.');
-    });
-
-    $('btn-fechar').addEventListener('click', fecharPlayer);
-    $('modal').addEventListener('click', (ev) => { if (ev.target === $('modal')) fecharPlayer(); });
-    $('modal-fontes').addEventListener('click', (ev) => { if (ev.target === $('modal-fontes')) $('modal-fontes').hidden = true; });
-
-    document.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Escape') {
-            if (!$('modal').hidden) fecharPlayer();
-            if (!$('modal-fontes').hidden) $('modal-fontes').hidden = true;
-        }
-    });
-
-    $('seletor-fonte').addEventListener('change', (ev) => {
-        if (!estado.player) return;
-        estado.player.indice = Number(ev.target.value);
-        estado.player.alvoSeek = 0;
-        iniciarReproducao(estado.player.transcode ? 'transcode' : 'direto');
-    });
-
-    $('seletor-modo').addEventListener('change', (ev) => {
-        if (!estado.player) return;
-        estado.player.alvoSeek = 0;
-        iniciarReproducao(ev.target.value === 'transcode' ? 'transcode' : 'direto');
-    });
-
-    $('btn-magnet').addEventListener('click', async () => {
-        const item = estado.player && estado.player.item;
-        if (!item) return;
-        const magnet = item.magnet || ('magnet:?xt=urn:btih:' + item.infoHash);
-        try {
-            await navigator.clipboard.writeText(magnet);
-            toast('Magnet copiado.');
-        } catch (_) {
-            window.prompt('Magnet:', magnet);
-        }
-    });
-
-    $('btn-liberar').addEventListener('click', async () => {
-        const player = estado.player;
-        if (!player || !player.infoHash) return;
-        await fetch('/api/cache?infoHash=' + player.infoHash, { method: 'DELETE' });
-        toast('Torrent liberado da memória e do disco.');
-        fecharPlayer();
-    });
+    state.job = data.jobId;
+    poll();
+  } catch (e) { erroPlayer(e.message); }
 }
 
-/* ---------------------------------- inicio -------------------------------- */
+function erroPlayer(msg) {
+  clearTimeout(state.poll);
+  els.pvCenter.classList.remove('oculto');
+  els.pvCenter.innerHTML =
+    '<p class="pv-erro">' + esc(msg) + '</p>' +
+    '<button class="btn small" id="pvOutraFonte">Escolher outra fonte</button>' +
+    '<button class="btn small ghost" id="pvSair">Sair</button>';
+  $('#pvOutraFonte').addEventListener('click', function () { abrirSheetFontes(); });
+  $('#pvSair').addEventListener('click', fecharPlayer);
+}
 
-(async function iniciar() {
-    carregarFavoritos();
-    montarAbas();
-    ligarEventos();
-    await carregar();
+function atualizarOverlay(s) {
+  if (s.canPlay && !state.podeTocar) {
+    state.podeTocar = true;
+    state.streamUrl = s.streamUrl;
+    if (API_BASE) els.video.crossOrigin = 'anonymous';
+    els.video.src = API_BASE + s.streamUrl;
+    const p = els.video.play();
+    if (p && p.catch) p.catch(function () { });
+    carregarLegendas();
+  }
 
-    setInterval(() => {
-        if (!estado.termo && estado.pagina === 1 && !estado.carregando && $('modal').hidden) carregar();
-    }, 5 * 60 * 1000);
-})();
+  els.pvFill.style.width = Math.max(2, Math.min(100, s.buffer || 0)).toFixed(0) + '%';
+
+  if (!state.podeTocar) {
+    els.pvMsg.textContent = s.message || 'Conectando aos peers...';
+    els.pvStats.textContent = (s.buffer || 0).toFixed(1) + '% do buffer | ' + s.peers + ' peers | ' +
+      fmtSpeed(s.speed) + ' | ' + fmtSize(s.downloaded) + ' de ' + fmtSize(s.total) + ' | ' + s.elapsed + 's';
+  } else {
+    els.pvMsg.textContent = 'Iniciando...';
+    els.pvStats.textContent = s.peers + ' peers | ' + fmtSpeed(s.speed);
+  }
+}
+
+async function poll() {
+  if (!state.job) return;
+  try {
+    const s = await api('/api/play/status', { jobId: state.job });
+    atualizarOverlay(s);
+    if (s.state === 'erro') { erroPlayer(s.message); return; }
+  } catch (e) { erroPlayer(e.message); return; }
+  state.poll = setTimeout(poll, state.podeTocar ? 2500 : 850);
+}
+
+/* ----------------------------- legendas ---------------------------- */
+
+async function carregarLegendas() {
+  if (!state.job) return;
+  try {
+    const data = await api('/api/play/subs', { jobId: state.job });
+    state.subs = data.subs || [];
+    if (state.subs.length) {
+      const pt = state.subs.filter(function (s) { return s.code === 'pt-BR'; })[0];
+      aplicarLegenda(pt ? pt.idx : null);
+    }
+  } catch (e) { }
+}
+
+function aplicarLegenda(idx) {
+  $$('#video track').forEach(function (t) { t.remove(); });
+  state.legendaAtiva = idx;
+  if (idx === null || idx === undefined) return;
+  const s = state.subs.filter(function (x) { return x.idx === idx; })[0];
+  if (!s) return;
+  const track = document.createElement('track');
+  track.kind = 'subtitles';
+  track.label = s.label;
+  track.srclang = s.code;
+  track.src = API_BASE + '/api/play/subtitle?jobId=' + state.job + '&idx=' + s.idx;
+  track.default = true;
+  els.video.appendChild(track);
+  setTimeout(function () { try { if (track.track) track.track.mode = 'showing'; } catch (e) { } }, 120);
+}
+
+/* ------------------------------ sheets ----------------------------- */
+
+function abrirSheet(titulo, html) {
+  els.pvSheetTitle.textContent = titulo;
+  els.pvSheetBody.innerHTML = html;
+  els.pvSheet.classList.remove('hidden');
+  mostrarControles();
+}
+
+function abrirSheetFontes() {
+  if (!state.fontes.length) { abrirSheet('Fontes', '<p class="pv-vazio">Nenhuma fonte carregada.</p>'); return; }
+  const html = state.fontes.map(function (f, i) {
+    const atual = state.melhor && f.hash === state.melhor.hash ? ' atual' : '';
+    const nivel = f.ptbr ? f.ptbr.nivel : 'desconhecido';
+    const cls = nivel === 'confirmado' || nivel === 'provavel' ? 'br' : (nivel === 'estrangeiro' ? 'ruim' : '');
+    return '<div class="pv-fonte-item' + atual + '" data-fonte-idx="' + i + '">' +
+        '<div><div class="pv-fonte-nome">' + esc(f.title) + '</div>' +
+          '<div class="pv-fonte-tags">' +
+            '<span class="pv-badge">' + esc(f.quality || 'SD') + '</span>' +
+            '<span class="pv-badge ' + cls + '">' + esc(f.ptbr ? f.ptbr.audio : '') + '</span>' +
+            (f.size ? '<span>' + esc(f.size) + '</span>' : '') +
+            '<span>' + f.seeders + ' seeds</span><span>' + esc(f.source) + '</span>' +
+          '</div>' +
+        '</div>' +
+        '<button class="btn small' + (atual ? ' primary' : '') + '">' + (atual ? 'Atual' : 'Usar') + '</button>' +
+      '</div>';
+  }).join('');
+  abrirSheet('Fontes (' + state.fontes.length + ')', html);
+  $$('#pvSheetBody [data-fonte-idx]').forEach(function (n) {
+    n.addEventListener('click', function () {
+      const f = state.fontes[Number(n.dataset.fonteIdx)];
+      state.melhor = f;
+      els.pvSheet.classList.add('hidden');
+      els.pvFonte.textContent = 'Fonte: ' + f.source + ' - ' + (f.ptbr ? f.ptbr.audio : '');
+      iniciarJob(f);
+    });
+  });
+}
+
+function abrirSheetLegendas() {
+  if (!state.subs.length) { abrirSheet('Legendas', '<p class="pv-vazio">Nenhuma legenda encontrada dentro do torrent.</p>'); return; }
+  const itens = [{ idx: null, label: 'Desativado', code: '' }].concat(state.subs);
+  const html = itens.map(function (s) {
+    const atual = (state.legendaAtiva === s.idx) ? ' atual' : '';
+    return '<div class="pv-legenda-item' + atual + '" data-legenda="' + (s.idx === null ? '' : s.idx) + '">' +
+      '<span>' + esc(s.label) + '</span><span>' + esc(s.code) + '</span></div>';
+  }).join('');
+  abrirSheet('Legendas', html);
+  $$('#pvSheetBody [data-legenda]').forEach(function (n) {
+    n.addEventListener('click', function () {
+      const v = n.dataset.legenda;
+      aplicarLegenda(v === '' ? null : Number(v));
+      els.pvSheet.classList.add('hidden');
+      toast(v === '' ? 'Legenda desativada' : 'Legenda ativada');
+    });
+  });
+}
+
+/* ----------------------------- controles --------------------------- */
+
+function mostrarControles() {
+  els.player.classList.remove('controles-ocultos');
+  clearTimeout(state.esconderTimer);
+  if (!els.video.paused && !els.pvSheet.classList.contains('hidden') === false) { /* noop */ }
+  state.esconderTimer = setTimeout(function () {
+    if (!els.video.paused && els.pvSheet.classList.contains('hidden')) {
+      els.player.classList.add('controles-ocultos');
+    }
+  }, 3400);
+}
+
+function alternarPlay() {
+  if (els.video.paused) { const p = els.video.play(); if (p && p.catch) p.catch(function () { }); }
+  else els.video.pause();
+}
+
+function pular(segundos) {
+  if (!isFinite(els.video.duration)) return;
+  els.video.currentTime = Math.max(0, Math.min(els.video.duration - 1, els.video.currentTime + segundos));
+  mostrarControles();
+}
+
+function atualizarTempo() {
+  const dur = isFinite(els.video.duration) ? els.video.duration : 0;
+  const pct = dur ? (els.video.currentTime / dur) * 100 : 0;
+  els.pvProgress.style.width = pct + '%';
+  els.pvKnob.style.left = pct + '%';
+  els.pvTime.textContent = fmtTime(els.video.currentTime) + ' / ' + fmtTime(dur);
+}
+
+function seekPara(clientX) {
+  const r = els.pvSeek.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
+  if (isFinite(els.video.duration)) els.video.currentTime = pct * els.video.duration;
+}
+
+/* ------------------------------ wiring ----------------------------- */
+
+function wire() {
+  $('#menuBtn').addEventListener('click', abrirDrawer);
+  $('#drawerClose').addEventListener('click', fecharDrawer);
+  els.drawerBackdrop.addEventListener('click', fecharDrawer);
+
+  $$('.nav-link, .bn-item').forEach(function (b) {
+    b.addEventListener('click', function () { setView(b.dataset.view); fecharDrawer(); });
+  });
+
+  $('#brand').addEventListener('click', function (e) { e.preventDefault(); setView('inicio'); });
+  $('#searchBtn').addEventListener('click', function () { setView('buscar'); });
+
+  els.tipoToggle.addEventListener('click', function () {
+    state.tipo = state.tipo === 'movie' ? 'tv' : 'movie';
+    LS.set(K.tipo, state.tipo);
+    els.tipoToggle.textContent = state.tipo === 'movie' ? 'Filmes' : 'Series';
+    carregarInicio();
+  });
+  els.tipoToggle.textContent = state.tipo === 'movie' ? 'Filmes' : 'Series';
+
+  $('#searchGo').addEventListener('click', function () { buscar(els.searchInput.value); });
+  els.searchInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') buscar(els.searchInput.value); });
+  els.searchInput.addEventListener('input', function () {
+    clearTimeout(state.buscaTimer);
+    state.buscaTimer = setTimeout(function () { buscar(els.searchInput.value); }, 420);
+  });
+
+  $('#limparHistorico').addEventListener('click', function () {
+    LS.del(K.historico); LS.del(K.continuar); renderHistorico(); toast('Historico limpo');
+  });
+
+  document.addEventListener('click', function (e) {
+    const card = e.target.closest('[data-card]');
+    if (card) { abrirDetalhes(card.dataset.tipo, card.dataset.id, false); return; }
+    const gen = e.target.closest('[data-genero]');
+    if (gen) { abrirGenero(gen.dataset.genero, gen.textContent); return; }
+    if (e.target.closest('[data-close]')) fecharModal();
+  });
+
+  /* ---- player ---- */
+  $('#pvClose').addEventListener('click', fecharPlayer);
+  $('#pvFontes').addEventListener('click', abrirSheetFontes);
+  $('#pvSheetClose').addEventListener('click', function () { els.pvSheet.classList.add('hidden'); });
+  $('#pvPlay').addEventListener('click', alternarPlay);
+  $('#pvBack30').addEventListener('click', function () { pular(-30); });
+  $('#pvFwd30').addEventListener('click', function () { pular(30); });
+  $('#pvCC').addEventListener('click', abrirSheetLegendas);
+  $('#pvMute').addEventListener('click', function () {
+    els.video.muted = !els.video.muted;
+    els.icoVol.classList.toggle('hidden', els.video.muted);
+    els.icoMudo.classList.toggle('hidden', !els.video.muted);
+  });
+  $('#pvFull').addEventListener('click', function () {
+    const alvo = els.player;
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (alvo.requestFullscreen) alvo.requestFullscreen();
+    else if (els.video.webkitEnterFullscreen) els.video.webkitEnterFullscreen();
+  });
+
+  els.pvSeek.addEventListener('pointerdown', function (e) {
+    state.arrastandoSeek = true;
+    els.pvSeek.setPointerCapture(e.pointerId);
+    seekPara(e.clientX);
+  });
+  els.pvSeek.addEventListener('pointermove', function (e) { if (state.arrastandoSeek) seekPara(e.clientX); });
+  els.pvSeek.addEventListener('pointerup', function () { state.arrastandoSeek = false; });
+  els.pvSeek.addEventListener('pointercancel', function () { state.arrastandoSeek = false; });
+
+  els.player.addEventListener('pointermove', mostrarControles);
+  els.player.addEventListener('pointerdown', function (e) {
+    if (e.target.closest('.pv-bottom') || e.target.closest('.pv-top') || e.target.closest('.pv-sheet')) { mostrarControles(); return; }
+    if (!els.player.classList.contains('controles-ocultos')) els.player.classList.add('controles-ocultos');
+    else mostrarControles();
+  });
+
+  els.video.addEventListener('play', function () {
+    els.icoPlay.classList.add('hidden');
+    els.icoPause.classList.remove('hidden');
+    mostrarControles();
+  });
+  els.video.addEventListener('pause', function () {
+    els.icoPlay.classList.remove('hidden');
+    els.icoPause.classList.add('hidden');
+    mostrarControles();
+  });
+  els.video.addEventListener('playing', function () {
+    els.pvCenter.classList.add('oculto');
+    mostrarControles();
+  });
+  els.video.addEventListener('waiting', function () {
+    if (state.podeTocar) {
+      els.pvCenter.classList.remove('oculto');
+      els.pvMsg.textContent = 'Carregando mais dados...';
+      els.pvStats.textContent = '';
+    }
+  });
+  els.video.addEventListener('timeupdate', function () {
+    atualizarTempo();
+    const agora = Date.now();
+    if (agora - state.ultimoSalvar < 5000) return;
+    state.ultimoSalvar = agora;
+    if (els.video.duration) salvarProgresso(els.video.currentTime, els.video.duration);
+  });
+  els.video.addEventListener('loadedmetadata', atualizarTempo);
+  els.video.addEventListener('error', function () {
+    if (state.podeTocar) toast('O navegador nao reproduziu este arquivo. Use "Fontes" para trocar ou abra no VLC.', 'error');
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (!els.player.classList.contains('hidden')) {
+      if (e.key === 'Escape') fecharPlayer();
+      if (e.key === ' ') { e.preventDefault(); alternarPlay(); }
+      if (e.key === 'ArrowLeft') pular(-30);
+      if (e.key === 'ArrowRight') pular(30);
+      if (e.key === 'f' || e.key === 'F') $('#pvFull').click();
+      return;
+    }
+    if (e.key === 'Escape') { if (!els.modal.classList.contains('hidden')) fecharModal(); else fecharDrawer(); }
+  });
+
+  window.addEventListener('pagehide', function () {
+    if (state.job) {
+      const u = url('/api/play/stop', { jobId: state.job });
+      if (navigator.sendBeacon) navigator.sendBeacon(u); else fetch(u, { keepalive: true }).catch(function () { });
+    }
+  });
+}
+
+/* -------------------------------- init ----------------------------- */
+
+async function init() {
+  wire();
+  try {
+    const cfg = await api('/api/config');
+    if (!cfg.tmdbConfigurado) mostrarAviso();
+    const g = await api('/api/generos', { tipo: state.tipo });
+    state.generos = g.generos || [];
+  } catch (e) { if (/TMDB_API_KEY/.test(e.message)) mostrarAviso(); }
+  carregarInicio();
+  renderLista();
+  renderHistorico();
+}
+
+init();
 '@
+Write-ProjectFile 'public/app.js' $appJs
 
-# ===========================================================================
-#  README-PTBR.md
-# ===========================================================================
-# ===========================================================================
-#  README-PTBR.md  - gerado por array de linhas (imune a falha de here-string)
-# ===========================================================================
-Escrever-Cabecalho 'GERANDO README-PTBR.md'
+# ======================================================================
+Write-Step 'Configuracao'
 
-# Se a entrada antiga do README ainda existir em $Arquivos, remove
-if ($Arquivos.Contains('README-PTBR.md')) { $Arquivos.Remove('README-PTBR.md') }
-
-$linhasReadme = @(
-    '# cinep2p v3 - Agregador P2P PT-BR'
-    ''
-    'Nucleo reescrito para priorizar **audio dublado, dual audio e legendas PT-BR**, cobrindo'
-    'Filmes, Series, Animes, Doramas, Novelas, Curtas e Documentarios.'
-    ''
-    '## Fluxo'
-    ''
-    '```'
-    'catalogo -> busca multi-fonte -> score de estabilidade -> magnet'
-    '        -> WebTorrent (stream sequencial) -> remux/transcode FFmpeg -> player browser'
-    '```'
-    ''
-    '## Como rodar'
-    ''
-    '```'
-    'npm install'
-    'npm start            # http://localhost:3000'
-    'npm run worker       # daemon de aquecimento do catalogo (6h)'
-    'npm run aquecer      # um unico ciclo de aquecimento'
-    'npm run fontes       # diagnostico de saude dos indexadores'
-    '```'
-    ''
-    '## Endpoints'
-    ''
-    '| Metodo | Rota | Descricao |'
-    '|---|---|---|'
-    '| GET | `/api/saude` | estado do processo, cache e binarios |'
-    '| GET | `/api/fontes` | saude de cada indexador (com teste de busca real) |'
-    '| GET | `/api/categorias` | categorias disponiveis |'
-    '| GET | `/api/buscar?q=&categoria=&pagina=&ptbr=` | busca agregada e ranqueada |'
-    '| GET | `/api/catalogo?categoria=&pagina=` | catalogo pre-aquecido |'
-    '| GET | `/api/torrent/:infoHash` | metadados, lista de arquivos, plano de reproducao |'
-    '| GET | `/api/status/:infoHash` | peers, velocidade, progresso |'
-    '| GET | `/stream/:infoHash/:indice` | streaming direto com `Range` / HTTP 206 |'
-    '| GET | `/transcode/:infoHash/:indice?t=` | remux/transcode FFmpeg para fMP4 |'
-    '| GET | `/api/img?u=&ref=` | proxy de poster (contorna hotlink bloqueado) |'
-    '| DELETE | `/api/cache` | limpa LRU (`?infoHash=` remove um so) |'
-    ''
-    '## Fontes de indexacao'
-    ''
-    'HTML: Comando Torrents, Torrent dos Filmes, BluDV, BJ-Share, Rede Torrent,'
-    'AnimesTorrent, Anime Torrents, Doramas Torrent, Novelas Torrent.'
-    'API JSON: The Pirate Bay (apibay), YTS.'
-    ''
-    'Cada fonte declara multiplas bases; o motor tenta em cascata ate obter resultados,'
-    'o que absorve a troca frequente de TLD dos sites brasileiros.'
-    ''
-    '## Score de estabilidade'
-    ''
-    '```'
-    'pontos = min(seeds, 600) * 0.35'
-    '       + bonus de idioma   (dublado 62 / dual 50 / legendado 26 / nacional 14 / original -22)'
-    '       + bonus de qualidade (2160p 22 / 1080p 15 / 720p 11 / 480p 5)'
-    '       + confiabilidade da fonte * 0.3'
-    '       + sanidade de tamanho'
-    '```'
-    ''
-    '## Armazenamento'
-    ''
-    '- Maximo de torrents ativos simultaneos (`CINE_MAX_TORRENTS`, padrao 3).'
-    '- Limpeza por ociosidade (`CINE_IDLE_MIN`, padrao 12 min).'
-    '- Teto de disco com despejo LRU (`CINE_MAX_CACHE_GB`, padrao 25 GB).'
-    '- Selecao sequencial de pecas: apenas o arquivo em reproducao e priorizado.'
-    ''
-    '## Compatibilidade de midia'
-    ''
-    '- **direto**: MP4/MOV/WebM com H.264/VP8/VP9/AV1 + AAC/MP3/Opus -> `Range` 206.'
-    '- **remux**: MKV com codecs de video suportados -> fMP4 sem reencodar video.'
-    '- **transcode**: codecs legados (XviD/MPEG-4) -> H.264 ultrafast.'
-    ''
-    '## Aviso'
-    ''
-    'Os arquivos sao servidos por torrents de terceiros. Seeders oscilam; se um magnet'
-    'estiver lento, troque a fonte no player ou escolha outra qualidade.'
-)
-
-$caminhoReadme = Join-Path $Raiz 'README-PTBR.md'
-if ((Test-Path -LiteralPath $caminhoReadme) -and -not $SemBackup) {
-    $bkpReadme = Join-Path $script:PastaBackup 'README-PTBR.md'
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $bkpReadme) | Out-Null
-    Copy-Item -LiteralPath $caminhoReadme -Destination $bkpReadme -Force
+# ----------------------------------------------------------------------
+$envPath = Join-Path $Root '.env'
+$existingKey = ''
+if (Test-Path -LiteralPath $envPath) {
+    $existing = [System.IO.File]::ReadAllText($envPath)
+    $m = [regex]::Match($existing, '(?m)^\s*TMDB_API_KEY\s*=\s*(.*)$')
+    if ($m.Success) { $existingKey = $m.Groups[1].Value.Trim() }
 }
-$utf8Readme = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($caminhoReadme, (($linhasReadme -join "`n") + "`n"), $utf8Readme)
-Escrever-Ok 'gravado  README-PTBR.md'
+$keyToWrite = 'SUA_CHAVE_AQUI'
+if ($existingKey -ne '' -and $existingKey -ne 'SUA_CHAVE_AQUI') { $keyToWrite = $existingKey }
 
-# ---------------------------------------------------------------------------
-# Gravacao dos demais arquivos do nucleo
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Gravacao dos demais arquivos do nucleo
-# ---------------------------------------------------------------------------
-Escrever-Cabecalho 'GRAVANDO ARQUIVOS DO NUCLEO'
+$envContent = @"
+# ============================================================
+#  CineP2P 4.0
+#  TMDB_API_KEY obrigatoria. https://www.themoviedb.org/settings/api
+# ============================================================
+TMDB_API_KEY=$keyToWrite
+TMDB_LANGUAGE=pt-BR
+TMDB_REGION=BR
 
-foreach ($relativo in $Arquivos.Keys) {
-    $destino = Join-Path $Raiz $relativo
-    $pasta   = Split-Path -Parent $destino
+# Servidor (0.0.0.0 permite abrir no celular da mesma rede)
+PORT=3000
+HOST=0.0.0.0
 
-    if ($pasta -and -not (Test-Path -LiteralPath $pasta)) {
-        New-Item -ItemType Directory -Force -Path $pasta | Out-Null
-    }
+# Scrapers (vazio = todos os 13 em paralelo)
+SCRAPER_TIMEOUT=9
+SCRAPERS_ENABLED=
 
-    if ((Test-Path -LiteralPath $destino) -and -not $SemBackup) {
-        $destinoBackup = Join-Path $script:PastaBackup $relativo
-        $dirBackup     = Split-Path -Parent $destinoBackup
-        if (-not (Test-Path -LiteralPath $dirBackup)) {
-            New-Item -ItemType Directory -Force -Path $dirBackup | Out-Null
-        }
-        Copy-Item -LiteralPath $destino -Destination $destinoBackup -Force
-    }
+# Player / buffer
+METADATA_TIMEOUT=40
+MAX_CONNS=200
+MAX_JOBS=3
+IDLE_TIMEOUT=720000
+MIN_BUFFER_PERCENT=3
+MIN_BUFFER_MB=8
 
-    $conteudo = $Arquivos[$relativo]
-    if (-not $ManterCRLF) {
-        $conteudo = $conteudo -replace "`r`n", "`n"
-    }
+# Legendas
+MAX_SUBS=8
 
-    $utf8SemBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($destino, $conteudo, $utf8SemBom)
+# Limpeza de disco: session = apaga ao fechar | keep = mantem cache
+CACHE_MODE=session
+TORRENT_CACHE_DIR=cache
+"@
+Write-ProjectFile '.env' $envContent
+Write-ProjectFile '.env.example' ($envContent -replace [regex]::Escape($keyToWrite), 'SUA_CHAVE_AQUI')
+if ($keyToWrite -ne 'SUA_CHAVE_AQUI') { Write-Host '  TMDB_API_KEY preservada' -ForegroundColor DarkGray }
 
-    $script:TotalGravado++
-    Escrever-Ok ("gravado  {0,-34} {1,7} bytes" -f $relativo, $conteudo.Length)
+# ----------------------------------------------------------------------
+$packageJson = @'
+{
+  "name": "cinep2p",
+  "version": "4.0.0",
+  "private": true,
+  "description": "Clone Netflix de streaming P2P com catalogo TMDb e selecao automatica de audio PT-BR.",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "dev": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "webtorrent": "^1.9.7"
+  }
 }
+'@
+Write-ProjectFile 'package.json' $packageJson
 
-# ---------------------------------------------------------------------------
-# Pastas de runtime
-# ---------------------------------------------------------------------------
-Escrever-Cabecalho 'PREPARANDO PASTAS DE RUNTIME'
+# ----------------------------------------------------------------------
+$readme = @'
+# CineP2P 4.0
 
-foreach ($pasta in @('.cache', '.cache\torrents', 'public', 'src\sources', 'src\routes', 'src\torrent', 'src\util', 'scripts')) {
-    $caminho = Join-Path $Raiz $pasta
-    if (-not (Test-Path -LiteralPath $caminho)) {
-        New-Item -ItemType Directory -Force -Path $caminho | Out-Null
-        Escrever-Info ("criada: " + $pasta)
-    }
-}
+Catalogo TMDb PT-BR + streaming P2P com selecao automatica de audio brasileiro.
 
-# ---------------------------------------------------------------------------
-# npm install
-# ---------------------------------------------------------------------------
-if (-not $SemNpm) {
-    Escrever-Cabecalho 'INSTALANDO DEPENDENCIAS (npm install)'
+## Rodar
+1. `TMDB_API_KEY=sua_chave` no `.env`
+2. `npm install`
+3. `npm start` -> http://localhost:3000 (celular: http://SEU-IP:3000)
 
-    $npm = Get-Command npm -ErrorAction SilentlyContinue
-    if (-not $npm) {
-        Escrever-Aviso 'npm nao encontrado no PATH. Rode "npm install" manualmente.'
-    } else {
-        Push-Location $Raiz
+## Classificacao de audio (src/ptbr.js)
+Niveis: `confirmado` > `provável` > `incerto` > `estrangeiro`.
+- `confirmado`: marcador PT-BR explicito OU fonte nacional (Commandotorrents,
+  Lapumia, RedeTorrent, BluDV, TorrentDosFilmes) + DUBLADO/DUAL AUDIO.
+- `provável`: DUAL AUDIO limpo, ou DUBLADO sem termo estrangeiro.
+- Rebaixa quando detecta dublagem alheia: russo, castellano, latino, VF,
+  truefrench, english, deutsch, italiano, hindi, japones...
+- So `confirmado`/`provável` podem virar "melhor fonte" automatica.
+
+## Player
+Abre imediatamente, sem modal. O buffer (peers, velocidade, %) roda dentro da
+area do video. Controles: play/pause, -30s, +30s, seek, volume, fullscreen e
+seletor de legendas (arquivos .srt/.ass/.vtt do proprio torrent, convertidos
+para WebVTT em `/api/play/subtitle`).
+
+## Disco
+Cada job vive em `cache/<jobId>`. Ao fechar o player, sair da pagina ou trocar
+de fonte: `destroy({destroyStore:true})` + rm recursivo com retry.
+`CACHE_MODE=keep` mantem os arquivos.
+
+## Endpoints
+`/api/home`, `/api/filmes/*`, `/api/buscar`, `/api/media/:tipo/:id`,
+`/api/torrent`, `/api/play`, `/api/play/status`, `/api/play/stream`,
+`/api/play/subs`, `/api/play/subtitle`, `/api/play/stop`.
+
+## Capacitor
+`public/` e estatico e sem rotas rigidas. Edite `public/config.js` com
+`window.CINEP2P_API_BASE = 'http://SEU_IP:3000'` e empacote normalmente.
+'@
+Write-ProjectFile 'README.md' $readme
+
+# ======================================================================
+if (-not $SkipInstall) {
+    Write-Step 'Instalando dependencias'
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        Push-Location -LiteralPath $Root
         try {
-            & npm install --no-audit --no-fund
-            if ($LASTEXITCODE -ne 0) {
-                Escrever-Aviso ("npm install retornou codigo " + $LASTEXITCODE)
-            } else {
-                Escrever-Ok 'dependencias instaladas'
-            }
-        } finally {
-            Pop-Location
-        }
-    }
-} else {
-    Escrever-Aviso 'npm install ignorado (-SemNpm)'
+            & npm install --no-fund --no-audit --loglevel=error
+            if ($LASTEXITCODE -ne 0) { Write-Host '  npm install com erro. Rode manualmente.' -ForegroundColor Yellow }
+        } finally { Pop-Location }
+    } else { Write-Host '  npm nao encontrado. Instale Node.js 18+.' -ForegroundColor Yellow }
+} else { Write-Step 'npm install ignorado' }
+
+Write-Step 'Validando'
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    Push-Location -LiteralPath $Root
+    try {
+        & node -e "require('./src/ptbr');require('./src/ranking');require('./src/subtitulos');require('./src/scrapers');require('./src/magnets');require('./src/streamer');console.log('  modulos ok')"
+    } catch { }
+    finally { Pop-Location }
 }
 
-# ---------------------------------------------------------------------------
-# Verificacao de sintaxe
-# ---------------------------------------------------------------------------
-Escrever-Cabecalho 'VERIFICANDO SINTAXE DOS ARQUIVOS GERADOS'
-
-$node = Get-Command node -ErrorAction SilentlyContinue
-if (-not $node) {
-    Escrever-Aviso 'node nao encontrado. Pule a verificacao.'
-} else {
-    $jsParaChecar = @(
-        'server.js', 'worker.js',
-        'src\config.js', 'src\catalogo.js',
-        'src\util\logger.js', 'src\util\magnet.js', 'src\util\http.js',
-        'src\util\text.js', 'src\util\pool.js', 'src\util\ffmpeg.js',
-        'src\sources\generic.js', 'src\sources\sites.js', 'src\sources\index.js',
-        'src\torrent\engine.js', 'src\routes\api.js',
-        'public\app.js', 'scripts\atualizar-fontes.js'
-    )
-
-    $falhas = 0
-    foreach ($relativo in $jsParaChecar) {
-        $caminho = Join-Path $Raiz $relativo
-        if (-not (Test-Path -LiteralPath $caminho)) { continue }
-        & node --check $caminho 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            Escrever-Ok ("sintaxe ok: " + $relativo)
-        } else {
-            $falhas++
-            Escrever-Erro ("erro de sintaxe em: " + $relativo)
-        }
-    }
-
-    if ($falhas -eq 0) { Escrever-Ok 'todos os arquivos JS passaram no node --check' }
-}
-
-# ---------------------------------------------------------------------------
-# Resumo
-# ---------------------------------------------------------------------------
-Escrever-Cabecalho 'CONCLUIDO'
-
 Write-Host ''
-Write-Host ("  arquivos gravados : " + $script:TotalGravado) -ForegroundColor White
-if (-not $SemBackup) {
-    Write-Host ("  backup em         : " + $script:PastaBackup) -ForegroundColor Gray
-}
+Write-Host '==================================================================' -ForegroundColor Green
+Write-Host ' CineP2P 4.0 aplicado' -ForegroundColor Green
+Write-Host '==================================================================' -ForegroundColor Green
 Write-Host ''
-Write-Host '  Proximos passos:' -ForegroundColor Cyan
-Write-Host '    1) npm run fontes        -> valida quais indexadores respondem' -ForegroundColor Gray
-Write-Host '    2) npm run aquecer       -> popula o catalogo (filmes/series/animes/doramas/novelas)' -ForegroundColor Gray
-Write-Host '    3) npm start             -> sobe o servidor em http://localhost:3000' -ForegroundColor Gray
-Write-Host '    4) npm run worker        -> daemon opcional de atualizacao continua' -ForegroundColor Gray
+Write-Host ' Filtro PT-BR: src/ptbr.js + src/fontes.js (5 fontes nacionais)' -ForegroundColor White
+Write-Host ' Player: abre imediato, buffer interno, -30s/+30s, legendas' -ForegroundColor White
+Write-Host ' Limpeza: cache/<jobId> destruido ao sair' -ForegroundColor White
 Write-Host ''
-Write-Host '  Variaveis uteis (.env ou shell):' -ForegroundColor Cyan
-Write-Host '    CINE_MAX_TORRENTS=3   CINE_IDLE_MIN=12   CINE_MAX_CACHE_GB=25' -ForegroundColor Gray
-Write-Host '    CINE_APENAS_PTBR=true CINE_FONTES_OFF=bludv,yts' -ForegroundColor Gray
+Write-Host ' PROXIMOS PASSOS:' -ForegroundColor Yellow
+Write-Host '   1) .env -> TMDB_API_KEY=sua_chave'
+Write-Host '   2) npm start'
+Write-Host '   3) http://localhost:3000'
 Write-Host ''
-Write-Host ('-' * 78) -ForegroundColor DarkGray
-Write-Host '  COMMIT SUGERIDO' -ForegroundColor Yellow
-Write-Host ('-' * 78) -ForegroundColor DarkGray
-Write-Host ''
-Write-Host '  git add -A'
-Write-Host '  git commit -m "feat(core): reconstroi motor de scraping e catalogo focado em PT-BR"'
+if ($madeBackup) { Write-Host (' Backup: ' + (Split-Path -Leaf $BackupDir)) -ForegroundColor DarkGray }
 Write-Host ''

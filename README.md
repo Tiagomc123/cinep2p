@@ -1,50 +1,33 @@
-# cinep2p
+# CineP2P 3.0
 
-Catalogo de filmes/series + busca de magnet + streaming de torrent no navegador.
-Funciona no PC, no celular Android, na TV Box e no projetor.
-
-## Requisitos
-
-- Node.js 22 ou superior
-- ffmpeg: ja vem junto (pacotes ffmpeg-static/ffprobe-static). Se quiser usar
-  o do sistema, defina FFMPEG_PATH.
+Catalogo TMDb (PT-BR) + streaming P2P por torrent, com UI mobile-first estilo Netflix.
 
 ## Rodar
+1. `TMDB_API_KEY=sua_chave` no `.env`
+2. `npm install`
+3. `npm start` -> http://localhost:3000
+4. No celular (mesma rede): `http://IP-DO-PC:3000`
 
-    npm install
-    npm start          # http://localhost:3000
+## Endpoints
+- `GET /api/home?tipo=movie|tv`
+- `GET /api/filmes/populares | /api/filmes/lancamentos | /api/filmes/top | /api/filmes/genero/:id`
+- `GET /api/buscar?q=`
+- `GET /api/media/:tipo/:id`
+- `GET /api/torrent?titulo=&tituloOriginal=&ano=&imdbId=&tipo=&temporada=&episodio=`
+- `GET /api/play`, `/api/play/status`, `/api/play/stream`, `/api/play/stop`
 
-Abra o endereco de rede mostrado no terminal.
+## Scrapers (paralelos)
+Torrentio, YTS, ThePirateBay, EZTV, SolidTorrents, TorrentGalaxy, Torrent9,
+Commandotorrents, Lapumia, 1337x. Ranking prioriza DUBLADO > PT-BR > DUAL AUDIO
+> seeders > qualidade; dedupe por infoHash.
 
-O servidor inicia em HTTP; `npm run https` nao esta configurado nesta versao.
-Para instalar como aplicativo em aparelhos da rede local, sera necessario
-configurar HTTPS com um certificado confiavel.
+## Disco
+Cada reproducao usa `cache/<jobId>`. Ao fechar o player (ou sair da pagina) o
+torrent e destruido e a pasta apagada. `CACHE_MODE=keep` mantem os arquivos.
 
-Controle remoto: setas navegam, OK seleciona, Voltar fecha o player,
-Enter no video abre os botoes. O botao "TV" aumenta a interface.
-
-## Recursos
-
-- Catalogo e capas: API publica do YTS (com espelhos de reserva)
-- Fontes extra: apibay (The Pirate Bay), com filtro "Dublado"
-- Troca de idioma do audio pelas faixas reais do arquivo (remux)
-- Legendas externas e embutidas no mkv, com ligar/desligar
-- Continuar de onde parou (sincronizado entre os aparelhos)
-- Modos: Direto -> Compativel (remux) -> Leve (transcode 720p/480p), com
-  fallback automatico quando o navegador recusa o formato
-- Botao Diagnostico: mostra peers, arquivo, codec, leitura e decisao
-
-## Cache, limpeza e historico
-
-- Os dados temporarios dos torrents ficam em ./downloads/<hash>.
-- Ao remover um torrent ou limpar um torrent ocioso, o WebTorrent e instruido a apagar tambem os dados temporarios do disco.
-- Torrents ociosos sao liberados automaticamente apos IDLE_MINUTES (padrao 1 min; minimo 1 min). O tempo e contado desde a ultima atividade do torrent.
-- O historico de reproducao fica separado dos arquivos de video em ./data/progress.json. A interface mostra "Continuar assistindo" e "Ja assistidos", incluindo a posicao aproximada.
-- O navegador mantem uma copia local do progresso para recuperar a posicao neste aparelho se o servidor reiniciar ou perder seu disco temporario. Para sincronizar entre aparelhos, o servidor precisa manter ./data em armazenamento persistente.
-- A limpeza automatica se aplica aos dados de torrents que forem removidos depois desta atualizacao; pastas antigas ja existentes podem precisar de limpeza manual uma vez.
-
-## Variaveis
-
-PORT, DOWNLOAD_DIR, DATA_DIR, METADATA_TIMEOUT (120), IDLE_MINUTES (1),
-TRANSCODE_PRESET (ultrafast em PC fraco), TRANSCODE_CRF, MAX_CONNS,
-PROBE_BYTES, FFMPEG_PATH, FFPROBE_PATH, FFMPEG_DISABLE=1, QUIET=1, HTTPS=1.
+## Capacitor / Cordova
+A pasta `public/` e 100% estatica e sem rotas rigidas. Para empacotar:
+1. `npx cap init` + `npx cap add android`
+2. copie `public/` para o `www/` do projeto Capacitor
+3. edite `public/config.js` com `window.CINEP2P_API_BASE = 'http://SEU_IP:3000'`
+4. `npx cap sync android && npx cap open android`

@@ -2,35 +2,17 @@
   "name": "cinep2p",
   "version": "3.0.0",
   "private": true,
-  "description": "Streaming P2P de Filmes, Series, Animes, Doramas e Novelas em PT-BR via WebTorrent + FFmpeg",
-  "main": "server.js",
+  "description": "Clone Netflix de streaming P2P com catalogo TMDb e scrapers PT-BR.",
   "type": "commonjs",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
-    "test": "node --test",
-    "worker": "node worker.js",
-    "aquecer": "node worker.js --once",
-    "fontes": "node scripts/atualizar-fontes.js",
-    "cache:limpar": "node scripts/atualizar-fontes.js --limpar-cache"
+    "dev": "node server.js"
   },
-  "engines": {
-    "node": ">=22.0.0"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "axios": "^1.7.7",
-    "cheerio": "^1.0.0",
-    "compression": "^1.7.5",
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "ffmpeg-static": "^5.2.0",
-    "ffprobe-static": "^3.1.0",
-    "iconv-lite": "^0.6.3",
-    "morgan": "^1.10.0",
-    "webtorrent": "3.0.21"
-  },
-  "allowScripts": {
-    "ffmpeg-static@5.3.0": true,
-    "ffprobe-static@3.1.0": true
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "webtorrent": "^1.9.7"
   }
 }
