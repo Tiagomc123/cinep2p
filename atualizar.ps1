@@ -1,283 +1,61 @@
 ﻿<#
-    CineP2P 8.0 - Player Universal: stream bruto + audio decodificado no navegador
-    -------------------------------------------------------------------------------
-    Executa SOBRE o CineP2P 7.0 (mantendo Series/SXXEXX e o filtro anti-mistura).
-
-    Mudancas:
-      1. src/streamer.js: TRANSCODE=nunca por padrao. Sem ffprobe, sem ffmpeg.
-         Stream BitTorrent bruto com Range: bytes completo. canPlay com 1%.
-      2. public/app.js: player universal. Le o cabecalho MKV no proprio navegador,
-         identifica as faixas de audio e, quando o codec e AC3/EAC3/DTS ou a faixa
-         PT nao e a primeira, ativa um pipeline de RESGATE: demux MKV em JS +
-         decodificacao via Web Audio API, com a faixa em portugues selecionada
-         automaticamente e sincronizada com o video.
-      3. src/ranking.js: descarte sumario de instaladores/ativadores/ISOs.
-      4. public/index.html: sem avisos, sem barras, sem botoes extras.
-
-    Uso: powershell -ExecutionPolicy Bypass -File .\atualizar.ps1
+    TMC 15.0 - atualizar.ps1
+    Corrige o player que ficava preso em "Preparando video...".
+    1) Playlist EVENT enquanto o ffmpeg escreve; VOD + ENDLIST quando termina.
+    2) Playlist vazia nao leva mais ENDLIST (hls.js volta a recarregar).
+    3) URL interna do ffmpeg forca &modo=direto (fim do ffmpeg dentro de ffmpeg).
+    4) ffmpeg do HLS pre-iniciado no canPlay (primeiro segmento pronto antes da intro).
+    5) hls.js sem aceleracao de live + watchdog de travamento + fallback automatico.
+    Arquivos: src/streamer.js, public/app.js
 #>
 [CmdletBinding()]
-param(
-    [switch]$SkipInstall,
-    [string]$Root
-)
-
-if ($PSVersionTable.PSVersion.Major -le 5 -and -not $env:CINEP2P_UTF8) {
-    try {
-        $selfPath = $MyInvocation.MyCommand.Path
-        if ($selfPath -and (Test-Path -LiteralPath $selfPath)) {
-            $raw = [System.IO.File]::ReadAllBytes($selfPath)
-            $hasBom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
-            $hasNonAscii = $false
-            foreach ($b in $raw) { if ($b -gt 127) { $hasNonAscii = $true; break } }
-            if (-not $hasBom -and $hasNonAscii) {
-                $text = [System.Text.Encoding]::UTF8.GetString($raw)
-                $tmp = Join-Path $env:TEMP ('cinep2p-' + [guid]::NewGuid().ToString('N') + '.ps1')
-                [System.IO.File]::WriteAllText($tmp, $text, [System.Text.UTF8Encoding]::new($true))
-                $env:CINEP2P_UTF8 = '1'
-                Write-Host 'Reexecutando com codificacao UTF-8...' -ForegroundColor DarkGray
-                & powershell -NoProfile -ExecutionPolicy Bypass -File $tmp @args
-                exit $LASTEXITCODE
-            }
-        }
-    } catch { }
-}
+param()
 
 $ErrorActionPreference = 'Stop'
+$Raiz = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+Set-Location $Raiz
 
-if (-not $Root -or $Root.Trim() -eq '') { $Root = Split-Path -Parent $MyInvocation.MyCommand.Path }
-if (-not $Root -or $Root.Trim() -eq '') { $Root = (Get-Location).Path }
-if (-not (Test-Path -LiteralPath $Root)) { throw "Pasta nao encontrada: $Root" }
-Set-Location -LiteralPath $Root
-
-$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-
-function Write-ProjectFile {
-    param(
-        [Parameter(Mandatory = $true)][string]$RelativePath,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content
-    )
-    $full = Join-Path $Root $RelativePath
-    $dir = Split-Path -Parent $full
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    [System.IO.File]::WriteAllText($full, $Content, $Utf8NoBom)
-    Write-Host ("  [ok] " + $RelativePath) -ForegroundColor DarkGray
+function Salvar {
+    param([string]$Caminho, [string]$Conteudo)
+    $alvo = Join-Path $Raiz $Caminho
+    $pasta = Split-Path -Parent $alvo
+    if ($pasta -and -not (Test-Path $pasta)) { New-Item -ItemType Directory -Force -Path $pasta | Out-Null }
+    Set-Content -LiteralPath $alvo -Value $Conteudo -Encoding UTF8
+    Write-Host ("  [ok] " + $Caminho) -ForegroundColor Green
 }
+function Etapa { param([string]$t) Write-Host ""; Write-Host ("=== " + $t) -ForegroundColor Cyan }
 
-function Write-Step { param([string]$Text) Write-Host ''; Write-Host ("== " + $Text) -ForegroundColor Cyan }
+Write-Host ""
+Write-Host "TMC 15.0 - correcao do player HLS (stuck em Preparando video)" -ForegroundColor Yellow
 
-Write-Host ''
-Write-Host '  CineP2P 8.0 - Player universal + audio no navegador' -ForegroundColor White
-Write-Host '  ---------------------------------------------------' -ForegroundColor DarkGray
-
-# ----------------------------------------------------------------------
-Write-Step 'Backup'
-$Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$BackupDir = Join-Path $Root ('.backup-' + $Stamp)
-$madeBackup = $false
-foreach ($t in @('server.js', 'src', 'public', '.env')) {
-    $p = Join-Path $Root $t
-    if (Test-Path -LiteralPath $p) {
-        if (-not $madeBackup) { New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null; $madeBackup = $true }
-        Copy-Item -LiteralPath $p -Destination (Join-Path $BackupDir $t) -Recurse -Force
-    }
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+foreach ($f in @('src\streamer.js','public\app.js')) {
+    $p = Join-Path $Raiz $f
+    if (Test-Path $p) { Copy-Item $p ($p + '.bak-' + $stamp) -Force }
 }
-if ($madeBackup) { Write-Host ("  backup: " + (Split-Path -Leaf $BackupDir)) -ForegroundColor DarkGray }
+Write-Host ("Backups .bak-" + $stamp + " criados.") -ForegroundColor DarkGray
 
-New-Item -ItemType Directory -Force -Path (Join-Path $Root 'src') | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $Root 'public') | Out-Null
-
-# ======================================================================
-Write-Step 'Ranking: descarte de instaladores'
-
-# ----------------------------------------------------------------------
-$rankingJs = @'
+# ---------------------------------------------------------------- 1. streamer.js
+Etapa '1/2  src/streamer.js (playlist viva -> VOD, modo=direto, pre-start)'
+Salvar 'src/streamer.js' @'
 'use strict';
 
 /**
- * Ranking: identidade -> descarte de instalador -> nivel de audio -> seeders.
+ * TMC 15.0 - Streamer HLS.
  *
- * Regra nova: qualquer resultado que pareca instalador de PC, ativador ou
- * imagem de disco e sumariamente rejeitado antes de tudo.
- */
-
-const ptbr = require('./ptbr');
-const validar = require('./validar');
-
-const RANK_NIVEL = {
-  duals51: 6, confirmado: 5, provavel: 4, incerto: 3, fraco: 2, estrangeiro: 1, desconhecido: 0
-};
-
-/* Sinais fortes: sozinhos ja condenam o arquivo */
-const RE_INSTALADOR_FORTE = /(monkrus|preactivated|pre-activated|\bkeygen\b|\bcrack(ed|eado)?\b|\bactivator\b|\bativador\b|\bportable\b|\bkms(?:pico|auto)?\b|\.exe\b|\.iso\b|\.img\b|\.zip\b|\.rar\b|\.7z\b|\.msi\b|\bx64\b|\bx86\b|\bwin(?:dows)?\b)/i;
-
-/* Sinais fracos: so condenam se nao houver marcador de video */
-const RE_INSTALADOR_FRACO = /(\brepack\b|\bpatch\b|\bsetup\b|\binstaller\b|\binstalador\b|\bserial\b|\bmedicine\b|\bupdate\b)/i;
-
-const RE_MARCADOR_VIDEO = /(2160p|1440p|1080p|720p|480p|4k|bluray|bdrip|brrip|webrip|web[\s._-]?dl|remux|hdtv|dvdrip|x264|x265|h264|h265|hevc|av1)/i;
-
-function ehInstalador(nome) {
-  const n = String(nome || '');
-  if (RE_INSTALADOR_FORTE.test(n)) return true;
-  if (RE_INSTALADOR_FRACO.test(n) && !RE_MARCADOR_VIDEO.test(n)) return true;
-  if (RE_INSTALADOR_FRACO.test(n) && !/\b(19|20)\d{2}\b/.test(n) && !RE_MARCADOR_VIDEO.test(n)) return true;
-  return false;
-}
-
-function pad(n) { return String(n || 1).padStart(2, '0'); }
-
-function bonusQualidade(q) {
-  switch (String(q || '').toLowerCase()) {
-    case '1080p': return 520;
-    case '720p': return 300;
-    case '2160p': return 430;
-    case '480p': return 80;
-    default: return 150;
-  }
-}
-
-function contemPalavras(titulo, alvo) {
-  if (!alvo) return false;
-  const t = String(titulo).toLowerCase();
-  return String(alvo).toLowerCase().split(/[^a-z0-9]+/)
-    .filter(function (w) { return w.length > 3; })
-    .some(function (w) { return t.indexOf(w) !== -1; });
-}
-
-function pontuar(item, ctx) {
-  let s = (RANK_NIVEL[item.ptbr.nivel] || 0) * 100000;
-  s += Math.log10(Math.max(1, item.seeders) + 1) * 1200;
-  s += bonusQualidade(item.quality);
-
-  if (item.ptbr.temDual51) s += 900;
-  if (contemPalavras(item.title, ctx.titulo)) s += 220;
-  if (contemPalavras(item.title, ctx.tituloOriginal)) s += 180;
-  if (item.fileIdx !== null && item.fileIdx !== undefined) s += 70;
-
-  if (ctx.tipo === 'tv') {
-    const tag = 'S' + pad(ctx.temporada) + 'E' + pad(ctx.episodio);
-    const reExato = new RegExp(tag, 'i');
-    const reOutroEp = /\bS\d{1,2}E\d{1,2}\b/i;
-    const rePack = /(complete|completa|temporada\s*\d|season\s*\d|\bpack\b)/i;
-    if (reExato.test(item.title)) s += 1200;
-    else if (reOutroEp.test(item.title)) s -= 200;
-    if (rePack.test(item.title) && !reExato.test(item.title)) s -= 600;
-  } else if (ctx.ano && String(item.title).indexOf(String(ctx.ano)) !== -1) {
-    s += 260;
-  }
-
-  if (item.quality === '2160p' && item.seeders < 15) s -= 900;
-  if (item.quality === '2160p' && /(\bdv\b|dolby[\s._-]?vision|hdr10|\bhdr\b)/i.test(item.title)) s -= 250;
-  if (/(\bcam\b|\bts\b|hdcam|hdts|telesync)/i.test(item.title)) s -= 450;
-  if (item.seeders === 0) s -= 400;
-  if (item.sizeBytes && item.sizeBytes < 200 * 1024 * 1024) s -= 60;
-
-  return s;
-}
-
-function normalizar(item) {
-  const nome = String(item.title || '').replace(/\s+/g, ' ').trim();
-  return {
-    title: nome || 'Torrent',
-    magnet: item.magnet,
-    hash: String(item.hash || '').toLowerCase(),
-    quality: item.quality || '',
-    size: item.size || '',
-    sizeBytes: item.sizeBytes || 0,
-    seeders: Number(item.seeders || 0),
-    fileIdx: (item.fileIdx === null || item.fileIdx === undefined) ? null : item.fileIdx,
-    source: item.source || 'Desconhecida',
-    imdbConfirmado: !!item.imdbConfirmado,
-    score: 0,
-    ptbr: null,
-    elegivel: false
-  };
-}
-
-function deduplicar(lista) {
-  const mapa = new Map();
-  lista.forEach(function (item) {
-    const chave = item.hash || item.magnet;
-    if (!chave) return;
-    const atual = mapa.get(chave);
-    if (!atual) { mapa.set(chave, item); return; }
-    if (item.score > atual.score) { mapa.set(chave, item); return; }
-    if (item.seeders > atual.seeders) atual.seeders = item.seeders;
-    if (!atual.size && item.size) { atual.size = item.size; atual.sizeBytes = item.sizeBytes; }
-    if (atual.fileIdx === null && item.fileIdx !== null) atual.fileIdx = item.fileIdx;
-    if (!atual.quality && item.quality) atual.quality = item.quality;
-  });
-  return Array.from(mapa.values());
-}
-
-function preparar(lista, ctx) {
-  const estrito = process.env.FILTRO_ESTRITO !== '0';
-  const semInstalador = process.env.FILTRO_INSTALADOR !== '0';
-
-  const validos = [];
-  const descartados = [];
-
-  lista
-    .filter(function (i) { return i && i.magnet && /^magnet:/i.test(i.magnet); })
-    .forEach(function (bruto) {
-      const item = normalizar(bruto);
-
-      if (semInstalador && ehInstalador(item.title)) {
-        item.valido = false;
-        item.motivoInvalido = 'descartado: instalador/ativador/iso';
-        descartados.push(item);
-        return;
-      }
-
-      if (!estrito || item.imdbConfirmado) {
-        item.valido = true;
-        item.motivoInvalido = item.imdbConfirmado ? 'imdb id confirmado' : 'filtro desligado';
-      } else {
-        const v = validar.validar(item.title, ctx);
-        item.valido = v.ok;
-        item.motivoInvalido = v.ok ? v.motivo : ('descartado: ' + v.motivo);
-      }
-
-      if (item.valido) validos.push(item);
-      else descartados.push(item);
-    });
-
-  validos.forEach(function (i) {
-    i.ptbr = ptbr.avaliar(i.title, i.source);
-    i.elegivel = i.ptbr.elegivel;
-    i.score = pontuar(i, ctx);
-  });
-
-  const unicos = deduplicar(validos);
-  unicos.sort(function (a, b) { return b.score - a.score; });
-  return { validos: unicos, descartados: descartados };
-}
-
-module.exports = { preparar: preparar, RANK_NIVEL: RANK_NIVEL, ehInstalador: ehInstalador };
-'@
-Write-ProjectFile 'src/ranking.js' $rankingJs
-
-# ======================================================================
-Write-Step 'Streamer: stream bruto, zero CPU'
-
-# ----------------------------------------------------------------------
-$streamerJs = @'
-'use strict';
-
-/**
- * Streamer 8.0 - modo BRUTO.
- *
- *  - TRANSCODE=nunca (padrao): nenhum ffprobe, nenhum ffmpeg. O arquivo do
- *    torrent e servido direto com Range: bytes, CPU zero, inicio instantaneo.
- *  - canPlay em 1% de buffer (ou 2 MB), o que faz o video comecar na hora.
- *  - O frontend cuida do audio: le o cabecalho MKV, escolhe a faixa PT e,
- *    se o codec for AC3/EAC3/DTS, decodifica em JS via Web Audio.
- *  - TRANSCODE=auto|sempre continua disponivel (usa ffmpeg, agora opcional).
+ *  - Enquanto o ffmpeg escreve, a playlist e servida como EVENT (o player
+ *    recarrega sozinho). Quando o ffmpeg termina, vira VOD com ENDLIST:
+ *    duracao real, seek livre e zero logica de live.
+ *  - Playlist vazia nunca leva ENDLIST (era o motivo do "Preparando video...").
+ *  - O ffmpeg le o torrent bruto por &modo=direto (Range real, sem ffmpeg aninhado).
+ *  - -c:v copy (CPU zero) + -c:a aac -ac 2 (AC3/DTS/5.1 -> estereo nativo).
+ *  - Mapeamento dinamico de audio: PT-BR por padrao, troca manual por indice.
  */
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const WebTorrent = require('webtorrent');
 
 const trackers = require('./trackers');
@@ -287,12 +65,16 @@ const TRACKERS = trackers.TRACKERS;
 const appendTrackers = trackers.appendTrackers;
 
 const MODO_TRANSCODE = String(process.env.TRANSCODE || 'nunca').toLowerCase();
+const HLS_ATIVO = String(process.env.HLS || '1') !== '0';
+const HLS_SEG = Math.max(2, Number(process.env.HLS_SEGMENT_SECONDS || 4));
+const PORTA = Number(process.env.PORT || 3000);
 
 /* ------------------- ffmpeg (so carrega se precisar) ---------------- */
 
 let ffmpegLib = null;
 let FFMPEG_PATH = '';
 let FFPROBE_PATH = '';
+let HLS_OK = false;
 
 function carregarFfmpeg() {
   if (ffmpegLib) return;
@@ -305,7 +87,8 @@ function carregarFfmpeg() {
   if (ffmpegLib && FFPROBE_PATH) ffmpegLib.setFfprobePath(FFPROBE_PATH);
 }
 
-if (MODO_TRANSCODE !== 'nunca') carregarFfmpeg();
+if (MODO_TRANSCODE !== 'nunca' || HLS_ATIVO) carregarFfmpeg();
+HLS_OK = HLS_ATIVO && !!(ffmpegLib && FFMPEG_PATH && FFPROBE_PATH);
 
 const VIDEO_OK_MP4 = /^(h264|hevc|vp9|av1|vp8)$/i;
 const AUDIO_OK_NAV = /^(aac|mp3|opus|vorbis|flac)$/i;
@@ -320,8 +103,8 @@ const METADATA_TIMEOUT = Number(process.env.METADATA_TIMEOUT || 60) * 1000;
 const BUFFER_TIMEOUT = Number(process.env.BUFFER_TIMEOUT || 150) * 1000;
 const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT || 15 * 60 * 1000);
 const MAX_JOBS = Number(process.env.MAX_JOBS || 3);
-const MAX_CONNS = Number(process.env.MAX_CONNS || 300);
-const MIN_BUFFER_PERCENT = Number(process.env.MIN_BUFFER_PERCENT || 1);
+const MAX_CONNS = Number(process.env.MAX_CONNS || 500);
+const MIN_BUFFER_PERCENT = Number(process.env.MIN_BUFFER_PERCENT || 0.5);
 const MIN_BUFFER_MB = Number(process.env.MIN_BUFFER_MB || 2);
 const MAX_SUBS = Number(process.env.MAX_SUBS || 8);
 const USAR_UTP = process.env.ENABLE_UTP === '1';
@@ -396,11 +179,11 @@ function start(params) {
     fileIdx: (params.fileIdx === undefined || params.fileIdx === null || params.fileIdx === '') ? null : Number(params.fileIdx),
     peers: 0, progress: 0, buffer: 0, speed: 0, downloaded: 0, total: 0,
     fileName: '', streamUrl: null, canPlay: false,
-    subs: [], tentativas: 0,
+    subs: [], subsInternas: [], audios: [], tentativas: 0,
     transcode: MODO_TRANSCODE !== 'nunca',
-    analisado: MODO_TRANSCODE === 'nunca',
-    duracao: 0, videoCodec: '', audioCodec: '', audioIdx: 0, motivoTranscode: '',
-    torrent: null, file: null, nudge: null, vigia: null, timers: []
+    analisado: MODO_TRANSCODE === 'nunca' && !HLS_ATIVO,
+    duracao: 0, videoCodec: '', audioCodec: '', audioIdx: 0, audioPt: -1, audioPtLang: '', motivoTranscode: '',
+    torrent: null, file: null, nudge: null, vigia: null, timers: [], hls: null
   };
 
   jobs.set(id, job);
@@ -413,6 +196,12 @@ function limparTimers(job) {
   if (job.vigia) { clearInterval(job.vigia); job.vigia = null; }
   (job.timers || []).forEach(function (t) { clearTimeout(t); });
   job.timers = [];
+}
+
+function fecharHls(job) {
+  if (!job || !job.hls) return;
+  try { if (job.hls.cmd) job.hls.cmd.kill('SIGKILL'); } catch (e) { }
+  job.hls = null;
 }
 
 function attach(job) {
@@ -479,6 +268,7 @@ function attach(job) {
           job.canPlay = true;
           job.state = 'pronto';
           job.message = 'Pronto.';
+          iniciarHlsServidor(job);
         } else {
           job.state = 'bufferizando';
           job.message = 'Preparando stream... ' + job.buffer.toFixed(1) + '%';
@@ -509,6 +299,7 @@ function tentarDeNovo(job, motivo) {
 }
 
 function reiniciar(job) {
+  fecharHls(job);
   try { if (job.torrent) job.torrent.destroy({ destroyStore: false }); } catch (e) { }
   limparTimers(job);
   job.torrent = null;
@@ -548,7 +339,7 @@ function coletarSubs(torrent, video) {
     .slice(0, MAX_SUBS)
     .map(function (x, idx) {
       const lang = subtitulos.idiomaDe(x.f.name);
-      return { idx: idx, fileIndex: x.i, nome: String(x.f.name).split('/').pop(), code: lang.code, label: lang.label };
+      return { idx: idx, fileIndex: x.i, nome: String(x.f.name).split('/').pop(), code: lang.code, label: lang.label, interna: false };
     });
 }
 
@@ -579,8 +370,7 @@ function onReady(job) {
     if (manter.indexOf(f) === -1) { try { f.deselect(); } catch (e) { } }
   });
 
-  // Modo bruto: nada de ffprobe, nada de ffmpeg. Ja esta analisado.
-  if (MODO_TRANSCODE === 'nunca') {
+  if (!HLS_OK && MODO_TRANSCODE === 'nunca') {
     job.analisado = true;
     job.transcode = false;
     job.motivoTranscode = 'bruto';
@@ -590,16 +380,16 @@ function onReady(job) {
   job.message = 'Analisando codecs...';
   analisar(job).catch(function () { }).then(function () {
     job.analisado = true;
-    job.message = job.transcode ? 'Convertendo audio...' : 'Stream direto.';
+    job.message = HLS_OK ? 'Pronto para HLS.' : (job.transcode ? 'Convertendo audio...' : 'Stream direto.');
+    if (job.canPlay) iniciarHlsServidor(job);
   });
 }
 
-/* ------------------- ffprobe (apenas modo transcode) --------------- */
+/* ------------------- ffprobe (HLS e transcode) --------------------- */
 
 function ffprobeStream(file) {
   return new Promise(function (resolve) {
     if (!FFPROBE_PATH) { resolve(null); return; }
-    const { spawn } = require('child_process');
     let saida = '';
     let stream = null, proc = null;
     const fim = function (valor) {
@@ -644,19 +434,206 @@ async function analisar(job) {
   job.videoCodec = videos[0] ? String(videos[0].codec_name || '') : '';
   job.duracao = (info.format && Number(info.format.duration)) || 0;
 
-  let idxPt = -1;
-  audios.forEach(function (a, i) {
-    const lang = String((a.tags && (a.tags.language || a.tags.LANGUAGE)) || '').toLowerCase();
-    if (idxPt === -1 && /por|pt|bra/.test(lang)) idxPt = i;
+  job.audios = audios.map(function (a, i) {
+    const tags = a.tags || {};
+    const lang = String(tags.language || tags.LANGUAGE || '').toLowerCase();
+    return {
+      indice: i,
+      codec: String(a.codec_name || ''),
+      canais: a.channels || 2,
+      lang: lang || 'und',
+      titulo: tags.title || '',
+      ptbr: /por|pt|bra/.test(lang),
+      padrao: !!(a.disposition && a.disposition.default)
+    };
   });
+
+  let idxPt = -1;
+  job.audios.forEach(function (a, i) {
+    if (idxPt === -1 && a.ptbr) { idxPt = i; job.audioPtLang = a.lang; }
+  });
+  job.audioPt = idxPt;
   job.audioIdx = idxPt >= 0 ? idxPt : 0;
-  job.audioCodec = audios[job.audioIdx] ? String(audios[job.audioIdx].codec_name || '') : '';
+  job.audioCodec = job.audios[job.audioIdx] ? job.audios[job.audioIdx].codec : '';
+
+  job.subsInternas = info.streams
+    .filter(function (s) { return s.codec_type === 'subtitle'; })
+    .map(function (s, i) {
+      const tags = s.tags || {};
+      const lang = String(tags.language || '').toLowerCase();
+      return { i: i, codec: s.codec_name || '', lang: lang, label: tags.title || '' };
+    });
 
   const audioRuim = job.audioCodec && !AUDIO_OK_NAV.test(job.audioCodec);
   const videoRuim = job.videoCodec && !VIDEO_OK_MP4.test(job.videoCodec);
 
   if (MODO_TRANSCODE === 'sempre') job.transcode = true;
   else job.transcode = !!(audioRuim || videoRuim);
+}
+
+/* ------------------------------- HLS ------------------------------- */
+
+/* modo=direto: o ffmpeg do HLS le o arquivo BRUTO do torrent com Range,
+   sem cair no servirTranscode (evita ffmpeg dentro de ffmpeg). */
+function urlInterna(job) {
+  return 'http://127.0.0.1:' + PORTA + '/api/play/stream?jobId=' + job.id + '&modo=direto';
+}
+
+function indiceAudio(job, pedido) {
+  if (pedido === null || pedido === undefined || pedido === '') return job.audioIdx;
+  if (!/^\d+$/.test(String(pedido))) return job.audioIdx;
+  const n = Number(pedido);
+  if (!job.audios || !job.audios[n]) return job.audioIdx;
+  return n;
+}
+
+function contarSegmentos(hls) {
+  if (!hls) return 0;
+  try {
+    return fs.readdirSync(hls.dir).filter(function (f) { return /\.(ts|m4s|mp4)$/.test(f); }).length;
+  } catch (e) { return 0; }
+}
+
+function abrirHls(job, ss, sess, pedido) {
+  if (!HLS_OK || !job.file) return null;
+  fecharHls(job);
+
+  const base = path.join(job.dir, 'hls');
+  const dir = path.join(base, String(sess));
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { }
+
+  const audio = indiceAudio(job, pedido);
+  const fmp4 = /hevc|hvc1|av1/i.test(job.videoCodec);
+  const ext = fmp4 ? 'm4s' : 'ts';
+
+  const cmd = ffmpegLib(urlInterna(job));
+
+  const optsIn = ['-probesize', '5000000', '-analyzeduration', '5000000',
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'];
+  if (ss > 0) optsIn.unshift('-ss', String(ss));
+  cmd.inputOptions(optsIn);
+
+  const opts = ['-map', '0:v:0'];
+  if (audio === job.audioPt && /^por/.test(job.audioPtLang)) opts.push('-map', '0:a:m:language:por?');
+  else opts.push('-map', '0:a:' + audio + '?');
+  opts.push('-sn', '-dn', '-max_muxing_queue_size', '4096');
+
+  if (VIDEO_OK_MP4.test(job.videoCodec)) {
+    opts.push('-c:v', 'copy');
+  } else {
+    opts.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p');
+    opts.push('-force_key_frames', 'expr:gte(t,n_forced*' + HLS_SEG + ')');
+  }
+
+  opts.push('-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '192k');
+  opts.push('-af', 'aresample=async=1:first_pts=0');
+  opts.push('-f', 'hls');
+  opts.push('-hls_time', String(HLS_SEG));
+  opts.push('-hls_list_size', '0');
+  opts.push('-hls_playlist_type', 'vod');
+  opts.push('-hls_flags', 'independent_segments');
+  if (fmp4) opts.push('-hls_segment_type', 'fmp4');
+  opts.push('-hls_segment_filename', path.join(dir, 'seg%05d.' + ext));
+  cmd.outputOptions(opts);
+  cmd.output(path.join(dir, 'index.m3u8'));
+
+  const registro = { sess: String(sess), ss: ss, audio: audio, dir: dir, cmd: cmd, criado: agora(), erro: null };
+  job.hls = registro;
+
+  cmd.on('error', function (e) {
+    registro.erro = e.message;
+    console.error('[hls] ' + e.message);
+  });
+  cmd.on('stderr', function (l) {
+    if (/error|invalid|unable|too many/i.test(l)) console.error('[hls] ' + String(l).trim());
+  });
+  cmd.run();
+
+  try {
+    fs.readdirSync(base).forEach(function (n) {
+      if (n !== String(sess)) apagarPasta(path.join(base, n));
+    });
+  } catch (e) { }
+
+  return registro;
+}
+
+function iniciarHlsServidor(job) {
+  if (!HLS_OK || !job.file || job.hls) return;
+  try { abrirHls(job, 0, 'inicial', null); } catch (e) { console.error('[hls] ' + e.message); }
+}
+
+function playlistHls(job, req, res) {
+  const ss = Math.max(0, Number(req.query.ss) || 0);
+  const sess = String(req.query.sess || '1');
+  const pedido = req.query.audio;
+  const audio = indiceAudio(job, pedido);
+
+  // Reaproveita a sessao ja iniciada (mesmo ponto e mesma faixa) em vez de
+  // reiniciar o ffmpeg a cada recarga da playlist.
+  if (job.hls && !job.hls.erro && job.hls.ss === ss && job.hls.audio === audio) {
+    job.hls.sess = sess;
+  } else {
+    abrirHls(job, ss, sess, pedido);
+  }
+
+  const cabecalho = {
+    'content-type': 'application/vnd.apple.mpegurl',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*'
+  };
+
+  if (!job.hls) { res.writeHead(200, cabecalho); res.end(vazio()); return; }
+
+  const arq = path.join(job.hls.dir, 'index.m3u8');
+  let txt = '';
+  try { if (fs.existsSync(arq)) txt = fs.readFileSync(arq, 'utf8'); } catch (e) { txt = ''; }
+  if (!/^#EXTM3U/.test(txt)) { res.writeHead(200, cabecalho); res.end(vazio()); return; }
+
+  // Sem ENDLIST => playlist viva (EVENT): o player recarrega e ve os novos
+  // segmentos. Com ENDLIST => VOD: duracao real e seek livre.
+  const temEndlist = /#EXT-X-ENDLIST/.test(txt);
+  const tipo = temEndlist ? 'VOD' : 'EVENT';
+  if (/^#EXT-X-PLAYLIST-TYPE:/m.test(txt)) txt = txt.replace(/^#EXT-X-PLAYLIST-TYPE:.*$/m, '#EXT-X-PLAYLIST-TYPE:' + tipo);
+  else txt = txt.replace('#EXTM3U', '#EXTM3U\n#EXT-X-PLAYLIST-TYPE:' + tipo);
+
+  const pref = 'stream?jobId=' + job.id + '&sess=' + sess + '&ss=' + ss + '&audio=' + audio + '&seg=';
+  txt = txt.replace(/^(seg\d+\.(?:ts|m4s|mp4))\s*$/gm, pref + '$1');
+
+  res.writeHead(200, cabecalho);
+  res.end(txt);
+}
+
+function vazio() {
+  // NUNCA com ENDLIST: senao o player trata como VOD completo e nao recarrega.
+  return '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:' + HLS_SEG +
+    '\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n';
+}
+
+function servirSegmento(job, req, res) {
+  const nome = String(req.query.seg || '');
+  if (!/^seg\d+\.(ts|m4s|mp4)$/.test(nome)) {
+    res.writeHead(404, { 'access-control-allow-origin': '*' }); res.end(); return;
+  }
+
+  let alvo = job.hls ? path.join(job.hls.dir, nome) : '';
+  if (!alvo || !fs.existsSync(alvo)) {
+    alvo = path.join(job.dir, 'hls', String(req.query.sess || ''), nome);
+  }
+  if (!fs.existsSync(alvo)) {
+    res.writeHead(404, { 'access-control-allow-origin': '*' }); res.end(); return;
+  }
+
+  let tamanho = 0;
+  try { tamanho = fs.statSync(alvo).size; } catch (e) { }
+
+  res.writeHead(200, {
+    'content-type': /\.ts$/.test(nome) ? 'video/mp2t' : 'video/mp4',
+    'content-length': tamanho,
+    'cache-control': 'public, max-age=3600',
+    'access-control-allow-origin': '*'
+  });
+  fs.createReadStream(alvo).pipe(res);
 }
 
 /* ------------------------------- HTTP ------------------------------ */
@@ -668,10 +645,21 @@ function handle(jobId, req, res) {
 
   if (job.state === 'erro') { res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end(job.message); return; }
 
+  if (req.query.seg) { servirSegmento(job, req, res); return; }
+
   const file = job.file;
   if (!file) { res.writeHead(202, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Aguardando metadados...'); return; }
 
   const modoPedido = String(req.query.modo || '').toLowerCase();
+
+  if (req.query.hls === '1' || modoPedido === 'hls') {
+    if (!HLS_OK) { servirDireto(job, req, res); return; }
+    playlistHls(job, req, res);
+    return;
+  }
+
+  if (modoPedido === 'direto') { servirDireto(job, req, res); return; }
+
   const modo = modoPedido || (job.transcode ? 'transcode' : 'direto');
 
   if (modo === 'transcode') servirTranscode(job, req, res);
@@ -722,6 +710,7 @@ function servirTranscode(job, req, res) {
   if (!ffmpegLib || !FFMPEG_PATH) { servirDireto(job, req, res); return; }
 
   const t = Math.max(0, Number(req.query.t) || 0);
+  const audio = indiceAudio(job, req.query.audio);
   const file = job.file;
   const bytesPorSeg = job.duracao > 0 ? (file.length / job.duracao) : 0;
   const inicio = (t > 0 && bytesPorSeg > 0) ? Math.min(file.length - 1, Math.floor(bytesPorSeg * t)) : 0;
@@ -743,7 +732,7 @@ function servirTranscode(job, req, res) {
 
   const opts = [
     '-map 0:v:0',
-    '-map 0:a:' + job.audioIdx,
+    '-map 0:a:' + audio,
     '-max_muxing_queue_size 2048',
     '-movflags frag_keyframe+empty_moov+default_base_moof',
     '-avoid_negative_ts make_zero'
@@ -795,15 +784,56 @@ function lerArquivo(file, limite) {
   });
 }
 
+function extrairLegendaInterna(job, ref) {
+  return new Promise(function (resolve) {
+    if (!ffmpegLib || !FFMPEG_PATH) { resolve(null); return; }
+    let saida = '';
+    let proc = null;
+    let pronto = false;
+    const fim = function () {
+      if (pronto) return;
+      pronto = true;
+      try { if (proc && !proc.killed) proc.kill('SIGKILL'); } catch (e) { }
+      const txt = String(saida).replace(/\r/g, '');
+      if (!txt.trim()) { resolve(null); return; }
+      resolve(/^WEBVTT/i.test(txt) ? txt : 'WEBVTT\n\n' + txt);
+    };
+    try {
+      proc = spawn(FFMPEG_PATH, [
+        '-hide_banner', '-loglevel', 'error',
+        '-i', urlInterna(job),
+        '-map', '0:s:' + ref.i,
+        '-f', 'webvtt', '-'
+      ], { windowsHide: true });
+    } catch (e) { resolve(null); return; }
+
+    const timer = setTimeout(fim, 60000);
+    proc.stdout.on('data', function (c) { saida += c.toString(); });
+    proc.on('close', function () { clearTimeout(timer); fim(); });
+    proc.on('error', function () { clearTimeout(timer); fim(); });
+  });
+}
+
 async function legenda(jobId, idx) {
   const job = jobs.get(jobId);
-  if (!job || !job.subs || !job.subs[idx]) return null;
-  const sub = job.subs[idx];
-  const file = job.torrent && job.torrent.files[sub.fileIndex];
-  if (!file) return null;
+  if (!job) return null;
   job.lastAccess = agora();
-  const texto = await lerArquivo(file);
-  return { nome: sub.nome, code: sub.code, label: sub.label, vtt: subtitulos.converter(texto, subtitulos.extensao(file.name)) };
+
+  const arquivos = job.subs || [];
+  if (idx < arquivos.length) {
+    const sub = arquivos[idx];
+    const file = job.torrent && job.torrent.files[sub.fileIndex];
+    if (!file) return null;
+    const texto = await lerArquivo(file);
+    return { nome: sub.nome, code: sub.code, label: sub.label, vtt: subtitulos.converter(texto, subtitulos.extensao(file.name)) };
+  }
+
+  const i = idx - arquivos.length;
+  const ref = (job.subsInternas || [])[i];
+  if (!ref) return null;
+  const vtt = await extrairLegendaInterna(job, ref);
+  if (!vtt) return null;
+  return { nome: 'Embutida ' + (ref.label || ref.lang || ref.i), code: ref.lang || 'pt-BR', label: ref.label || 'Legenda embutida', vtt: vtt };
 }
 
 /* ------------------------------ status ----------------------------- */
@@ -813,6 +843,19 @@ function status(jobId) {
   if (!job) return null;
   job.lastAccess = agora();
   const t = job.torrent;
+
+  const subs = (job.subs || []).map(function (s) {
+    return { idx: s.idx, nome: s.nome, code: s.code, label: s.label, interna: false };
+  }).concat((job.subsInternas || []).map(function (s, i) {
+    return {
+      idx: (job.subs || []).length + i,
+      nome: 'Embutida ' + (s.label || s.lang || ('#' + s.i)),
+      code: s.lang || 'pt-BR',
+      label: s.label || ('Legenda embutida ' + (s.lang || s.i)),
+      interna: true
+    };
+  }));
+
   return {
     id: job.id,
     state: job.state,
@@ -828,8 +871,16 @@ function status(jobId) {
     canPlay: !!job.canPlay,
     tentativa: job.tentativas,
     transcode: !!job.transcode,
+    hls: !!HLS_OK,
+    hlsPronto: job.hls ? (contarSegmentos(job.hls) > 0) : false,
+    hlsErro: job.hls ? (job.hls.erro || null) : null,
     duracao: job.duracao || 0,
-    subs: job.subs ? job.subs.map(function (s) { return { idx: s.idx, nome: s.nome, code: s.code, label: s.label }; }) : [],
+    audioIdx: job.audioIdx,
+    audioPt: job.audioPt,
+    audioFaixas: (job.audios || []).map(function (a) {
+      return { indice: a.indice, codec: a.codec, canais: a.canais, lang: a.lang, titulo: a.titulo, ptbr: a.ptbr };
+    }),
+    subs: subs,
     elapsed: Math.round((agora() - job.createdAt) / 1000),
     streamUrl: job.streamUrl
   };
@@ -839,6 +890,7 @@ function stop(jobId) {
   const job = jobs.get(jobId);
   if (!job) return false;
   limparTimers(job);
+  fecharHls(job);
   jobs.delete(jobId);
   const dir = job.dir;
   const finalizar = function () { if (CACHE_MODE !== 'keep') apagarPasta(dir); };
@@ -868,235 +920,30 @@ process.on('SIGTERM', function () { try { client.destroy(); } catch (e) { } stop
 module.exports = {
   start: start, status: status, stop: stop, stopTudo: stopTudo,
   handle: handle, legenda: legenda, jobs: jobs, CACHE_ROOT: CACHE_ROOT,
-  FFMPEG_OK: !!FFMPEG_PATH, FFPROBE_OK: !!FFPROBE_PATH, MODO_TRANSCODE: MODO_TRANSCODE
+  FFMPEG_OK: !!FFMPEG_PATH, FFPROBE_OK: !!FFPROBE_PATH, HLS_OK: HLS_OK, MODO_TRANSCODE: MODO_TRANSCODE
 };
 '@
-Write-ProjectFile 'src/streamer.js' $streamerJs
 
-# ======================================================================
-Write-Step 'Frontend'
-
-# ----------------------------------------------------------------------
-$indexHtml = @'
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0a0a0b">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>CineP2P</title>
-<link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" href="/placeholder.svg">
-<link rel="preconnect" href="https://image.tmdb.org">
-<link rel="stylesheet" href="/styles.css">
-<link rel="stylesheet" href="/player.css">
-<link rel="stylesheet" href="/series.css">
-</head>
-<body>
-
-<header class="topbar">
-  <button class="icon-btn" id="menuBtn" aria-label="Abrir menu">
-    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-  </button>
-
-  <a class="brand" id="brand" href="#">Cine<span>P2P</span></a>
-
-  <nav class="tipo-tabs" id="tipoTabs">
-    <button class="tipo-tab active" data-tipo="movie">Filmes</button>
-    <button class="tipo-tab" data-tipo="tv">Series</button>
-  </nav>
-
-  <nav class="topnav" id="topnav">
-    <button class="nav-link active" data-view="inicio">Inicio</button>
-    <button class="nav-link" data-view="buscar">Buscar</button>
-    <button class="nav-link" data-view="historico">Historico</button>
-    <button class="nav-link" data-view="lista">Minha Lista</button>
-    <button class="nav-link" data-view="categorias">Categorias</button>
-  </nav>
-
-  <div class="topbar-actions">
-    <button class="icon-btn" id="searchBtn" aria-label="Buscar">
-      <svg viewBox="0 0 24 24" width="21" height="21"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2" fill="none"/><path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-    </button>
-  </div>
-</header>
-
-<aside id="drawer" class="drawer hidden">
-  <div class="drawer-head">
-    <span class="brand">Cine<span>P2P</span></span>
-    <button class="icon-btn" id="drawerClose" aria-label="Fechar">
-      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-    </button>
-  </div>
-  <div class="drawer-tipos">
-    <button class="tipo-tab active" data-tipo="movie">Filmes</button>
-    <button class="tipo-tab" data-tipo="tv">Series</button>
-  </div>
-  <nav class="drawer-nav">
-    <button class="nav-link" data-view="inicio">Inicio</button>
-    <button class="nav-link" data-view="buscar">Buscar</button>
-    <button class="nav-link" data-view="historico">Historico</button>
-    <button class="nav-link" data-view="lista">Minha Lista</button>
-    <button class="nav-link" data-view="categorias">Categorias</button>
-  </nav>
-  <p class="drawer-foot">CineP2P 8.0</p>
-</aside>
-<div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
-
-<main id="app">
-  <section id="view-inicio" class="view">
-    <section id="hero" class="hero"></section>
-    <div id="rows" class="rows"></div>
-  </section>
-
-  <section id="view-buscar" class="view hidden">
-    <div class="searchbar">
-      <input id="searchInput" type="search" placeholder="Buscar..." autocomplete="off">
-      <button class="btn small" id="searchGo">Buscar</button>
-    </div>
-    <div id="searchResults" class="grid"></div>
-  </section>
-
-  <section id="view-lista" class="view hidden">
-    <h1 class="view-title">Minha Lista</h1>
-    <div id="listaGrid" class="grid"></div>
-  </section>
-
-  <section id="view-historico" class="view hidden">
-    <h1 class="view-title">Historico</h1>
-    <div id="historicoGrid" class="grid"></div>
-    <button class="btn ghost limpar" id="limparHistorico">Limpar historico</button>
-  </section>
-
-  <section id="view-categorias" class="view hidden">
-    <h1 class="view-title">Categorias</h1>
-    <div id="categoriasChips" class="chips"></div>
-    <div id="categoriasGrid" class="grid"></div>
-  </section>
-</main>
-
-<nav class="bottom-nav">
-  <button class="bn-item active" data-view="inicio" data-tipo="movie">
-    <svg viewBox="0 0 24 24" width="21" height="21"><path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-    <span>Inicio</span>
-  </button>
-  <button class="bn-item" data-view="inicio" data-tipo="movie" data-aba="filmes">
-    <svg viewBox="0 0 24 24" width="21" height="21"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 5v14M16 5v14" stroke="currentColor" stroke-width="2"/></svg>
-    <span>Filmes</span>
-  </button>
-  <button class="bn-item" data-view="inicio" data-tipo="tv" data-aba="series">
-    <svg viewBox="0 0 24 24" width="21" height="21"><rect x="3" y="7" width="18" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 3l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-    <span>Series</span>
-  </button>
-  <button class="bn-item" data-view="lista">
-    <svg viewBox="0 0 24 24" width="21" height="21"><path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 4.6-7 9-7 9z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-    <span>Lista</span>
-  </button>
-  <button class="bn-item" data-view="historico">
-    <svg viewBox="0 0 24 24" width="21" height="21"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-    <span>Historico</span>
-  </button>
-</nav>
-
-<div id="modal" class="modal hidden">
-  <div class="modal-backdrop" data-close></div>
-  <div class="modal-card" role="dialog" aria-modal="true">
-    <button class="modal-close" data-close aria-label="Fechar">
-      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-    </button>
-    <div id="modalBody" class="modal-body"></div>
-  </div>
-</div>
-
-<!-- ============================ PLAYER ============================ -->
-<div id="player" class="player hidden">
-  <video id="video" playsinline webkit-playsinline preload="auto" autoplay></video>
-
-  <div class="pv-top" id="pvTop">
-    <button class="pv-btn" id="pvClose" aria-label="Voltar">
-      <svg viewBox="0 0 24 24" width="24" height="24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>
-    <div class="pv-title" id="pvTitle">Reproduzindo</div>
-    <button class="pv-btn pv-txt" id="pvFontes">Fontes</button>
-  </div>
-
-  <div class="pv-center" id="pvCenter">
-    <div class="pv-spinner"></div>
-    <p class="pv-msg" id="pvMsg">Conectando aos peers...</p>
-    <div class="pv-bar"><i id="pvFill"></i></div>
-    <p class="pv-stats" id="pvStats"></p>
-    <p class="pv-fonte" id="pvFonte"></p>
-  </div>
-
-  <div class="pv-bottom" id="pvBottom">
-    <div class="pv-seek" id="pvSeek">
-      <div class="pv-seek-track"><i id="pvProgress"></i></div>
-      <div class="pv-seek-knob" id="pvKnob"></div>
-    </div>
-    <div class="pv-row">
-      <button class="pv-btn" id="pvPlay" aria-label="Play/Pause">
-        <svg id="icoPlay" viewBox="0 0 24 24" width="26" height="26"><path d="M7 4.5v15l13-7.5z" fill="currentColor"/></svg>
-        <svg id="icoPause" class="hidden" viewBox="0 0 24 24" width="26" height="26"><path d="M7 4.5h4v15H7zM13 4.5h4v15h-4z" fill="currentColor"/></svg>
-      </button>
-      <button class="pv-btn" id="pvBack30" aria-label="Voltar 30 segundos">
-        <svg viewBox="0 0 24 24" width="26" height="26"><path d="M11 5V2L6 6l5 4V7a6 6 0 1 1-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><text x="12" y="17" font-size="8" font-weight="700" fill="currentColor" text-anchor="middle">30</text></svg>
-      </button>
-      <button class="pv-btn" id="pvFwd30" aria-label="Avancar 30 segundos">
-        <svg viewBox="0 0 24 24" width="26" height="26"><path d="M13 5V2l5 4-5 4V7a6 6 0 1 0 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><text x="12" y="17" font-size="8" font-weight="700" fill="currentColor" text-anchor="middle">30</text></svg>
-      </button>
-      <span class="pv-time" id="pvTime">0:00 / 0:00</span>
-      <span class="pv-spacer"></span>
-      <button class="pv-btn" id="pvMute" aria-label="Volume">
-        <svg id="icoVol" viewBox="0 0 24 24" width="24" height="24"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-        <svg id="icoMudo" class="hidden" viewBox="0 0 24 24" width="24" height="24"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor"/><path d="M15 9l5 6M20 9l-5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      </button>
-      <button class="pv-btn pv-cc" id="pvCC" aria-label="Legendas">CC</button>
-      <button class="pv-btn" id="pvFull" aria-label="Tela cheia">
-        <svg viewBox="0 0 24 24" width="24" height="24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      </button>
-    </div>
-  </div>
-
-  <div class="pv-sheet hidden" id="pvSheet">
-    <div class="pv-sheet-head">
-      <strong id="pvSheetTitle">Fontes</strong>
-      <button class="pv-btn" id="pvSheetClose" aria-label="Fechar">
-        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      </button>
-    </div>
-    <div class="pv-sheet-body" id="pvSheetBody"></div>
-  </div>
-</div>
-
-<div id="toast" class="toast hidden"></div>
-
-<script src="/config.js"></script>
-<script src="/app.js"></script>
-</body>
-</html>
-'@
-Write-ProjectFile 'public/index.html' $indexHtml
-
-# ----------------------------------------------------------------------
-$appJs = @'
+# ---------------------------------------------------------------- 2. app.js
+Etapa '2/2  public/app.js (hls sem aceleracao + watchdog + fallback)'
+Salvar 'public/app.js' @'
 'use strict';
 
 /* =====================================================================
-   CineP2P 8.0 - player universal
+   TMC 15.0 - player HLS
 
-   Video: stream BitTorrent bruto (Range), abre instantaneo.
-   Audio: o navegador le o cabecalho MKV, escolhe a faixa PT e, quando o
-          codec e AC3/EAC3/DTS (ou a faixa PT nao e a primeira), ativa o
-          RESGATE: demux MKV em JavaScript + decodificacao via Web Audio,
-          sincronizada com o video. Nenhum servidor de transcode.
+   Video : HLS do backend (-c:v copy). Enquanto o ffmpeg escreve a playlist
+           e viva (recarrega sozinha); ao terminar vira VOD com ENDLIST.
+   Anti-travamento: sem aceleracao de live + watchdog + fallback automatico
+           para o modo mp4 caso o HLS nao entregue imagem.
+   Audio : AAC estereo no servidor + seletor de faixa.
+   Intro : 3s com animacao + tudum. CC: legendas do torrent e embutidas.
    ===================================================================== */
 
 const API_BASE = String(window.CINEP2P_API_BASE || '').replace(/\/+$/, '');
 const PLACEHOLDER = '/placeholder.svg';
 const NIVEIS_BONS = ['duals51', 'confirmado', 'provavel'];
+const INTRO_MS = 3000;
 
 const $ = function (s, r) { return (r || document).querySelector(s); };
 const $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
@@ -1108,6 +955,17 @@ const LS = {
 };
 
 const K = { lista: 'cinep2p:lista', historico: 'cinep2p:historico', continuar: 'cinep2p:continuar', tipo: 'cinep2p:tipo' };
+
+const GENEROS_FILTRO = [
+  { id: 28, nome: 'Ação' },
+  { id: 35, nome: 'Comédia' },
+  { id: 27, nome: 'Terror' },
+  { id: 53, nome: 'Suspense' },
+  { id: 10749, nome: 'Romance' },
+  { id: 16, nome: 'Animação' }
+];
+
+let hls = null;
 
 const state = {
   view: 'inicio',
@@ -1127,16 +985,35 @@ const state = {
   tentativa: 0,
   subs: [],
   legendaAtiva: null,
+  faixas: [],
+  audio: null,
   total: 0,
   duracao: 0,
+  ss: 0,
+  sess: null,
+  modoHls: false,
   mudo: false,
   volume: 1,
   esconderTimer: null,
-  arrastandoSeek: false
+  introTimer: null,
+  introFim: 0,
+  arrastandoSeek: false,
+  recarregando: false,
+  ultimoRecarregar: 0,
+  ultimoProgresso: 0,
+  guardTimer: null,
+  slideTimer: null,
+  slides: [],
+  slideIdx: 0,
+  catalogo: [],
+  generoFiltro: null,
+  ordemNota: false,
+  vigiaTimer: null
 };
 
 const els = {
   hero: $('#hero'), rows: $('#rows'),
+  filtros: $('#filtros'), filtrosGrid: $('#filtrosGrid'), filtrosTitulo: $('#filtrosTitulo'),
   searchInput: $('#searchInput'), searchResults: $('#searchResults'),
   listaGrid: $('#listaGrid'), historicoGrid: $('#historicoGrid'),
   categoriasChips: $('#categoriasChips'), categoriasGrid: $('#categoriasGrid'),
@@ -1147,6 +1024,7 @@ const els = {
   pvMsg: $('#pvMsg'), pvStats: $('#pvStats'), pvFill: $('#pvFill'), pvFonte: $('#pvFonte'),
   pvTime: $('#pvTime'), pvProgress: $('#pvProgress'), pvKnob: $('#pvKnob'), pvSeek: $('#pvSeek'),
   pvSheet: $('#pvSheet'), pvSheetBody: $('#pvSheetBody'), pvSheetTitle: $('#pvSheetTitle'),
+  pvIntro: $('#pvIntro'), selAudio: $('#sel-audio'),
   icoPlay: $('#icoPlay'), icoPause: $('#icoPause'), icoVol: $('#icoVol'), icoMudo: $('#icoMudo')
 };
 
@@ -1175,12 +1053,12 @@ function fmtTime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(sec).padStart(2, '0');
 }
-function esperar(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
 let toastTimer = null;
 function toast(msg, tipo) {
   els.toast.textContent = msg;
   els.toast.className = 'toast' + (tipo === 'error' ? ' error' : '');
+  els.toast.classList.remove('hidden');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(function () { els.toast.classList.add('hidden'); }, 4000);
 }
@@ -1245,6 +1123,9 @@ function setTipo(tipo) {
   $$('.tipo-tab').forEach(function (b) { b.classList.toggle('active', b.dataset.tipo === state.tipo); });
   $$('.bn-item[data-aba]').forEach(function (b) { b.classList.toggle('active', b.dataset.tipo === state.tipo); });
   els.searchInput.placeholder = state.tipo === 'tv' ? 'Buscar series...' : 'Buscar filmes...';
+  state.generoFiltro = null;
+  state.ordemNota = false;
+  state.catalogo = [];
   api('/api/generos', { tipo: state.tipo }).then(function (g) { state.generos = g.generos || []; }).catch(function () { });
   carregarInicio();
 }
@@ -1252,7 +1133,62 @@ function setTipo(tipo) {
 function abrirDrawer() { els.drawer.classList.remove('hidden'); els.drawerBackdrop.classList.remove('hidden'); }
 function fecharDrawer() { els.drawer.classList.add('hidden'); els.drawerBackdrop.classList.add('hidden'); }
 
-/* ------------------------------- home ------------------------------ */
+/* --------------------------- hero slideshow ------------------------ */
+
+function renderSlides(itens) {
+  const alvo = els.hero;
+  if (!alvo) return;
+  clearInterval(state.slideTimer);
+  const lista = (itens || []).filter(function (i) { return i && (i.backdrop || i.poster); }).slice(0, 6);
+  state.slides = lista;
+  state.slideIdx = 0;
+
+  if (!lista.length) { alvo.innerHTML = ''; return; }
+
+  alvo.classList.add('slides');
+  alvo.innerHTML = lista.map(function (item, i) {
+    return '<div class="slide' + (i === 0 ? ' on' : '') + '" style="background-image:url(\'' + esc(item.backdrop || item.poster) + '\')">' +
+        '<div class="hero-inner">' +
+          '<p class="hero-kicker">' + (item.tipo === 'tv' ? 'Serie em destaque' : 'Lancamento') + '</p>' +
+          '<h1 class="hero-title">' + esc(item.titulo) + '</h1>' +
+          '<p class="hero-meta">' + esc(item.ano || '') + (item.nota ? ' &middot; &#9733; ' + item.nota.toFixed(1) : '') + '</p>' +
+          '<p class="hero-sinopse">' + esc(item.sinopse || '') + '</p>' +
+          '<div class="hero-actions">' +
+            '<button class="btn primary" data-slide="' + i + '">' + (item.tipo === 'tv' ? 'Ver episodios' : 'Assistir agora') + '</button>' +
+            '<button class="btn ghost" data-slide-info="' + i + '">Detalhes</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  }).join('') + '<div class="slide-dots">' +
+    lista.map(function (x, i) { return '<i class="' + (i === 0 ? 'on' : '') + '"></i>'; }).join('') + '</div>';
+
+  $$('.slide .btn[data-slide]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      const item = state.slides[Number(b.dataset.slide)];
+      if (!item) return;
+      if (item.tipo === 'tv') abrirDetalhes('tv', item.id, false);
+      else assistir(item);
+    });
+  });
+  $$('.slide .btn[data-slide-info]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      const item = state.slides[Number(b.dataset.slideInfo)];
+      if (item) abrirDetalhes(item.tipo || 'movie', item.id, false);
+    });
+  });
+
+  if (lista.length > 1) state.slideTimer = setInterval(function () { proximoSlide(1); }, 7000);
+}
+
+function proximoSlide(passo) {
+  const total = state.slides.length;
+  if (total < 2) return;
+  state.slideIdx = (state.slideIdx + passo + total) % total;
+  $$('.slide').forEach(function (s, i) { s.classList.toggle('on', i === state.slideIdx); });
+  $$('.slide-dots i').forEach(function (d, i) { d.classList.toggle('on', i === state.slideIdx); });
+}
+
+/* ------------------------------ home ------------------------------- */
 
 function skeleton() {
   let html = '';
@@ -1264,46 +1200,98 @@ function skeleton() {
   return html;
 }
 
-function renderHero(item) {
-  if (!item) { els.hero.innerHTML = ''; els.hero.style.backgroundImage = 'none'; return; }
-  els.hero.style.backgroundImage = 'url("' + (item.backdrop || item.poster || PLACEHOLDER) + '")';
-  els.hero.innerHTML =
-    '<div class="hero-inner">' +
-      '<p class="hero-kicker">' + (item.tipo === 'tv' ? 'Serie em destaque' : 'Destaque de hoje') + '</p>' +
-      '<h1 class="hero-title">' + esc(item.titulo) + '</h1>' +
-      '<p class="hero-meta">' + esc(item.ano || '') + (item.nota ? ' &middot; &#9733; ' + item.nota.toFixed(1) : '') + '</p>' +
-      '<p class="hero-sinopse">' + esc(item.sinopse || '') + '</p>' +
-      '<div class="hero-actions">' +
-        '<button class="btn primary" id="heroAssistir">' + (item.tipo === 'tv' ? 'Ver episodios' : 'Assistir agora') + '</button>' +
-        '<button class="btn ghost" id="heroTrailer">Assistir trailer</button>' +
-        '<button class="btn ghost" id="heroFavoritar">Favoritar</button>' +
-      '</div>' +
-    '</div>';
-  $('#heroAssistir').addEventListener('click', function () {
-    if (item.tipo === 'tv') abrirDetalhes('tv', item.id, false);
-    else assistir(item);
-  });
-  $('#heroTrailer').addEventListener('click', function () { abrirDetalhes(item.tipo || 'movie', item.id, true); });
-  $('#heroFavoritar').addEventListener('click', function () { alternarFavorito(item); });
-}
-
 function rowHtml(titulo, itens, opts) {
   return '<section class="row"><h2>' + esc(titulo) + '</h2><div class="scroller">' +
     itens.map(function (i) { return cardHtml(i, opts); }).join('') + '</div></section>';
 }
 
+function renderFiltros() {
+  const box = els.filtros;
+  if (!box) return;
+  box.classList.toggle('hidden', state.tipo !== 'movie');
+  if (state.tipo !== 'movie') return;
+
+  let html = '<button class="chip' + (!state.generoFiltro ? ' ativo' : '') + '" data-genero-f="">Todos</button>';
+  GENEROS_FILTRO.forEach(function (g) {
+    html += '<button class="chip' + (state.generoFiltro === g.id ? ' ativo' : '') + '" data-genero-f="' + g.id + '">' + esc(g.nome) + '</button>';
+  });
+  html += '<button class="chip ordem' + (state.ordemNota ? ' ativo' : '') + '" id="btnOrdemNota">&#9733; Mais bem avaliados</button>';
+  box.innerHTML = html;
+
+  $$('#filtros [data-genero-f]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      const v = b.dataset.generoF;
+      state.generoFiltro = v === '' ? null : Number(v);
+      renderFiltros();
+      aplicarFiltro();
+    });
+  });
+  const btn = $('#btnOrdemNota');
+  if (btn) btn.addEventListener('click', function () {
+    state.ordemNota = !state.ordemNota;
+    renderFiltros();
+    if (state.catalogo.length && state.generoFiltro) { ordenarERender(); return; }
+    aplicarFiltro();
+  });
+}
+
+function nomeGenero(id) {
+  const g = GENEROS_FILTRO.filter(function (x) { return x.id === Number(id); })[0];
+  return g ? g.nome : 'Genero';
+}
+
+async function aplicarFiltro() {
+  const grid = els.filtrosGrid, tit = els.filtrosTitulo, rows = els.rows;
+  if (!grid) return;
+
+  if (!state.generoFiltro && !state.ordemNota) {
+    grid.classList.add('hidden');
+    tit.classList.add('hidden');
+    rows.classList.remove('hidden');
+    return;
+  }
+
+  grid.classList.remove('hidden');
+  tit.classList.remove('hidden');
+  rows.classList.add('hidden');
+  tit.textContent = state.generoFiltro ? ('Genero: ' + nomeGenero(state.generoFiltro)) : 'Mais bem avaliados';
+  grid.innerHTML = '<p class="vazio">Carregando...</p>';
+
+  try {
+    const d = state.generoFiltro
+      ? await api('/api/filmes/genero/' + state.generoFiltro, { tipo: state.tipo })
+      : await api('/api/filmes/top', { tipo: state.tipo });
+    state.catalogo = d.itens || [];
+    ordenarERender();
+  } catch (e) { grid.innerHTML = '<p class="vazio">' + esc(e.message) + '</p>'; }
+}
+
+function ordenarERender() {
+  if (!els.filtrosGrid) return;
+  const lista = (state.catalogo || []).slice();
+  if (state.ordemNota) lista.sort(function (a, b) { return (b.nota || 0) - (a.nota || 0); });
+  els.filtrosGrid.innerHTML = gridHtml(lista, {});
+}
+
 async function carregarInicio() {
   els.rows.innerHTML = skeleton();
+  renderFiltros();
   try {
-    const data = await api('/api/home', { tipo: state.tipo });
-    renderHero(data.hero);
+    const home = await api('/api/home', { tipo: state.tipo });
+    let lanc = { itens: [] };
+    try { lanc = await api('/api/filmes/lancamentos', { tipo: state.tipo }); } catch (e) { }
+
+    renderSlides((lanc.itens && lanc.itens.length) ? lanc.itens : (home.hero ? [home.hero] : []));
+
     let html = '';
     if (state.tipo === 'movie') {
       const continuar = LS.get(K.continuar, []);
       if (continuar.length) html += rowHtml('Continue Assistindo', continuar, { progresso: true });
     }
-    data.rows.forEach(function (r) { html += rowHtml(r.titulo, r.itens, {}); });
+    home.rows.forEach(function (r) { html += rowHtml(r.titulo, r.itens, {}); });
     els.rows.innerHTML = html || '<p class="vazio">Sem resultados.</p>';
+
+    if (state.generoFiltro || state.ordemNota) aplicarFiltro();
   } catch (e) {
     els.rows.innerHTML = '<p class="vazio">' + esc(e.message) + '</p>';
     if (/TMDB_API_KEY/.test(e.message)) mostrarAviso();
@@ -1380,11 +1368,15 @@ function marcarHistorico(item, rotulo) {
   LS.set(K.historico, h.slice(0, 80));
 }
 
+function posicaoAbsoluta() {
+  return state.ss + (els.video.currentTime || 0);
+}
+
 function salvarProgresso() {
   if (!state.media || state.media.tipo === 'tv') return;
-  const dur = els.video.duration;
-  if (!dur || !isFinite(dur)) return;
-  const pct = Math.min(100, (els.video.currentTime / dur) * 100);
+  const dur = state.duracao || (isFinite(els.video.duration) ? els.video.duration : 0);
+  if (!dur) return;
+  const pct = Math.min(100, (posicaoAbsoluta() / dur) * 100);
   if (pct < 1 || pct > 98) return;
   const chave = chaveItem(state.media);
   const lista = LS.get(K.continuar, []).filter(function (i) { return chaveItem(i) !== chave; });
@@ -1515,451 +1507,6 @@ function mostrarTrailer(trailer) {
   box.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
-/* =========================== DEMUX MKV ============================== */
-
-const EBML = {
-  SEG: 0x18538067, INFO: 0x1549A966, TRACKS: 0x1654AE6B, ENTRY: 0xAE,
-  TRACKNUM: 0xD7, TRACKTYPE: 0x83, CODECID: 0x86, CODECPRIV: 0x63A2,
-  LANG: 0x22B59C, LANG2: 0x22B59D, AUDIO: 0xE1, CHANNELS: 0x9F,
-  CLUSTER: 0x1F43B675, TIMECODE: 0xE7, SIMPLEBLOCK: 0xA3, BLOCKGROUP: 0xA0, BLOCK: 0xA1,
-  SCALE: 0x2AD7B1, HEADER: 0x1A45DFA3
-};
-
-function criarParserMkv(cb) {
-  let buf = new Uint8Array(0);
-  let pos = 0;
-  const fins = [];
-  const tipos = [];
-  let escala = 1000000;
-  let tsCluster = 0;
-  let entry = {};
-  let modoSimples = false;
-  let sincronizado = false;
-  let ligado = true;
-
-  function lerId(p) {
-    if (p >= buf.length) return null;
-    const b0 = buf[p];
-    if (b0 === 0) return null;
-    let n = 1;
-    if (!(b0 & 0x80)) {
-      if (b0 & 0x40) n = 2; else if (b0 & 0x20) n = 3; else if (b0 & 0x10) n = 4; else return null;
-    }
-    if (p + n > buf.length) return null;
-    let v = 0;
-    for (let i = 0; i < n; i++) v = v * 256 + buf[p + i];
-    return { v: v, n: n };
-  }
-
-  function lerTam(p) {
-    if (p >= buf.length) return null;
-    const b0 = buf[p];
-    if (b0 === 0) return null;
-    let n = 1, mask = 0x80;
-    while (n <= 8 && !(b0 & mask)) { mask >>= 1; n++; }
-    if (n > 8 || p + n > buf.length) return null;
-    let v = b0 & (mask - 1);
-    let todosFf = ((b0 & (mask - 1)) === (mask - 1));
-    for (let i = 1; i < n; i++) {
-      v = v * 256 + buf[p + i];
-      if (buf[p + i] !== 0xFF) todosFf = false;
-    }
-    return { v: v, n: n, desconhecido: todosFf };
-  }
-
-  function uint(p, fim) {
-    if (fim > buf.length) return null;
-    let v = 0;
-    for (let i = p; i < fim; i++) v = v * 256 + buf[i];
-    return v;
-  }
-
-  function texto(p, fim) {
-    if (fim > buf.length) return null;
-    let s = '';
-    for (let i = p; i < fim; i++) { const c = buf[i]; if (c >= 32 && c < 127) s += String.fromCharCode(c); }
-    return s.trim();
-  }
-
-  function finalizarEntry() {
-    if (entry && entry.n && entry.tipo === 2 && cb.aoFaixa) {
-      cb.aoFaixa({
-        numero: entry.n,
-        lang: (entry.lang || '').toLowerCase(),
-        codec: entry.codec || '',
-        canais: entry.canais || 0,
-        codecPrivado: entry.codecPrivado || null
-      });
-    }
-    entry = {};
-  }
-
-  function blocos(p, fim) {
-    const tn = lerTam(p);
-    if (!tn) return;
-    let off = p + tn.n;
-    if (off + 3 > fim) return;
-    let ts = (buf[off] << 8) | buf[off + 1];
-    if (ts & 0x8000) ts -= 0x10000;
-    off += 2;
-    const flags = buf[off]; off++;
-    const lace = (flags >> 1) & 3;
-    const partes = [];
-
-    if (lace === 0) {
-      partes.push([off, fim]);
-    } else {
-      const n = buf[off] + 1; off++;
-      const tamanhos = [];
-      if (lace === 1) {
-        let total = 0;
-        for (let i = 0; i < n - 1; i++) {
-          let s = 0, b;
-          do { b = buf[off++]; s += b; } while (b === 255 && off < fim);
-          tamanhos.push(s); total += s;
-        }
-        tamanhos.push(Math.max(0, fim - off - total));
-      } else if (lace === 3) {
-        const s0 = lerTam(off);
-        if (!s0) return;
-        off += s0.n;
-        tamanhos.push(s0.v);
-        let total = s0.v;
-        for (let i = 1; i < n - 1; i++) {
-          const d = lerTam(off);
-          if (!d) return;
-          off += d.n;
-          const dv = d.v - Math.pow(2, 7 * d.n - 1) + 1;
-          tamanhos.push(dv); total += dv;
-        }
-        tamanhos.push(Math.max(0, fim - off - total));
-      } else {
-        const t = Math.floor((fim - off) / n);
-        for (let i = 0; i < n; i++) tamanhos.push(t);
-      }
-      let cur = off;
-      tamanhos.forEach(function (t) { partes.push([cur, cur + t]); cur += t; });
-    }
-
-    const tsSeg = (tsCluster + ts) * escala / 1e9;
-    partes.forEach(function (pp) {
-      if (pp[1] > pp[0] && cb.aoFrame) cb.aoFrame(tn.v, tsSeg, buf.subarray(pp[0], pp[1]));
-    });
-  }
-
-  function processar() {
-    let voltas = 0;
-    while (ligado && voltas++ < 200000) {
-      while (fins.length && pos >= fins[fins.length - 1]) {
-        const t = tipos.pop(); fins.pop();
-        if (t === 'entry') finalizarEntry();
-      }
-      if (buf.length - pos < 2) break;
-
-      if (modoSimples && !sincronizado) {
-        let achou = -1;
-        for (let i = pos; i + 4 <= buf.length; i++) {
-          if (buf[i] === 0x1F && buf[i + 1] === 0x43 && buf[i + 2] === 0xB6 && buf[i + 3] === 0x75) { achou = i; break; }
-        }
-        if (achou < 0) { pos = Math.max(pos, buf.length - 3); break; }
-        pos = achou;
-        sincronizado = true;
-      }
-
-      const id = lerId(pos);
-      if (!id) break;
-      const tam = lerTam(pos + id.n);
-      if (!tam) break;
-
-      const idv = id.v;
-      const ini = pos + id.n + tam.n;
-      const fim = tam.desconhecido ? Infinity : ini + tam.v;
-
-      if (idv === EBML.CLUSTER) { tsCluster = 0; pos = ini; fins.push(fim); tipos.push('cluster'); continue; }
-      if (idv === EBML.SEG || idv === EBML.HEADER) { pos = ini; fins.push(fim); tipos.push('seg'); continue; }
-      if (idv === EBML.INFO) { pos = ini; fins.push(fim); tipos.push('info'); continue; }
-      if (!modoSimples && idv === EBML.TRACKS) { pos = ini; fins.push(fim); tipos.push('tracks'); continue; }
-      if (!modoSimples && idv === EBML.ENTRY) { entry = {}; pos = ini; fins.push(fim); tipos.push('entry'); continue; }
-      if (idv === EBML.AUDIO) { pos = ini; fins.push(fim); tipos.push('audio'); continue; }
-      if (idv === EBML.BLOCKGROUP) { pos = ini; fins.push(fim); tipos.push('bg'); continue; }
-
-      if (idv === EBML.SCALE) { const r = uint(ini, fim); if (r === null) break; escala = r || escala; pos = fim; continue; }
-      if (idv === EBML.TIMECODE) { const r = uint(ini, fim); if (r === null) break; tsCluster = r; pos = fim; continue; }
-
-      if (!modoSimples && idv === EBML.TRACKNUM) { const r = uint(ini, fim); if (r === null) break; entry.n = r; pos = fim; continue; }
-      if (!modoSimples && idv === EBML.TRACKTYPE) { const r = uint(ini, fim); if (r === null) break; entry.tipo = r; pos = fim; continue; }
-      if (!modoSimples && idv === EBML.CHANNELS) { const r = uint(ini, fim); if (r === null) break; entry.canais = r; pos = fim; continue; }
-      if (!modoSimples && idv === EBML.CODECID) { const r = texto(ini, fim); if (r === null) break; entry.codec = r; pos = fim; continue; }
-      if (!modoSimples && (idv === EBML.LANG || idv === EBML.LANG2)) { const r = texto(ini, fim); if (r === null) break; if (!entry.lang) entry.lang = r; pos = fim; continue; }
-      if (!modoSimples && idv === EBML.CODECPRIV) { if (fim > buf.length) break; entry.codecPrivado = buf.subarray(ini, fim); pos = fim; continue; }
-
-      if (idv === EBML.SIMPLEBLOCK || idv === EBML.BLOCK) {
-        if (fim > buf.length) break;
-        blocos(ini, fim);
-        pos = fim;
-        continue;
-      }
-
-      if (fim === Infinity) { pos = ini; fins.push(fim); tipos.push('x'); continue; }
-      if (fim > buf.length) break;
-      pos = fim;
-    }
-
-    if (pos > 0) { buf = buf.subarray(pos); pos = 0; }
-  }
-
-  return {
-    empurrar: function (dados) {
-      if (!ligado) return;
-      const novo = new Uint8Array(buf.length + dados.length);
-      novo.set(buf, 0);
-      novo.set(dados, buf.length);
-      buf = novo;
-      processar();
-    },
-    modoSimples: function () { modoSimples = true; sincronizado = false; },
-    desligar: function () { ligado = false; }
-  };
-}
-
-function juntarBytes(lista) {
-  let total = 0;
-  lista.forEach(function (b) { total += b.length; });
-  const out = new Uint8Array(total);
-  let p = 0;
-  lista.forEach(function (b) { out.set(b, p); p += b.length; });
-  return out;
-}
-
-function comAdts(frame, asc) {
-  if (!asc || asc.length < 2) return frame;
-  const objType = (asc[0] >> 3) & 0x1F;
-  const perfil = Math.max(0, objType - 1);
-  const freq = ((asc[0] & 0x07) << 1) | ((asc[1] >> 7) & 0x01);
-  const canais = (asc[1] >> 3) & 0x0F;
-  const tam = frame.length + 7;
-  const h = new Uint8Array(7);
-  h[0] = 0xFF; h[1] = 0xF1;
-  h[2] = (perfil << 6) | (freq << 2) | ((canais >> 2) & 1);
-  h[3] = ((canais & 3) << 6) | ((tam >> 11) & 3);
-  h[4] = (tam >> 3) & 0xFF;
-  h[5] = ((tam & 7) << 5) | 0x1F;
-  h[6] = 0xFC;
-  const out = new Uint8Array(tam);
-  out.set(h, 0);
-  out.set(frame, 7);
-  return out;
-}
-
-/* ========================== RESGATE DE AUDIO ======================== */
-
-const audio = {
-  ctx: null,
-  ganho: null,
-  ativo: false,
-  abort: null,
-  leitor: null,
-  parser: null,
-  trackNum: 0,
-  asc: null,
-  aac: false,
-  pendente: [],
-  pendenteTs: 0,
-  pendenteTam: 0,
-  fila: [],
-  fontes: [],
-  ultimoTs: 0,
-  processando: false,
-  falhas: 0,
-  info: null
-};
-
-function pararResgate() {
-  audio.ativo = false;
-  if (audio.abort) { try { audio.abort.abort(); } catch (e) { } audio.abort = null; }
-  if (audio.parser) { audio.parser.desligar(); audio.parser = null; }
-  audio.fontes.forEach(function (s) { try { s.stop(); } catch (e) { } });
-  audio.fontes = [];
-  audio.fila = [];
-  audio.pendente = [];
-  audio.pendenteTam = 0;
-  audio.pendenteTs = 0;
-  audio.ultimoTs = 0;
-  audio.leitor = null;
-}
-
-function volumeAplicado() {
-  return state.mudo ? 0 : state.volume;
-}
-
-async function analisarCabecalho() {
-  const alvo = API_BASE + state.streamUrl;
-  const res = await fetch(alvo, { headers: { Range: 'bytes=0-1048575' } });
-  const dados = new Uint8Array(await res.arrayBuffer());
-  const info = { container: '?', audio: [] };
-  if (dados.length > 8 && dados[0] === 0x1A && dados[1] === 0x45 && dados[2] === 0xDF && dados[3] === 0xA3) info.container = 'mkv';
-  else if (dados.length > 12 && dados[4] === 0x66 && dados[5] === 0x74 && dados[6] === 0x79 && dados[7] === 0x70) info.container = 'mp4';
-  if (info.container !== 'mkv') return info;
-
-  const parser = criarParserMkv({
-    aoFaixa: function (f) { info.audio.push(f); },
-    aoFrame: function () { }
-  });
-  parser.empurrar(dados);
-  parser.desligar();
-  return info;
-}
-
-function decidirResgate(info) {
-  if (!info || info.container !== 'mkv') return false;
-  const faixas = info.audio || [];
-  if (!faixas.length) return false;
-
-  const pt = faixas.filter(function (f) { return /por|pt|bra|portugu/.test(f.lang); })[0];
-  const alvo = pt || faixas[0];
-  const codec = String(alvo.codec || '').toLowerCase();
-
-  const seguro = /(a_aac|aac|a_mp3|mp3|a_opus|a_vorbis|a_flac|a_ac3|eac3|ec-3)/.test(codec);
-  const problematico = /(dts|dca|truehd|mlp|pcm|lpcm|a_real)/.test(codec);
-  const primeiro = faixas[0] === alvo;
-
-  if (problematico) return true;
-  if (!primeiro) return true;
-  if (!seguro) return true;
-  return false;
-}
-
-async function iniciarResgate(info, inicioBytes) {
-  pararResgate();
-
-  const faixas = info.audio || [];
-  const pt = faixas.filter(function (f) { return /por|pt|bra|portugu/.test(f.lang); })[0];
-  const alvo = pt || faixas[0];
-  if (!alvo) return;
-
-  audio.info = info;
-  audio.trackNum = alvo.numero;
-  audio.asc = alvo.codecPrivado || null;
-  audio.aac = /aac/i.test(alvo.codec || '');
-
-  if (!audio.ctx) {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    audio.ctx = new Ctx();
-    audio.ganho = audio.ctx.createGain();
-    audio.ganho.gain.value = volumeAplicado();
-    audio.ganho.connect(audio.ctx.destination);
-  }
-  try { if (audio.ctx.state === 'suspended') await audio.ctx.resume(); } catch (e) { }
-
-  const ctrl = new AbortController();
-  audio.abort = ctrl;
-  audio.ativo = true;
-  audio.falhas = 0;
-  audio.ultimoTs = 0;
-
-  const parser = criarParserMkv({
-    aoFaixa: function () { },
-    aoFrame: function (tn, ts, bytes) {
-      if (tn !== audio.trackNum) return;
-      if (ts + 0.4 < els.video.currentTime - 1) return;
-      let b = bytes;
-      if (audio.aac) b = comAdts(bytes, audio.asc);
-      if (audio.pendenteTs === 0) audio.pendenteTs = ts;
-      audio.pendente.push(new Uint8Array(b));
-      audio.pendenteTam += b.length;
-      if (ts - audio.pendenteTs >= 0.45) descarregar();
-    }
-  });
-  if (inicioBytes > 0) parser.modoSimples();
-  audio.parser = parser;
-
-  try {
-    const res = await fetch(API_BASE + state.streamUrl, {
-      headers: { Range: 'bytes=' + inicioBytes + '-' },
-      signal: ctrl.signal
-    });
-    if (!res.body) throw new Error('sem corpo');
-    audio.leitor = res.body.getReader();
-  } catch (e) {
-    audio.ativo = false;
-    return;
-  }
-
-  while (audio.ativo) {
-    if (audio.ultimoTs - els.video.currentTime > 12) { await esperar(150); continue; }
-    let r;
-    try { r = await audio.leitor.read(); } catch (e) { break; }
-    if (r.done) break;
-    parser.empurrar(r.value);
-  }
-}
-
-function descarregar() {
-  if (!audio.pendente.length) return;
-  const dados = juntarBytes(audio.pendente);
-  const ts = audio.pendenteTs;
-  audio.pendente = [];
-  audio.pendenteTam = 0;
-  audio.pendenteTs = 0;
-  audio.fila.push({ ts: ts, dados: dados });
-  processarFila();
-}
-
-async function processarFila() {
-  if (audio.processando) return;
-  audio.processando = true;
-  while (audio.fila.length && audio.ativo) {
-    const item = audio.fila.shift();
-    if (item.ts + 1 < els.video.currentTime - 0.5) continue;
-    try {
-      const copia = item.dados.slice(0);
-      const buf = await audio.ctx.decodeAudioData(copia.buffer);
-      agendar(item.ts, buf);
-      audio.falhas = 0;
-      if (els.video.muted !== true && audio.fontes.length === 1) {
-        els.video.muted = true;
-        audio.ganho.gain.value = volumeAplicado();
-      }
-    } catch (e) {
-      audio.falhas++;
-      if (audio.falhas > 12) { audio.ativo = false; els.video.muted = false; }
-    }
-  }
-  audio.processando = false;
-}
-
-function agendar(ts, buf) {
-  const agora = audio.ctx.currentTime;
-  let quando = agora + (ts - els.video.currentTime);
-  if (quando < agora + 0.02) quando = agora + 0.02;
-  const src = audio.ctx.createBufferSource();
-  src.buffer = buf;
-  src.connect(audio.ganho);
-  try { src.start(quando); } catch (e) { return; }
-  audio.fontes.push(src);
-  audio.ultimoTs = Math.max(audio.ultimoTs, ts + buf.duration);
-  src.onended = function () {
-    const i = audio.fontes.indexOf(src);
-    if (i >= 0) audio.fontes.splice(i, 1);
-  };
-}
-
-function byteEstimado(t) {
-  const dur = els.video.duration;
-  if (!dur || !isFinite(dur) || !state.total) return 0;
-  return Math.max(0, Math.floor((t / dur) * state.total));
-}
-
-async function reiniciarResgate() {
-  if (!audio.info) return;
-  const t = els.video.currentTime;
-  pararResgate();
-  audio.fontes.forEach(function (s) { try { s.stop(); } catch (e) { } });
-  audio.fontes = [];
-  await iniciarResgate(audio.info, byteEstimado(t));
-}
-
 /* =============================== PLAYER ============================ */
 
 function abrirPlayer(titulo) {
@@ -1968,10 +1515,25 @@ function abrirPlayer(titulo) {
   state.subs = [];
   state.legendaAtiva = null;
   state.tentativa = 0;
-  pararResgate();
+  state.ss = 0;
+  state.duracao = 0;
+  state.sess = null;
+  state.modoHls = false;
+  state.audio = null;
+  state.faixas = [];
+  state.recarregando = false;
+  state.ultimoRecarregar = 0;
+  state.ultimoProgresso = Date.now();
+  clearTimeout(state.introTimer);
+  clearTimeout(state.guardTimer);
+  if (hls) { try { hls.destroy(); } catch (e) { } hls = null; }
+  if (els.pvIntro) els.pvIntro.classList.remove('on', 'saindo');
+  if (els.selAudio) { els.selAudio.innerHTML = ''; els.selAudio.classList.add('hidden'); }
+  els.video.muted = false;
   els.video.removeAttribute('src');
   $$('#video track').forEach(function (t) { t.remove(); });
   els.video.load();
+  atualizarBotaoCC();
   els.pvTitle.textContent = titulo || 'Reproduzindo';
   els.pvCenter.classList.remove('oculto');
   els.pvMsg.textContent = 'Buscando fontes DUAL 5.1 PT-BR...';
@@ -1995,7 +1557,10 @@ function fecharPlayer() {
   }
   clearTimeout(state.poll);
   clearTimeout(state.esconderTimer);
-  pararResgate();
+  clearTimeout(state.introTimer);
+  clearTimeout(state.guardTimer);
+  if (hls) { try { hls.destroy(); } catch (e) { } hls = null; }
+  if (els.pvIntro) els.pvIntro.classList.remove('on', 'saindo');
   try { els.video.pause(); } catch (e) { }
   els.video.removeAttribute('src');
   els.video.load();
@@ -2046,13 +1611,16 @@ async function iniciarJob(fonte) {
   state.podeTocar = false;
   state.legendaAtiva = null;
   state.subs = [];
-  pararResgate();
+  state.faixas = [];
+  state.audio = null;
+  if (hls) { try { hls.destroy(); } catch (e) { } hls = null; }
   els.video.removeAttribute('src');
   $$('#video track').forEach(function (t) { t.remove(); });
   els.video.load();
   els.pvCenter.classList.remove('oculto');
   els.pvMsg.textContent = 'Conectando aos peers...';
   els.pvFill.style.width = '0%';
+  if (els.selAudio) { els.selAudio.innerHTML = ''; els.selAudio.classList.add('hidden'); }
 
   try {
     const data = await api('/api/play', {
@@ -2095,24 +1663,226 @@ function erroPlayer(msg, permitirTroca) {
   $('#pvSair').addEventListener('click', fecharPlayer);
 }
 
-let analiseEmCurso = false;
+/* --------------------- sessao HLS / seek livre --------------------- */
+
+function urlHls(ss) {
+  const p = {
+    jobId: state.job,
+    hls: 1,
+    ss: Math.max(0, Math.floor(ss || 0)),
+    sess: state.sess
+  };
+  if (state.audio !== null && state.audio !== undefined) p.audio = state.audio;
+  return url('/api/play/stream', p);
+}
+
+function urlDireto(pos) {
+  const p = { jobId: state.job, modo: 'transcode', t: Math.max(0, Math.floor(pos || 0)) };
+  if (state.audio !== null && state.audio !== undefined) p.audio = state.audio;
+  return url('/api/play/stream', p);
+}
+
+function usarModoDireto(pos) {
+  state.modoHls = false;
+  if (hls) { try { hls.destroy(); } catch (e) { } hls = null; }
+  els.video.src = urlDireto(pos);
+  tentarPlay();
+}
+
+function iniciarHls(ss) {
+  if (!state.job) return;
+  state.sess = String(Date.now());
+  state.ultimoRecarregar = Date.now();
+  state.ultimoProgresso = Date.now();
+
+  if (hls) { try { hls.destroy(); } catch (e) { } hls = null; }
+
+  if (!window.Hls || !window.Hls.isSupported()) { usarModoDireto(ss); return; }
+
+  const destino = urlHls(ss);
+  hls = new window.Hls({
+    enableWorker: true,
+    lowLatencyMode: false,
+    backBufferLength: 60,
+    maxBufferLength: 60,
+    maxMaxBufferLength: 180,
+    startPosition: -1,
+    liveSyncDurationCount: 3,
+    liveMaxLatencyDurationCount: Infinity,
+    maxLiveSyncPlaybackRate: 1,
+    manifestLoadingMaxRetry: 60,
+    manifestLoadingRetryDelay: 400,
+    manifestLoadingTimeOut: 20000,
+    fragLoadingMaxRetry: 60,
+    levelLoadingMaxRetry: 60
+  });
+  hls.attachMedia(els.video);
+  hls.on(window.Hls.Events.MEDIA_ATTACHED, function () { hls.loadSource(destino); });
+  hls.on(window.Hls.Events.ERROR, function (ev, d) {
+    if (!d || !d.fatal) return;
+    if (d.type === window.Hls.ErrorTypes.NETWORK_ERROR) { try { hls.startLoad(); } catch (e) { } }
+    else if (d.type === window.Hls.ErrorTypes.MEDIA_ERROR) { try { hls.recoverMediaError(); } catch (e) { } }
+    else if (state.duracao) seekParaSegundos(state.ss);
+  });
+}
+
+function recarregarPlaylist() {
+  if (!hls || !state.podeTocar || state.recarregando || !state.modoHls) return;
+  state.recarregando = true;
+  state.ultimoRecarregar = Date.now();
+  const pos = els.video.currentTime || 0;
+  try {
+    hls.config.startPosition = pos;
+    hls.loadSource(urlHls(state.ss));
+  } catch (e) { }
+  setTimeout(function () { state.recarregando = false; }, 2000);
+}
+
+function vigiarPlayer() {
+  if (!state.podeTocar || !state.modoHls || state.recarregando) return;
+  if (els.video.paused || els.video.ended) { state.ultimoProgresso = Date.now(); return; }
+  if (Date.now() - state.ultimoProgresso < 12000) return;
+  recarregarPlaylist();
+  setTimeout(tentarPlay, 700);
+}
+
+function armarGuarda() {
+  clearTimeout(state.guardTimer);
+  state.guardTimer = setTimeout(function () {
+    if (!state.podeTocar || !state.modoHls) return;
+    if (els.video.readyState >= 2 && !els.video.paused) return;
+    toast('Alternando motor de video...');
+    usarModoDireto(state.ss);
+  }, 16000);
+}
+
+function seekParaSegundos(seg) {
+  if (!state.job) return;
+  const alvo = Math.max(0, Math.min((state.duracao || 0) - 1, Math.floor(seg)));
+
+  if (!state.modoHls) {
+    state.ss = 0;
+    els.video.src = urlDireto(alvo);
+    atualizarTempo();
+    tentarPlay();
+    return;
+  }
+
+  state.ss = alvo;
+  els.pvCenter.classList.remove('oculto');
+  els.pvMsg.textContent = 'Carregando ' + fmtTime(alvo) + '...';
+  els.pvStats.textContent = '';
+  atualizarTempo();
+  iniciarHls(alvo);
+}
+
+function pular(segundos) {
+  if (!state.podeTocar) return;
+  const base = state.modoHls ? posicaoAbsoluta() : (els.video.currentTime || 0);
+  const alvo = base + segundos;
+  if (state.modoHls) seekParaSegundos(alvo);
+  else if (isFinite(els.video.duration)) els.video.currentTime = Math.max(0, Math.min(els.video.duration - 1, alvo));
+  mostrarControles();
+}
+
+function reiniciar() {
+  if (!state.podeTocar) return;
+  state.ss = 0;
+  els.pvCenter.classList.add('oculto');
+  els.pvProgress.style.width = '0%';
+  els.pvKnob.style.left = '0%';
+  els.pvTime.textContent = '0:00 / ' + fmtTime(state.duracao);
+  if (state.modoHls) iniciarHls(0);
+  else { try { els.video.currentTime = 0; } catch (e) { } }
+  tentarPlay();
+  mostrarControles();
+}
+
+/* --------------------------- intro + tudum ------------------------- */
+
+function tocarTudum() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const t = ctx.currentTime;
+
+    const grave = ctx.createOscillator();
+    grave.type = 'sine';
+    grave.frequency.setValueAtTime(170, t);
+    grave.frequency.exponentialRampToValueAtTime(40, t + 1.3);
+    const g1 = ctx.createGain();
+    g1.gain.setValueAtTime(0.0001, t);
+    g1.gain.exponentialRampToValueAtTime(0.85, t + 0.06);
+    g1.gain.exponentialRampToValueAtTime(0.0001, t + 1.7);
+    grave.connect(g1).connect(ctx.destination);
+    grave.start(t); grave.stop(t + 1.8);
+
+    const brilho = ctx.createOscillator();
+    brilho.type = 'triangle';
+    brilho.frequency.setValueAtTime(920, t + 0.02);
+    brilho.frequency.exponentialRampToValueAtTime(210, t + 1.0);
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.0001, t);
+    g2.gain.exponentialRampToValueAtTime(0.22, t + 0.07);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 1.2);
+    brilho.connect(g2).connect(ctx.destination);
+    brilho.start(t + 0.02); brilho.stop(t + 1.3);
+
+    setTimeout(function () { try { ctx.close(); } catch (e) { } }, 2600);
+  } catch (e) { }
+}
+
+function tentarPlay() {
+  const p = els.video.play();
+  if (p && p.catch) p.catch(function () { });
+}
+
+function mostrarIntro() {
+  if (!els.pvIntro) { tentarPlay(); return; }
+  clearTimeout(state.introTimer);
+  els.pvIntro.classList.remove('saindo');
+  els.pvIntro.classList.add('on');
+  els.video.muted = true;
+  state.introFim = Date.now() + INTRO_MS;
+  tocarTudum();
+  state.introTimer = setTimeout(function () { finalizarIntro(); }, INTRO_MS);
+}
+
+function finalizarIntro() {
+  clearTimeout(state.introTimer);
+  esconderIntro();
+  els.video.muted = state.mudo;
+  tentarPlay();
+}
+
+function esconderIntro() {
+  if (!els.pvIntro || !els.pvIntro.classList.contains('on')) return;
+  els.pvIntro.classList.add('saindo');
+  setTimeout(function () { els.pvIntro.classList.remove('on', 'saindo'); }, 520);
+}
+
+/* ----------------------------- overlay ----------------------------- */
 
 function atualizarOverlay(s) {
   if (s.total) state.total = s.total;
+  if (s.duracao) state.duracao = s.duracao;
 
   if (s.canPlay && !state.podeTocar) {
     state.podeTocar = true;
     state.streamUrl = s.streamUrl;
-    els.video.src = API_BASE + s.streamUrl;
-    const p = els.video.play();
-    if (p && p.catch) p.catch(function () { });
+    state.modoHls = !!s.hls;
+    state.ultimoProgresso = Date.now();
+    mostrarIntro();
+    iniciarHls(0);
     carregarLegendas();
-    if (!analiseEmCurso) {
-      analiseEmCurso = true;
-      analisarCabecalho().then(function (info) {
-        if (decidirResgate(info)) iniciarResgate(info, 0);
-      }).catch(function () { }).then(function () { analiseEmCurso = false; });
-    }
+    carregarFaixas();
+    armarGuarda();
+  }
+
+  if (s.hlsErro && state.modoHls && els.video.readyState < 2) {
+    state.modoHls = false;
+    usarModoDireto(state.ss);
   }
 
   els.pvFill.style.width = Math.max(2, Math.min(100, s.buffer || 0)).toFixed(0) + '%';
@@ -2121,8 +1891,8 @@ function atualizarOverlay(s) {
     els.pvMsg.textContent = s.message || 'Conectando aos peers...';
     els.pvStats.textContent = (s.buffer || 0).toFixed(1) + '% | ' + s.peers + ' peers | ' +
       fmtSpeed(s.speed) + ' | ' + fmtSize(s.downloaded) + ' de ' + fmtSize(s.total);
-  } else {
-    els.pvMsg.textContent = 'Iniciando...';
+  } else if (!els.pvCenter.classList.contains('oculto')) {
+    els.pvMsg.textContent = 'Preparando video...';
     els.pvStats.textContent = s.peers + ' peers | ' + fmtSpeed(s.speed);
   }
 }
@@ -2134,7 +1904,56 @@ async function poll() {
     atualizarOverlay(s);
     if (s.state === 'erro') { erroPlayer(s.message); return; }
   } catch (e) { erroPlayer(e.message); return; }
-  state.poll = setTimeout(poll, state.podeTocar ? 2500 : 700);
+  state.poll = setTimeout(poll, state.podeTocar ? 2000 : 700);
+}
+
+/* --------------------------- faixas de audio ----------------------- */
+
+async function carregarFaixas() {
+  if (!state.job) return;
+  let faixas = [];
+  let atual = null;
+  try {
+    const d = await api('/api/play/faixas', { jobId: state.job });
+    faixas = d.faixas || [];
+    atual = d.audio;
+  } catch (e) {
+    try {
+      const s = await api('/api/play/status', { jobId: state.job });
+      faixas = s.audioFaixas || [];
+      atual = s.audioIdx;
+    } catch (er) { }
+  }
+  preencherFaixas(faixas, atual);
+}
+
+function preencherFaixas(faixas, atual) {
+  const sel = els.selAudio;
+  if (!sel) return;
+  state.faixas = faixas || [];
+  if (state.faixas.length < 2) { sel.classList.add('hidden'); return; }
+
+  sel.innerHTML = state.faixas.map(function (f, i) {
+    const lang = String(f.lang || 'und').toUpperCase();
+    const pt = f.ptbr ? ' &#9733;' : '';
+    return '<option value="' + i + '">' + lang + pt + ' · ' + esc(f.titulo || f.codec || '') + '</option>';
+  }).join('');
+  sel.classList.remove('hidden');
+
+  if (atual !== null && atual !== undefined && state.faixas[atual]) sel.value = String(atual);
+  else {
+    const pt = state.faixas.findIndex(function (f) { return f.ptbr; });
+    sel.value = String(pt >= 0 ? pt : 0);
+  }
+
+  sel.onchange = function () {
+    const idx = Number(sel.value);
+    const pos = state.modoHls ? posicaoAbsoluta() : (els.video.currentTime || 0);
+    state.audio = idx;
+    toast('Trocando faixa de audio...');
+    if (state.modoHls) seekParaSegundos(pos);
+    else els.video.src = urlDireto(pos);
+  };
 }
 
 /* ----------------------------- legendas ---------------------------- */
@@ -2151,9 +1970,15 @@ async function carregarLegendas() {
   } catch (e) { }
 }
 
+function atualizarBotaoCC() {
+  const b = $('#pvCC');
+  if (b) b.classList.toggle('ativo', state.legendaAtiva !== null && state.legendaAtiva !== undefined);
+}
+
 function aplicarLegenda(idx) {
   $$('#video track').forEach(function (t) { t.remove(); });
   state.legendaAtiva = idx;
+  atualizarBotaoCC();
   if (idx === null || idx === undefined) return;
   const s = state.subs.filter(function (x) { return x.idx === idx; })[0];
   if (!s) return;
@@ -2241,25 +2066,26 @@ function alternarPlay() {
   else els.video.pause();
 }
 
-function pular(segundos) {
-  if (!isFinite(els.video.duration)) return;
-  els.video.currentTime = Math.max(0, Math.min(els.video.duration - 1, els.video.currentTime + segundos));
-  mostrarControles();
-}
-
 function atualizarTempo() {
-  const dur = isFinite(els.video.duration) ? els.video.duration : 0;
-  const atual = els.video.currentTime || 0;
+  const dur = state.duracao || (isFinite(els.video.duration) ? els.video.duration : 0);
+  const atual = state.modoHls ? posicaoAbsoluta() : (els.video.currentTime || 0);
   const pct = dur ? Math.min(100, (atual / dur) * 100) : 0;
   els.pvProgress.style.width = pct + '%';
   els.pvKnob.style.left = pct + '%';
   els.pvTime.textContent = fmtTime(atual) + ' / ' + fmtTime(dur);
 }
 
-function seekPara(clientX) {
+function pctSeek(clientX) {
   const r = els.pvSeek.getBoundingClientRect();
-  const pct = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
-  if (isFinite(els.video.duration)) els.video.currentTime = pct * els.video.duration;
+  return Math.max(0, Math.min(1, (clientX - r.left) / r.width));
+}
+
+function previaSeek(clientX) {
+  const pct = pctSeek(clientX);
+  els.pvProgress.style.width = (pct * 100) + '%';
+  els.pvKnob.style.left = (pct * 100) + '%';
+  const dur = state.duracao || (isFinite(els.video.duration) ? els.video.duration : 0);
+  if (dur) els.pvTime.textContent = fmtTime(pct * dur) + ' / ' + fmtTime(dur);
 }
 
 /* ------------------------------ wiring ----------------------------- */
@@ -2315,14 +2141,16 @@ function wire() {
   $('#pvPlay').addEventListener('click', alternarPlay);
   $('#pvBack30').addEventListener('click', function () { pular(-30); });
   $('#pvFwd30').addEventListener('click', function () { pular(30); });
+  if ($('#pvReiniciar')) $('#pvReiniciar').addEventListener('click', reiniciar);
   $('#pvCC').addEventListener('click', abrirSheetLegendas);
+
+  if (els.pvIntro) els.pvIntro.addEventListener('click', finalizarIntro);
 
   $('#pvMute').addEventListener('click', function () {
     state.mudo = !state.mudo;
     els.icoVol.classList.toggle('hidden', state.mudo);
     els.icoMudo.classList.toggle('hidden', !state.mudo);
-    if (audio.ativo && audio.ganho) audio.ganho.gain.value = volumeAplicado();
-    else els.video.muted = state.mudo;
+    els.video.muted = state.mudo;
   });
 
   $('#pvFull').addEventListener('click', function () {
@@ -2334,15 +2162,21 @@ function wire() {
   els.pvSeek.addEventListener('pointerdown', function (e) {
     state.arrastandoSeek = true;
     try { els.pvSeek.setPointerCapture(e.pointerId); } catch (err) { }
-    seekPara(e.clientX);
+    previaSeek(e.clientX);
+    mostrarControles();
   });
-  els.pvSeek.addEventListener('pointermove', function (e) { if (state.arrastandoSeek) seekPara(e.clientX); });
-  els.pvSeek.addEventListener('pointerup', function () { state.arrastandoSeek = false; });
+  els.pvSeek.addEventListener('pointermove', function (e) { if (state.arrastandoSeek) previaSeek(e.clientX); });
+  els.pvSeek.addEventListener('pointerup', function (e) {
+    if (!state.arrastandoSeek) return;
+    state.arrastandoSeek = false;
+    const dur = state.duracao || (isFinite(els.video.duration) ? els.video.duration : 0);
+    if (dur) seekParaSegundos(pctSeek(e.clientX) * dur);
+  });
   els.pvSeek.addEventListener('pointercancel', function () { state.arrastandoSeek = false; });
 
   els.player.addEventListener('pointermove', mostrarControles);
   els.player.addEventListener('pointerdown', function (e) {
-    if (e.target.closest('.pv-bottom') || e.target.closest('.pv-top') || e.target.closest('.pv-sheet')) { mostrarControles(); return; }
+    if (e.target.closest('.pv-bottom') || e.target.closest('.pv-top') || e.target.closest('.pv-sheet') || e.target.closest('.pv-intro')) { mostrarControles(); return; }
     if (!els.player.classList.contains('controles-ocultos')) els.player.classList.add('controles-ocultos');
     else mostrarControles();
   });
@@ -2350,17 +2184,18 @@ function wire() {
   els.video.addEventListener('loadedmetadata', atualizarTempo);
   els.video.addEventListener('play', function () {
     els.icoPlay.classList.add('hidden'); els.icoPause.classList.remove('hidden'); mostrarControles();
-    if (audio.ctx && audio.ctx.state === 'suspended') { try { audio.ctx.resume(); } catch (e) { } }
   });
   els.video.addEventListener('pause', function () {
     els.icoPlay.classList.remove('hidden'); els.icoPause.classList.add('hidden'); mostrarControles();
-    if (audio.ctx && audio.ctx.state === 'running') { try { audio.ctx.suspend(); } catch (e) { } }
   });
   els.video.addEventListener('playing', function () {
-    els.pvCenter.classList.add('oculto'); mostrarControles();
+    els.pvCenter.classList.add('oculto');
+    state.ultimoProgresso = Date.now();
+    clearTimeout(state.guardTimer);
+    mostrarControles();
   });
   els.video.addEventListener('waiting', function () {
-    if (state.podeTocar) {
+    if (state.podeTocar && els.video.currentTime > 0 && !state.recarregando) {
       els.pvCenter.classList.remove('oculto');
       els.pvMsg.textContent = 'Carregando mais dados...';
       els.pvStats.textContent = '';
@@ -2368,16 +2203,21 @@ function wire() {
   });
   els.video.addEventListener('timeupdate', function () {
     atualizarTempo();
+    state.ultimoProgresso = Date.now();
     const agora = Date.now();
     if (agora - state.ultimoSalvar < 5000) return;
     state.ultimoSalvar = agora;
     salvarProgresso();
   });
-  els.video.addEventListener('seeked', function () {
-    if (audio.ativo) reiniciarResgate();
+  els.video.addEventListener('ended', function () {
+    if (!state.modoHls || !state.podeTocar) return;
+    if (posicaoAbsoluta() < state.duracao - 8) {
+      recarregarPlaylist();
+      setTimeout(tentarPlay, 900);
+    }
   });
   els.video.addEventListener('error', function () {
-    if (state.podeTocar) toast('Falha na reproducao. Use Fontes para trocar.', 'error');
+    if (state.podeTocar && !state.recarregando) toast('Falha na reproducao. Use Fontes para trocar.', 'error');
   });
 
   document.addEventListener('keydown', function (e) {
@@ -2386,6 +2226,7 @@ function wire() {
       if (e.key === ' ') { e.preventDefault(); alternarPlay(); }
       if (e.key === 'ArrowLeft') pular(-30);
       if (e.key === 'ArrowRight') pular(30);
+      if (e.key === 'Home') reiniciar();
       if (e.key === 'f' || e.key === 'F') $('#pvFull').click();
       return;
     }
@@ -2398,6 +2239,9 @@ function wire() {
       if (navigator.sendBeacon) navigator.sendBeacon(u); else fetch(u, { keepalive: true }).catch(function () { });
     }
   });
+
+  if (state.vigiaTimer) clearInterval(state.vigiaTimer);
+  state.vigiaTimer = setInterval(vigiarPlayer, 2000);
 }
 
 /* -------------------------------- init ----------------------------- */
@@ -2417,165 +2261,21 @@ async function init() {
 
 init();
 '@
-Write-ProjectFile 'public/app.js' $appJs
 
-# ======================================================================
-Write-Step 'Configuracao'
-
-# ----------------------------------------------------------------------
-$envPath = Join-Path $Root '.env'
-$existingKey = ''
-if (Test-Path -LiteralPath $envPath) {
-    $existing = [System.IO.File]::ReadAllText($envPath)
-    $m = [regex]::Match($existing, '(?m)^\s*TMDB_API_KEY\s*=\s*(.*)$')
-    if ($m.Success) { $existingKey = $m.Groups[1].Value.Trim() }
-}
-$keyToWrite = 'SUA_CHAVE_AQUI'
-if ($existingKey -ne '' -and $existingKey -ne 'SUA_CHAVE_AQUI') { $keyToWrite = $existingKey }
-
-$envContent = @"
-# ============================================================
-#  CineP2P 8.0 - stream bruto + audio decodificado no navegador
-#  TMDB_API_KEY obrigatoria. https://www.themoviedb.org/settings/api
-# ============================================================
-TMDB_API_KEY=$keyToWrite
-TMDB_LANGUAGE=pt-BR
-TMDB_REGION=BR
-
-# Servidor
-PORT=3000
-HOST=0.0.0.0
-
-# Filtros
-FILTRO_ESTRITO=1
-FILTRO_INSTALADOR=1
-
-# Scrapers (vazio = todos)
-SCRAPER_TIMEOUT=9
-SCRAPERS_ENABLED=
-
-# Player - modo BRUTO: nenhum ffmpeg, CPU zero, inicio instantaneo
-TRANSCODE=nunca
-METADATA_TIMEOUT=60
-BUFFER_TIMEOUT=150
-MAX_CONNS=300
-MAX_JOBS=3
-IDLE_TIMEOUT=900000
-MIN_BUFFER_PERCENT=1
-MIN_BUFFER_MB=2
-
-# uTP: 0 = somente TCP
-ENABLE_UTP=0
-
-# Legendas
-MAX_SUBS=8
-
-# Limpeza de disco: session = apaga ao fechar | keep = mantem cache
-CACHE_MODE=session
-TORRENT_CACHE_DIR=cache
-"@
-Write-ProjectFile '.env' $envContent
-Write-ProjectFile '.env.example' ($envContent -replace [regex]::Escape($keyToWrite), 'SUA_CHAVE_AQUI')
-if ($keyToWrite -ne 'SUA_CHAVE_AQUI') { Write-Host '  TMDB_API_KEY preservada' -ForegroundColor DarkGray }
-
-# ----------------------------------------------------------------------
-$packageJson = @'
-{
-  "name": "cinep2p",
-  "version": "8.0.0",
-  "private": true,
-  "description": "Streaming P2P com filtro IMDb e audio decodificado no proprio navegador.",
-  "type": "commonjs",
-  "main": "server.js",
-  "scripts": { "start": "node server.js", "dev": "node server.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "webtorrent": "^1.9.7"
-  },
-  "optionalDependencies": {
-    "@ffmpeg-installer/ffmpeg": "^1.1.0",
-    "@ffprobe-installer/ffprobe": "^2.1.2",
-    "fluent-ffmpeg": "^2.1.3"
-  }
-}
-'@
-Write-ProjectFile 'package.json' $packageJson
-
-# ----------------------------------------------------------------------
-$readme = @'
-# CineP2P 8.0
-
-## Arquitetura do player
-
-Servidor serve o arquivo BitTorrent BRUTO com `Range: bytes`. Zero CPU,
-zero ffmpeg, sem ffprobe. O video comeca com 1% de buffer.
-
-O audio e resolvido no navegador:
-
-1. Ao iniciar o video, o frontend baixa os primeiros 1 MB e faz o parse do
-   cabecalho MKV em JavaScript (EBML puro).
-2. Identifica as faixas de audio, o codec e o idioma de cada uma.
-3. Se a faixa em portugues nao for a primeira, ou o codec for AC3/EAC3/DTS/
-   TrueHD/PCM (que o navegador nao decodifica), ativa o RESGATE:
-   - segunda conexao HTTP com Range no mesmo stream;
-   - demux MKV em JS (SimpleBlock, lacing Xiph/EBML/fixo, timecodes);
-   - decodificacao via Web Audio API (`decodeAudioData`), com envelope ADTS
-     automatico para AAC;
-   - agendamento dos buffers contra `video.currentTime`, com video mutado.
-
-Resultado: audio em portugues audivel, sem transcode no servidor e sem
-nenhum player externo.
-
-## Filtros
-- `src/validar.js` descarta links de outros filmes (titulo + ano vs IMDb).
-- `src/ranking.js` descarta instaladores, ativadores, ISOs, RAR/ZIP, cracks.
-  Desligue com `FILTRO_INSTALADOR=0`.
-
-## Rodar
-`npm start` -> http://localhost:3000
-
-## Voltar ao transcode
-`TRANSCODE=auto` (so quando o codec exigir) ou `TRANSCODE=sempre`.
-Nesses modos o ffmpeg entra em acao; sem ele o app continua funcionando
-em modo bruto.
-'@
-Write-ProjectFile 'README.md' $readme
-
-# ======================================================================
-if (-not $SkipInstall) {
-    Write-Step 'Instalando dependencias'
-    if (Get-Command npm -ErrorAction SilentlyContinue) {
-        Push-Location -LiteralPath $Root
-        try {
-            & npm install --no-fund --no-audit --loglevel=error
-            if ($LASTEXITCODE -ne 0) { Write-Host '  npm install com erro. Rode manualmente.' -ForegroundColor Yellow }
-        } finally { Pop-Location }
-    } else { Write-Host '  npm nao encontrado. Instale Node.js 18+.' -ForegroundColor Yellow }
-} else { Write-Step 'npm install ignorado' }
-
-Write-Step 'Validando'
-if (Get-Command node -ErrorAction SilentlyContinue) {
-    Push-Location -LiteralPath $Root
-    try {
-        & node -e "require('./src/validar');require('./src/ranking');require('./src/magnets');require('./src/scrapers');const s=require('./src/streamer');console.log('  modulos ok | modo:', s.MODO_TRANSCODE)"
-    } catch { }
-    finally { Pop-Location }
+Write-Host ""
+Write-Host "Verificando sintaxe..." -ForegroundColor Cyan
+$node = Get-Command node -ErrorAction SilentlyContinue
+if ($node) {
+    foreach ($f in @('src\streamer.js', 'public\app.js')) {
+        $r = & node --check (Join-Path $Raiz $f) 2>&1
+        if ($LASTEXITCODE -eq 0) { Write-Host ("  [ok] " + $f) -ForegroundColor Green }
+        else { Write-Host ("  [ERRO] " + $f + " -> " + $r) -ForegroundColor Red }
+    }
+} else {
+    Write-Host '  node nao encontrado no PATH.' -ForegroundColor Yellow
 }
 
-Write-Host ''
-Write-Host '==================================================================' -ForegroundColor Green
-Write-Host ' CineP2P 8.0 aplicado' -ForegroundColor Green
-Write-Host '==================================================================' -ForegroundColor Green
-Write-Host ''
-Write-Host ' Servidor: stream bruto com Range, CPU zero, sem ffmpeg' -ForegroundColor White
-Write-Host ' Player: demux MKV em JS + Web Audio, faixa PT automatica' -ForegroundColor White
-Write-Host ' Ranking: descarte de instalador/ativador/ISO' -ForegroundColor White
-Write-Host ''
-Write-Host ' PROXIMOS PASSOS:' -ForegroundColor Yellow
-Write-Host '   1) npm start'
-Write-Host '   2) http://localhost:3000'
-Write-Host ''
-if ($madeBackup) { Write-Host (' Backup: ' + (Split-Path -Leaf $BackupDir)) -ForegroundColor DarkGray }
-Write-Host ''
+Write-Host ""
+Write-Host "Reinicie o servidor (Ctrl+C e npm start) e teste o mesmo filme." -ForegroundColor Green
+Write-Host "Se ainda travar, o console do servidor mostra as linhas [hls] com o motivo exato." -ForegroundColor DarkGray
+Write-Host ""

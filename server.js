@@ -1,9 +1,10 @@
-'use strict';
+﻿'use strict';
 
 /**
- * CineP2P 7.0 - API desacoplada.
+ * TMC 14.0 - API.
  * /api/torrent resolve o IMDb ID no servidor e passa os titulos alternativos
- * (aliases BR/PT) para o filtro de identidade.
+ * (aliases BR/PT) para o filtro de identidade. /api/play/faixas expoe as
+ * trilhas de audio encontradas pelo ffprobe para o seletor do player.
  */
 
 require('dotenv').config();
@@ -19,7 +20,7 @@ const streamer = require('./src/streamer');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
-const VERSAO = '7.0.0';
+const VERSAO = '14.0.0';
 
 const app = express();
 app.disable('x-powered-by');
@@ -43,7 +44,7 @@ function fail(res, err, status) {
 app.get('/api/health', function (req, res) {
   res.json({
     ok: true, versao: VERSAO, tmdb: tmdb.isConfigured(),
-    ffmpeg: streamer.FFMPEG_OK, ffprobe: streamer.FFPROBE_OK,
+    ffmpeg: streamer.FFMPEG_OK, ffprobe: streamer.FFPROBE_OK, hls: streamer.HLS_OK,
     uptime: Math.round(process.uptime())
   });
 });
@@ -55,7 +56,8 @@ app.get('/api/config', function (req, res) {
     idioma: tmdb.cfg().language,
     cache: streamer.CACHE_ROOT,
     ffmpeg: streamer.FFMPEG_OK,
-    minBuffer: Number(process.env.MIN_BUFFER_PERCENT || 2)
+    hls: streamer.HLS_OK,
+    minBuffer: Number(process.env.MIN_BUFFER_PERCENT || 0.5)
   });
 });
 
@@ -230,6 +232,12 @@ app.get('/api/play/status', function (req, res) {
   res.json(s);
 });
 
+app.get('/api/play/faixas', function (req, res) {
+  const s = streamer.status(String(req.query.jobId || ''));
+  if (!s) return res.status(404).json({ error: 'Job nao encontrado.' });
+  res.json({ faixas: s.audioFaixas || [], audio: s.audioIdx });
+});
+
 app.get('/api/play/stream', function (req, res) { streamer.handle(String(req.query.jobId || ''), req, res); });
 
 app.get('/api/play/subs', function (req, res) {
@@ -259,9 +267,9 @@ app.get('*', function (req, res) { res.sendFile(path.join(__dirname, 'public', '
 
 app.listen(PORT, HOST, function () {
   console.log('');
-  console.log('  CineP2P ' + VERSAO + ' -> http://localhost:' + PORT);
+  console.log('  TMC ' + VERSAO + ' -> http://localhost:' + PORT);
   console.log('  Cache (apagado ao fechar o player): ' + streamer.CACHE_ROOT);
-  console.log('  FFmpeg: ' + (streamer.FFMPEG_OK ? 'ok' : 'AUSENTE') + ' | ffprobe: ' + (streamer.FFPROBE_OK ? 'ok' : 'AUSENTE'));
+  console.log('  FFmpeg: ' + (streamer.FFMPEG_OK ? 'ok' : 'AUSENTE') + ' | ffprobe: ' + (streamer.FFPROBE_OK ? 'ok' : 'AUSENTE') + ' | HLS VOD: ' + (streamer.HLS_OK ? 'ok' : 'desligado'));
   if (!tmdb.isConfigured()) console.log('  ATENCAO: TMDB_API_KEY ausente no .env');
   console.log('');
 });

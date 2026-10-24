@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
@@ -7,13 +7,34 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>CineP2P</title>
+<title>TMC</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/placeholder.svg">
 <link rel="preconnect" href="https://image.tmdb.org">
 <link rel="stylesheet" href="/styles.css">
 <link rel="stylesheet" href="/player.css">
 <link rel="stylesheet" href="/series.css">
+<style id="tmc14">
+  .hero.slides{position:relative;overflow:hidden}
+  .slide{position:absolute;inset:0;background-size:cover;background-position:center 20%;background-color:#14161c;opacity:0;transition:opacity .9s ease;pointer-events:none}
+  .slide.on{opacity:1;pointer-events:auto}
+  .slide .hero-inner{position:relative;z-index:3}
+  .slide-dots{position:absolute;right:16px;bottom:22px;z-index:4;display:flex;gap:6px}
+  .slide-dots i{width:7px;height:7px;border-radius:50%;background:rgba(255,255,255,.35)}
+  .slide-dots i.on{background:var(--brand);width:20px;border-radius:9px}
+  .filtros{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:14px 16px 4px}
+  .filtros .chip.ativo{background:var(--brand);border-color:transparent;color:#fff}
+  .filtros .chip.ordem{margin-left:auto}
+  #sel-audio{background:rgba(0,0,0,.55);color:#fff;border:1px solid #2a2e38;border-radius:9px;padding:8px 6px;font-size:12px;max-width:132px;outline:none}
+  .topbar .nav-link[data-view="inicio"]{flex:0 0 auto}
+  @media (max-width:520px){
+    .brand{font-size:16px}
+    .topbar .nav-link[data-view="inicio"]{padding:8px 9px;font-size:12.5px}
+    .filtros .chip{font-size:12px;padding:7px 11px}
+    .filtros .chip.ordem{margin-left:0}
+  }
+  @media (min-width:860px){ .filtros{padding-left:44px;padding-right:44px} }
+</style>
 </head>
 <body>
 
@@ -22,7 +43,9 @@
     <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
   </button>
 
-  <a class="brand" id="brand" href="#">Cine<span>P2P</span></a>
+  <a class="brand" id="brand" href="#">TMC<span>.app</span></a>
+
+  <button class="nav-link" data-view="inicio">Início</button>
 
   <nav class="tipo-tabs" id="tipoTabs">
     <button class="tipo-tab active" data-tipo="movie">Filmes</button>
@@ -30,7 +53,6 @@
   </nav>
 
   <nav class="topnav" id="topnav">
-    <button class="nav-link active" data-view="inicio">Inicio</button>
     <button class="nav-link" data-view="buscar">Buscar</button>
     <button class="nav-link" data-view="historico">Historico</button>
     <button class="nav-link" data-view="lista">Minha Lista</button>
@@ -46,7 +68,7 @@
 
 <aside id="drawer" class="drawer hidden">
   <div class="drawer-head">
-    <span class="brand">Cine<span>P2P</span></span>
+    <span class="brand">TMC<span>.app</span></span>
     <button class="icon-btn" id="drawerClose" aria-label="Fechar">
       <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     </button>
@@ -62,13 +84,16 @@
     <button class="nav-link" data-view="lista">Minha Lista</button>
     <button class="nav-link" data-view="categorias">Categorias</button>
   </nav>
-  <p class="drawer-foot">CineP2P 8.0</p>
+  <p class="drawer-foot">TMC 12.0</p>
 </aside>
 <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
 
 <main id="app">
   <section id="view-inicio" class="view">
-    <section id="hero" class="hero"></section>
+    <section id="hero" class="hero slides"></section>
+    <div id="filtros" class="filtros"></div>
+    <h2 id="filtrosTitulo" class="view-title hidden"></h2>
+    <div id="filtrosGrid" class="grid hidden"></div>
     <div id="rows" class="rows"></div>
   </section>
 
@@ -135,6 +160,11 @@
 <div id="player" class="player hidden">
   <video id="video" playsinline webkit-playsinline preload="auto" autoplay></video>
 
+  <div class="pv-intro" id="pvIntro">
+    <div class="pi-logo">TMC<em>Miranda</em></div>
+    <div class="pi-linha"></div>
+  </div>
+
   <div class="pv-top" id="pvTop">
     <button class="pv-btn" id="pvClose" aria-label="Voltar">
       <svg viewBox="0 0 24 24" width="24" height="24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -167,8 +197,10 @@
       <button class="pv-btn" id="pvFwd30" aria-label="Avancar 30 segundos">
         <svg viewBox="0 0 24 24" width="26" height="26"><path d="M13 5V2l5 4-5 4V7a6 6 0 1 0 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><text x="12" y="17" font-size="8" font-weight="700" fill="currentColor" text-anchor="middle">30</text></svg>
       </button>
+      <button class="pv-btn" id="pvReiniciar" aria-label="Voltar ao inicio">&#8634;</button>
       <span class="pv-time" id="pvTime">0:00 / 0:00</span>
       <span class="pv-spacer"></span>
+      <select id="sel-audio" class="hidden" title="Faixa de audio"></select>
       <button class="pv-btn" id="pvMute" aria-label="Volume">
         <svg id="icoVol" viewBox="0 0 24 24" width="24" height="24"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         <svg id="icoMudo" class="hidden" viewBox="0 0 24 24" width="24" height="24"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor"/><path d="M15 9l5 6M20 9l-5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
@@ -193,7 +225,12 @@
 
 <div id="toast" class="toast hidden"></div>
 
+<script src="/hls.min.js"></script>
+<script>window.Hls||document.write('<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"><\/script>');</script>
 <script src="/config.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
+
+
+

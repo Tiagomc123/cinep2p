@@ -1,20 +1,18 @@
-{
-  "name": "cinep2p",
-  "version": "8.0.0",
+﻿{
+  "name": "tmc",
+  "version": "14.0.0",
   "private": true,
-  "description": "Streaming P2P com filtro IMDb e audio decodificado no proprio navegador.",
+  "description": "TMC - catalogo e player HLS VOD com audio AAC estereo, legendas e filtros.",
   "type": "commonjs",
   "main": "server.js",
   "scripts": { "start": "node server.js", "dev": "node server.js" },
   "engines": { "node": ">=18" },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "webtorrent": "^1.9.7"
-  },
-  "optionalDependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@ffprobe-installer/ffprobe": "^2.1.2",
-    "fluent-ffmpeg": "^2.1.3"
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "fluent-ffmpeg": "^2.1.3",
+    "webtorrent": "^1.9.7"
   }
 }

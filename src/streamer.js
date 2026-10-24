@@ -1,19 +1,21 @@
-'use strict';
+﻿'use strict';
 
 /**
- * Streamer 8.0 - modo BRUTO.
+ * TMC 15.0 - Streamer HLS.
  *
- *  - TRANSCODE=nunca (padrao): nenhum ffprobe, nenhum ffmpeg. O arquivo do
- *    torrent e servido direto com Range: bytes, CPU zero, inicio instantaneo.
- *  - canPlay em 1% de buffer (ou 2 MB), o que faz o video comecar na hora.
- *  - O frontend cuida do audio: le o cabecalho MKV, escolhe a faixa PT e,
- *    se o codec for AC3/EAC3/DTS, decodifica em JS via Web Audio.
- *  - TRANSCODE=auto|sempre continua disponivel (usa ffmpeg, agora opcional).
+ *  - Enquanto o ffmpeg escreve, a playlist e servida como EVENT (o player
+ *    recarrega sozinho). Quando o ffmpeg termina, vira VOD com ENDLIST:
+ *    duracao real, seek livre e zero logica de live.
+ *  - Playlist vazia nunca leva ENDLIST (era o motivo do "Preparando video...").
+ *  - O ffmpeg le o torrent bruto por &modo=direto (Range real, sem ffmpeg aninhado).
+ *  - -c:v copy (CPU zero) + -c:a aac -ac 2 (AC3/DTS/5.1 -> estereo nativo).
+ *  - Mapeamento dinamico de audio: PT-BR por padrao, troca manual por indice.
  */
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const WebTorrent = require('webtorrent');
 
 const trackers = require('./trackers');
@@ -23,12 +25,16 @@ const TRACKERS = trackers.TRACKERS;
 const appendTrackers = trackers.appendTrackers;
 
 const MODO_TRANSCODE = String(process.env.TRANSCODE || 'nunca').toLowerCase();
+const HLS_ATIVO = String(process.env.HLS || '1') !== '0';
+const HLS_SEG = Math.max(2, Number(process.env.HLS_SEGMENT_SECONDS || 4));
+const PORTA = Number(process.env.PORT || 3000);
 
 /* ------------------- ffmpeg (so carrega se precisar) ---------------- */
 
 let ffmpegLib = null;
 let FFMPEG_PATH = '';
 let FFPROBE_PATH = '';
+let HLS_OK = false;
 
 function carregarFfmpeg() {
   if (ffmpegLib) return;
@@ -41,7 +47,8 @@ function carregarFfmpeg() {
   if (ffmpegLib && FFPROBE_PATH) ffmpegLib.setFfprobePath(FFPROBE_PATH);
 }
 
-if (MODO_TRANSCODE !== 'nunca') carregarFfmpeg();
+if (MODO_TRANSCODE !== 'nunca' || HLS_ATIVO) carregarFfmpeg();
+HLS_OK = HLS_ATIVO && !!(ffmpegLib && FFMPEG_PATH && FFPROBE_PATH);
 
 const VIDEO_OK_MP4 = /^(h264|hevc|vp9|av1|vp8)$/i;
 const AUDIO_OK_NAV = /^(aac|mp3|opus|vorbis|flac)$/i;
@@ -56,8 +63,8 @@ const METADATA_TIMEOUT = Number(process.env.METADATA_TIMEOUT || 60) * 1000;
 const BUFFER_TIMEOUT = Number(process.env.BUFFER_TIMEOUT || 150) * 1000;
 const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT || 15 * 60 * 1000);
 const MAX_JOBS = Number(process.env.MAX_JOBS || 3);
-const MAX_CONNS = Number(process.env.MAX_CONNS || 300);
-const MIN_BUFFER_PERCENT = Number(process.env.MIN_BUFFER_PERCENT || 1);
+const MAX_CONNS = Number(process.env.MAX_CONNS || 500);
+const MIN_BUFFER_PERCENT = Number(process.env.MIN_BUFFER_PERCENT || 0.5);
 const MIN_BUFFER_MB = Number(process.env.MIN_BUFFER_MB || 2);
 const MAX_SUBS = Number(process.env.MAX_SUBS || 8);
 const USAR_UTP = process.env.ENABLE_UTP === '1';
@@ -132,11 +139,11 @@ function start(params) {
     fileIdx: (params.fileIdx === undefined || params.fileIdx === null || params.fileIdx === '') ? null : Number(params.fileIdx),
     peers: 0, progress: 0, buffer: 0, speed: 0, downloaded: 0, total: 0,
     fileName: '', streamUrl: null, canPlay: false,
-    subs: [], tentativas: 0,
+    subs: [], subsInternas: [], audios: [], tentativas: 0,
     transcode: MODO_TRANSCODE !== 'nunca',
-    analisado: MODO_TRANSCODE === 'nunca',
-    duracao: 0, videoCodec: '', audioCodec: '', audioIdx: 0, motivoTranscode: '',
-    torrent: null, file: null, nudge: null, vigia: null, timers: []
+    analisado: MODO_TRANSCODE === 'nunca' && !HLS_ATIVO,
+    duracao: 0, videoCodec: '', audioCodec: '', audioIdx: 0, audioPt: -1, audioPtLang: '', motivoTranscode: '',
+    torrent: null, file: null, nudge: null, vigia: null, timers: [], hls: null
   };
 
   jobs.set(id, job);
@@ -149,6 +156,12 @@ function limparTimers(job) {
   if (job.vigia) { clearInterval(job.vigia); job.vigia = null; }
   (job.timers || []).forEach(function (t) { clearTimeout(t); });
   job.timers = [];
+}
+
+function fecharHls(job) {
+  if (!job || !job.hls) return;
+  try { if (job.hls.cmd) job.hls.cmd.kill('SIGKILL'); } catch (e) { }
+  job.hls = null;
 }
 
 function attach(job) {
@@ -215,6 +228,7 @@ function attach(job) {
           job.canPlay = true;
           job.state = 'pronto';
           job.message = 'Pronto.';
+          iniciarHlsServidor(job);
         } else {
           job.state = 'bufferizando';
           job.message = 'Preparando stream... ' + job.buffer.toFixed(1) + '%';
@@ -245,6 +259,7 @@ function tentarDeNovo(job, motivo) {
 }
 
 function reiniciar(job) {
+  fecharHls(job);
   try { if (job.torrent) job.torrent.destroy({ destroyStore: false }); } catch (e) { }
   limparTimers(job);
   job.torrent = null;
@@ -284,7 +299,7 @@ function coletarSubs(torrent, video) {
     .slice(0, MAX_SUBS)
     .map(function (x, idx) {
       const lang = subtitulos.idiomaDe(x.f.name);
-      return { idx: idx, fileIndex: x.i, nome: String(x.f.name).split('/').pop(), code: lang.code, label: lang.label };
+      return { idx: idx, fileIndex: x.i, nome: String(x.f.name).split('/').pop(), code: lang.code, label: lang.label, interna: false };
     });
 }
 
@@ -315,8 +330,7 @@ function onReady(job) {
     if (manter.indexOf(f) === -1) { try { f.deselect(); } catch (e) { } }
   });
 
-  // Modo bruto: nada de ffprobe, nada de ffmpeg. Ja esta analisado.
-  if (MODO_TRANSCODE === 'nunca') {
+  if (!HLS_OK && MODO_TRANSCODE === 'nunca') {
     job.analisado = true;
     job.transcode = false;
     job.motivoTranscode = 'bruto';
@@ -326,16 +340,16 @@ function onReady(job) {
   job.message = 'Analisando codecs...';
   analisar(job).catch(function () { }).then(function () {
     job.analisado = true;
-    job.message = job.transcode ? 'Convertendo audio...' : 'Stream direto.';
+    job.message = HLS_OK ? 'Pronto para HLS.' : (job.transcode ? 'Convertendo audio...' : 'Stream direto.');
+    if (job.canPlay) iniciarHlsServidor(job);
   });
 }
 
-/* ------------------- ffprobe (apenas modo transcode) --------------- */
+/* ------------------- ffprobe (HLS e transcode) --------------------- */
 
 function ffprobeStream(file) {
   return new Promise(function (resolve) {
     if (!FFPROBE_PATH) { resolve(null); return; }
-    const { spawn } = require('child_process');
     let saida = '';
     let stream = null, proc = null;
     const fim = function (valor) {
@@ -380,19 +394,206 @@ async function analisar(job) {
   job.videoCodec = videos[0] ? String(videos[0].codec_name || '') : '';
   job.duracao = (info.format && Number(info.format.duration)) || 0;
 
-  let idxPt = -1;
-  audios.forEach(function (a, i) {
-    const lang = String((a.tags && (a.tags.language || a.tags.LANGUAGE)) || '').toLowerCase();
-    if (idxPt === -1 && /por|pt|bra/.test(lang)) idxPt = i;
+  job.audios = audios.map(function (a, i) {
+    const tags = a.tags || {};
+    const lang = String(tags.language || tags.LANGUAGE || '').toLowerCase();
+    return {
+      indice: i,
+      codec: String(a.codec_name || ''),
+      canais: a.channels || 2,
+      lang: lang || 'und',
+      titulo: tags.title || '',
+      ptbr: /por|pt|bra/.test(lang),
+      padrao: !!(a.disposition && a.disposition.default)
+    };
   });
+
+  let idxPt = -1;
+  job.audios.forEach(function (a, i) {
+    if (idxPt === -1 && a.ptbr) { idxPt = i; job.audioPtLang = a.lang; }
+  });
+  job.audioPt = idxPt;
   job.audioIdx = idxPt >= 0 ? idxPt : 0;
-  job.audioCodec = audios[job.audioIdx] ? String(audios[job.audioIdx].codec_name || '') : '';
+  job.audioCodec = job.audios[job.audioIdx] ? job.audios[job.audioIdx].codec : '';
+
+  job.subsInternas = info.streams
+    .filter(function (s) { return s.codec_type === 'subtitle'; })
+    .map(function (s, i) {
+      const tags = s.tags || {};
+      const lang = String(tags.language || '').toLowerCase();
+      return { i: i, codec: s.codec_name || '', lang: lang, label: tags.title || '' };
+    });
 
   const audioRuim = job.audioCodec && !AUDIO_OK_NAV.test(job.audioCodec);
   const videoRuim = job.videoCodec && !VIDEO_OK_MP4.test(job.videoCodec);
 
   if (MODO_TRANSCODE === 'sempre') job.transcode = true;
   else job.transcode = !!(audioRuim || videoRuim);
+}
+
+/* ------------------------------- HLS ------------------------------- */
+
+/* modo=direto: o ffmpeg do HLS le o arquivo BRUTO do torrent com Range,
+   sem cair no servirTranscode (evita ffmpeg dentro de ffmpeg). */
+function urlInterna(job) {
+  return 'http://127.0.0.1:' + PORTA + '/api/play/stream?jobId=' + job.id + '&modo=direto';
+}
+
+function indiceAudio(job, pedido) {
+  if (pedido === null || pedido === undefined || pedido === '') return job.audioIdx;
+  if (!/^\d+$/.test(String(pedido))) return job.audioIdx;
+  const n = Number(pedido);
+  if (!job.audios || !job.audios[n]) return job.audioIdx;
+  return n;
+}
+
+function contarSegmentos(hls) {
+  if (!hls) return 0;
+  try {
+    return fs.readdirSync(hls.dir).filter(function (f) { return /\.(ts|m4s|mp4)$/.test(f); }).length;
+  } catch (e) { return 0; }
+}
+
+function abrirHls(job, ss, sess, pedido) {
+  if (!HLS_OK || !job.file) return null;
+  fecharHls(job);
+
+  const base = path.join(job.dir, 'hls');
+  const dir = path.join(base, String(sess));
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { }
+
+  const audio = indiceAudio(job, pedido);
+  const fmp4 = /hevc|hvc1|av1/i.test(job.videoCodec);
+  const ext = fmp4 ? 'm4s' : 'ts';
+
+  const cmd = ffmpegLib(urlInterna(job));
+
+  const optsIn = ['-probesize', '5000000', '-analyzeduration', '5000000',
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'];
+  if (ss > 0) optsIn.unshift('-ss', String(ss));
+  cmd.inputOptions(optsIn);
+
+  const opts = ['-map', '0:v:0'];
+  if (audio === job.audioPt && /^por/.test(job.audioPtLang)) opts.push('-map', '0:a:m:language:por?');
+  else opts.push('-map', '0:a:' + audio + '?');
+  opts.push('-sn', '-dn', '-max_muxing_queue_size', '4096');
+
+  if (VIDEO_OK_MP4.test(job.videoCodec)) {
+    opts.push('-c:v', 'copy');
+  } else {
+    opts.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p');
+    opts.push('-force_key_frames', 'expr:gte(t,n_forced*' + HLS_SEG + ')');
+  }
+
+  opts.push('-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '192k');
+  opts.push('-af', 'aresample=async=1:first_pts=0');
+  opts.push('-f', 'hls');
+  opts.push('-hls_time', String(HLS_SEG));
+  opts.push('-hls_list_size', '0');
+  opts.push('-hls_playlist_type', 'vod');
+  opts.push('-hls_flags', 'independent_segments');
+  if (fmp4) opts.push('-hls_segment_type', 'fmp4');
+  opts.push('-hls_segment_filename', path.join(dir, 'seg%05d.' + ext));
+  cmd.outputOptions(opts);
+  cmd.output(path.join(dir, 'index.m3u8'));
+
+  const registro = { sess: String(sess), ss: ss, audio: audio, dir: dir, cmd: cmd, criado: agora(), erro: null };
+  job.hls = registro;
+
+  cmd.on('error', function (e) {
+    registro.erro = e.message;
+    console.error('[hls] ' + e.message);
+  });
+  cmd.on('stderr', function (l) {
+    if (/error|invalid|unable|too many/i.test(l)) console.error('[hls] ' + String(l).trim());
+  });
+  cmd.run();
+
+  try {
+    fs.readdirSync(base).forEach(function (n) {
+      if (n !== String(sess)) apagarPasta(path.join(base, n));
+    });
+  } catch (e) { }
+
+  return registro;
+}
+
+function iniciarHlsServidor(job) {
+  if (!HLS_OK || !job.file || job.hls) return;
+  try { abrirHls(job, 0, 'inicial', null); } catch (e) { console.error('[hls] ' + e.message); }
+}
+
+function playlistHls(job, req, res) {
+  const ss = Math.max(0, Number(req.query.ss) || 0);
+  const sess = String(req.query.sess || '1');
+  const pedido = req.query.audio;
+  const audio = indiceAudio(job, pedido);
+
+  // Reaproveita a sessao ja iniciada (mesmo ponto e mesma faixa) em vez de
+  // reiniciar o ffmpeg a cada recarga da playlist.
+  if (job.hls && !job.hls.erro && job.hls.ss === ss && job.hls.audio === audio) {
+    job.hls.sess = sess;
+  } else {
+    abrirHls(job, ss, sess, pedido);
+  }
+
+  const cabecalho = {
+    'content-type': 'application/vnd.apple.mpegurl',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*'
+  };
+
+  if (!job.hls) { res.writeHead(200, cabecalho); res.end(vazio()); return; }
+
+  const arq = path.join(job.hls.dir, 'index.m3u8');
+  let txt = '';
+  try { if (fs.existsSync(arq)) txt = fs.readFileSync(arq, 'utf8'); } catch (e) { txt = ''; }
+  if (!/^#EXTM3U/.test(txt)) { res.writeHead(200, cabecalho); res.end(vazio()); return; }
+
+  // Sem ENDLIST => playlist viva (EVENT): o player recarrega e ve os novos
+  // segmentos. Com ENDLIST => VOD: duracao real e seek livre.
+  const temEndlist = /#EXT-X-ENDLIST/.test(txt);
+  const tipo = temEndlist ? 'VOD' : 'EVENT';
+  if (/^#EXT-X-PLAYLIST-TYPE:/m.test(txt)) txt = txt.replace(/^#EXT-X-PLAYLIST-TYPE:.*$/m, '#EXT-X-PLAYLIST-TYPE:' + tipo);
+  else txt = txt.replace('#EXTM3U', '#EXTM3U\n#EXT-X-PLAYLIST-TYPE:' + tipo);
+
+  const pref = 'stream?jobId=' + job.id + '&sess=' + sess + '&ss=' + ss + '&audio=' + audio + '&seg=';
+  txt = txt.replace(/^(seg\d+\.(?:ts|m4s|mp4))\s*$/gm, pref + '$1');
+
+  res.writeHead(200, cabecalho);
+  res.end(txt);
+}
+
+function vazio() {
+  // NUNCA com ENDLIST: senao o player trata como VOD completo e nao recarrega.
+  return '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:' + HLS_SEG +
+    '\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n';
+}
+
+function servirSegmento(job, req, res) {
+  const nome = String(req.query.seg || '');
+  if (!/^seg\d+\.(ts|m4s|mp4)$/.test(nome)) {
+    res.writeHead(404, { 'access-control-allow-origin': '*' }); res.end(); return;
+  }
+
+  let alvo = job.hls ? path.join(job.hls.dir, nome) : '';
+  if (!alvo || !fs.existsSync(alvo)) {
+    alvo = path.join(job.dir, 'hls', String(req.query.sess || ''), nome);
+  }
+  if (!fs.existsSync(alvo)) {
+    res.writeHead(404, { 'access-control-allow-origin': '*' }); res.end(); return;
+  }
+
+  let tamanho = 0;
+  try { tamanho = fs.statSync(alvo).size; } catch (e) { }
+
+  res.writeHead(200, {
+    'content-type': /\.ts$/.test(nome) ? 'video/mp2t' : 'video/mp4',
+    'content-length': tamanho,
+    'cache-control': 'public, max-age=3600',
+    'access-control-allow-origin': '*'
+  });
+  fs.createReadStream(alvo).pipe(res);
 }
 
 /* ------------------------------- HTTP ------------------------------ */
@@ -404,10 +605,21 @@ function handle(jobId, req, res) {
 
   if (job.state === 'erro') { res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }); res.end(job.message); return; }
 
+  if (req.query.seg) { servirSegmento(job, req, res); return; }
+
   const file = job.file;
   if (!file) { res.writeHead(202, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Aguardando metadados...'); return; }
 
   const modoPedido = String(req.query.modo || '').toLowerCase();
+
+  if (req.query.hls === '1' || modoPedido === 'hls') {
+    if (!HLS_OK) { servirDireto(job, req, res); return; }
+    playlistHls(job, req, res);
+    return;
+  }
+
+  if (modoPedido === 'direto') { servirDireto(job, req, res); return; }
+
   const modo = modoPedido || (job.transcode ? 'transcode' : 'direto');
 
   if (modo === 'transcode') servirTranscode(job, req, res);
@@ -458,6 +670,7 @@ function servirTranscode(job, req, res) {
   if (!ffmpegLib || !FFMPEG_PATH) { servirDireto(job, req, res); return; }
 
   const t = Math.max(0, Number(req.query.t) || 0);
+  const audio = indiceAudio(job, req.query.audio);
   const file = job.file;
   const bytesPorSeg = job.duracao > 0 ? (file.length / job.duracao) : 0;
   const inicio = (t > 0 && bytesPorSeg > 0) ? Math.min(file.length - 1, Math.floor(bytesPorSeg * t)) : 0;
@@ -479,7 +692,7 @@ function servirTranscode(job, req, res) {
 
   const opts = [
     '-map 0:v:0',
-    '-map 0:a:' + job.audioIdx,
+    '-map 0:a:' + audio,
     '-max_muxing_queue_size 2048',
     '-movflags frag_keyframe+empty_moov+default_base_moof',
     '-avoid_negative_ts make_zero'
@@ -531,15 +744,56 @@ function lerArquivo(file, limite) {
   });
 }
 
+function extrairLegendaInterna(job, ref) {
+  return new Promise(function (resolve) {
+    if (!ffmpegLib || !FFMPEG_PATH) { resolve(null); return; }
+    let saida = '';
+    let proc = null;
+    let pronto = false;
+    const fim = function () {
+      if (pronto) return;
+      pronto = true;
+      try { if (proc && !proc.killed) proc.kill('SIGKILL'); } catch (e) { }
+      const txt = String(saida).replace(/\r/g, '');
+      if (!txt.trim()) { resolve(null); return; }
+      resolve(/^WEBVTT/i.test(txt) ? txt : 'WEBVTT\n\n' + txt);
+    };
+    try {
+      proc = spawn(FFMPEG_PATH, [
+        '-hide_banner', '-loglevel', 'error',
+        '-i', urlInterna(job),
+        '-map', '0:s:' + ref.i,
+        '-f', 'webvtt', '-'
+      ], { windowsHide: true });
+    } catch (e) { resolve(null); return; }
+
+    const timer = setTimeout(fim, 60000);
+    proc.stdout.on('data', function (c) { saida += c.toString(); });
+    proc.on('close', function () { clearTimeout(timer); fim(); });
+    proc.on('error', function () { clearTimeout(timer); fim(); });
+  });
+}
+
 async function legenda(jobId, idx) {
   const job = jobs.get(jobId);
-  if (!job || !job.subs || !job.subs[idx]) return null;
-  const sub = job.subs[idx];
-  const file = job.torrent && job.torrent.files[sub.fileIndex];
-  if (!file) return null;
+  if (!job) return null;
   job.lastAccess = agora();
-  const texto = await lerArquivo(file);
-  return { nome: sub.nome, code: sub.code, label: sub.label, vtt: subtitulos.converter(texto, subtitulos.extensao(file.name)) };
+
+  const arquivos = job.subs || [];
+  if (idx < arquivos.length) {
+    const sub = arquivos[idx];
+    const file = job.torrent && job.torrent.files[sub.fileIndex];
+    if (!file) return null;
+    const texto = await lerArquivo(file);
+    return { nome: sub.nome, code: sub.code, label: sub.label, vtt: subtitulos.converter(texto, subtitulos.extensao(file.name)) };
+  }
+
+  const i = idx - arquivos.length;
+  const ref = (job.subsInternas || [])[i];
+  if (!ref) return null;
+  const vtt = await extrairLegendaInterna(job, ref);
+  if (!vtt) return null;
+  return { nome: 'Embutida ' + (ref.label || ref.lang || ref.i), code: ref.lang || 'pt-BR', label: ref.label || 'Legenda embutida', vtt: vtt };
 }
 
 /* ------------------------------ status ----------------------------- */
@@ -549,6 +803,19 @@ function status(jobId) {
   if (!job) return null;
   job.lastAccess = agora();
   const t = job.torrent;
+
+  const subs = (job.subs || []).map(function (s) {
+    return { idx: s.idx, nome: s.nome, code: s.code, label: s.label, interna: false };
+  }).concat((job.subsInternas || []).map(function (s, i) {
+    return {
+      idx: (job.subs || []).length + i,
+      nome: 'Embutida ' + (s.label || s.lang || ('#' + s.i)),
+      code: s.lang || 'pt-BR',
+      label: s.label || ('Legenda embutida ' + (s.lang || s.i)),
+      interna: true
+    };
+  }));
+
   return {
     id: job.id,
     state: job.state,
@@ -564,8 +831,16 @@ function status(jobId) {
     canPlay: !!job.canPlay,
     tentativa: job.tentativas,
     transcode: !!job.transcode,
+    hls: !!HLS_OK,
+    hlsPronto: job.hls ? (contarSegmentos(job.hls) > 0) : false,
+    hlsErro: job.hls ? (job.hls.erro || null) : null,
     duracao: job.duracao || 0,
-    subs: job.subs ? job.subs.map(function (s) { return { idx: s.idx, nome: s.nome, code: s.code, label: s.label }; }) : [],
+    audioIdx: job.audioIdx,
+    audioPt: job.audioPt,
+    audioFaixas: (job.audios || []).map(function (a) {
+      return { indice: a.indice, codec: a.codec, canais: a.canais, lang: a.lang, titulo: a.titulo, ptbr: a.ptbr };
+    }),
+    subs: subs,
     elapsed: Math.round((agora() - job.createdAt) / 1000),
     streamUrl: job.streamUrl
   };
@@ -575,6 +850,7 @@ function stop(jobId) {
   const job = jobs.get(jobId);
   if (!job) return false;
   limparTimers(job);
+  fecharHls(job);
   jobs.delete(jobId);
   const dir = job.dir;
   const finalizar = function () { if (CACHE_MODE !== 'keep') apagarPasta(dir); };
@@ -604,5 +880,5 @@ process.on('SIGTERM', function () { try { client.destroy(); } catch (e) { } stop
 module.exports = {
   start: start, status: status, stop: stop, stopTudo: stopTudo,
   handle: handle, legenda: legenda, jobs: jobs, CACHE_ROOT: CACHE_ROOT,
-  FFMPEG_OK: !!FFMPEG_PATH, FFPROBE_OK: !!FFPROBE_PATH, MODO_TRANSCODE: MODO_TRANSCODE
+  FFMPEG_OK: !!FFMPEG_PATH, FFPROBE_OK: !!FFPROBE_PATH, HLS_OK: HLS_OK, MODO_TRANSCODE: MODO_TRANSCODE
 };
