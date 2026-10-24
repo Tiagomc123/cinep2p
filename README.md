@@ -5,28 +5,20 @@ Funciona no PC, no celular Android, na TV Box e no projetor.
 
 ## Requisitos
 
-- Node.js 20 ou superior
+- Node.js 22 ou superior
 - ffmpeg: ja vem junto (pacotes ffmpeg-static/ffprobe-static). Se quiser usar
   o do sistema, defina FFMPEG_PATH.
 
 ## Rodar
 
     npm install
-    npm run https      # https://SEU-IP:3000  <- use este para instalar como app
     npm start          # http://localhost:3000
 
 Abra o endereco de rede mostrado no terminal.
 
-## Instalar como aplicativo (Android / TV Box / projetor)
-
-1. Rode: npm run https
-2. No aparelho, abra https://IP-DO-PC:3000 e aceite o aviso do certificado.
-3. Toque no botao "Instalar app" (ou menu do navegador -> Instalar aplicativo).
-4. Fica com icone proprio, tela cheia e sem barra do navegador.
-
-Se quiser um .apk de verdade: publique a mesma URL no pwabuilder.com
-(ou use o Chrome -> "Instalar aplicativo"). O .apk continua precisando do
-servidor ligado no PC, que e ele que baixa o torrent.
+O servidor inicia em HTTP; `npm run https` nao esta configurado nesta versao.
+Para instalar como aplicativo em aparelhos da rede local, sera necessario
+configurar HTTPS com um certificado confiavel.
 
 Controle remoto: setas navegam, OK seleciona, Voltar fecha o player,
 Enter no video abre os botoes. O botao "TV" aumenta a interface.

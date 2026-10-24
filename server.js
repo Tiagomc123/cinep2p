@@ -1,379 +1,63 @@
-import express from 'express'
-import path from 'node:path'
-import os from 'node:os'
-import http from 'node:http'
-import https from 'node:https'
-import { Readable } from 'node:stream'
-import { fileURLToPath } from 'node:url'
-import { listMovies, searchMovies } from './src/yts.js'
-import { searchApibay, topMovies, brShelf, rank } from './src/apibay.js'
-import { searchAll } from './src/search.js'
-import { tvSearch, tvShow, tvFind } from './src/tv.js'
-import { matchesLang } from './src/lang.js'
-import { liveMeta, liveChannels } from './src/live.js'
-import { archiveSearch, archiveStream } from './src/archive.js'
-import {
-  ensureTorrent, serveMedia, status, stop, active, listFiles, pickVideo,
-  externalSubs, getProbe, mediaInfo, decideMode, diagnose,
-  externalSubVtt, embeddedSubVtt, destroyClient, stopAll, storageInfo
-} from './src/streamer.js'
-import { ensureFfmpeg, ffmpegInfo } from './src/ffmpeg.js'
-import { ensureCerts } from './src/tls.js'
-import * as progress from './src/progress.js'
+'use strict';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const app = express()
-const PORT = Number(process.env.PORT || 3000)
-const USE_HTTPS = process.argv.includes('--https') || ['1', 'true'].includes(String(process.env.HTTPS))
-const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'
+const path = require('path');
+const express = require('express');
+const compression = require('compression');
+const cors = require('cors');
 
-app.disable('x-powered-by')
-app.use(express.json({ limit: '64kb' }))
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: 0, etag: true }))
+const config = require('./src/config');
+const rotas = require('./src/routes/api');
+const motor = require('./src/torrent/engine');
+const catalogo = require('./src/catalogo');
+const { log } = require('./src/util/logger');
+const ff = require('./src/util/ffmpeg');
 
-const wrap = fn => (req, res) => Promise.resolve(fn(req, res)).catch(e => {
-  console.error('[cinep2p] erro na rota', req.path, '-', e.message)
-  if (!res.headersSent) res.status(500).json({ error: e.message })
-})
-const hash40 = v => /^[0-9a-f]{40}$/.test(String(v || '').toLowerCase())
+const app = express();
 
-function cleanTitle(s) {
-  return String(s || '')
-    .replace(/\.(mp4|mkv|avi|mov|webm|m4v|ts)$/i, '')
-    .replace(/[._]/g, ' ')
-    .replace(/\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-?ray|web-?dl|webrip|hdrip|brrip|dvdrip|remux|hdr|dv|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ac3|ddp?5[ .]?1|dts(-hd)?|truehd|atmos|yify|galaxyrg|yts|dublado|dublada|dublagem|dual|multi|legendado|legendas?|nacional|brasileir[oa]|repackage?d?|proper|extended|imax|10bit|8bit|hq|bone|psa|oft|turg|rarbg)\b/gi, ' ')
-    .replace(/\s*-\s*[a-z0-9]+$/i, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-const yearOf = s => (/\b(19\d{2}|20\d{2})\b/.exec(String(s || '')) || [])[1] || ''
+app.disable('x-powered-by');
+app.use(compression({ threshold: 1024 }));
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
-const posterCache = new Map()
+app.use((req, res, next) => {
+    if (/^\/(api|stream|transcode)\//.test(req.path)) {
+        log.debug(req.method, req.originalUrl);
+    }
+    next();
+});
 
-app.get('/api/health', wrap(async (_req, res) => {
-  const ff = await ensureFfmpeg()
-  res.json({ ok: true, ffmpeg: ff, ffmpegInfo: ffmpegInfo(), https: USE_HTTPS, version: '0.6.0', live: true, archive: true, tv: true })
-}))
+app.use(rotas);
 
-app.get('/api/active', (_req, res) => res.json({ active: active() }))
+app.use('/api', (req, res) => res.status(404).json({ erro: 'rota nao encontrada', rota: req.originalUrl }));
 
-app.get('/api/catalog', wrap(async (req, res) => {
-  const { genre = '', sort = 'year', order = 'desc', page = '1' } = req.query
-  res.json(await listMovies({ genre, sort, order, page: Number(page) }))
-}))
+app.use(express.static(path.join(config.RAIZ, 'public'), { maxAge: 0 }));
 
-const brCache = new Map()
-const BR_TTL = 120e3
+app.get('*', (req, res) => {
+    res.sendFile(path.join(config.RAIZ, 'public', 'index.html'));
+});
 
-app.get('/api/br', wrap(async (req, res) => {
-  const q = String(req.query.q || '').trim().slice(0, 180)
-  const catRaw = String(req.query.cat || '').trim()
-  const cats = catRaw ? catRaw.split(',').map(Number).filter(Number.isFinite) : [201, 207]
-  const lang = String(req.query.lang || '').trim().toLowerCase()
-  const limit = Math.max(1, Math.min(60, Number.parseInt(req.query.limit || '24', 10) || 24))
+catalogo.carregar();
 
-  const cacheKey = `${q}|${cats.join(',')}|${lang}|${limit}`
-  const hit = brCache.get(cacheKey)
-  if (hit && Date.now() - hit.at < BR_TTL) return res.json(hit.data)
+const servidor = app.listen(config.PORT, config.HOST, () => {
+    const bin = ff.caminhoDoBinario();
+    log.info('cinep2p v3 no ar em http://localhost:' + config.PORT);
+    log.info('cache P2P      :', config.TORRENT_DIR);
+    log.info('max torrents   :', config.MAX_TORRENTS_ATIVOS, '| ociosidade:', config.TORRENT_IDLE_MIN + 'min');
+    log.info('ffmpeg         :', bin.ffmpeg);
+    log.info('catalogo       :', JSON.stringify(catalogo.resumo()));
+});
 
-  let list = []
-  try {
-    list = q ? await brShelf([q]) : await topMovies(cats)
-  } catch (e) {
-    console.warn('[cinep2p] /api/br falhou:', e.message)
-  }
-  let filtered = lang ? list.filter(x => matchesLang(x, lang)) : list
-  if (filtered.length < 3) filtered = list
-
-  const data = {
-    results: rank(filtered).slice(0, limit).map(x => ({ ...x, year: yearOf(x.title) })),
-    source: 'TPB', lang: lang || 'all', count: filtered.length
-  }
-  brCache.set(cacheKey, { at: Date.now(), data })
-  if (brCache.size > 200) brCache.clear()
-  res.json(data)
-}))
-
-app.get('/api/search', wrap(async (req, res) => {
-  const q = String(req.query.q || '').trim()
-  if (!q) return res.json({ results: [], extra: [] })
-  const onlyDub = req.query.dub === '1'
-  const [yts, bay] = await Promise.all([
-    searchMovies(q).catch(() => []),
-    searchAll(q, { onlyDub, limit: 60 }).catch(() => ({ extras: [] }))
-  ])
-  res.json({ results: onlyDub ? [] : yts, extra: bay.extras || [] })
-}))
-
-app.get('/api/extra', wrap(async (req, res) => {
-  const title = String(req.query.title || '').trim()
-  if (!title) return res.json({ results: [] })
-  const j = await searchAll(title, { onlyDub: req.query.dub === '1', limit: 30 }).catch(() => ({ extras: [] }))
-  res.json({ results: j.extras || [] })
-}))
-
-const posterHostAllowed = host => {
-  const h = String(host || '').toLowerCase()
-  return ['yts.mx','yts.lt','yts.gg','yts.bz','yts.rs','tmdb.org','tvmaze.com','archive.org']
-    .some(domain => h === domain || h.endsWith('.' + domain))
+function desligar(sinal) {
+    log.info('encerrando (' + sinal + ')...');
+    servidor.close(() => {
+        motor.encerrar();
+        process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 6000);
 }
 
-app.get('/api/poster/image', wrap(async (req, res) => {
-  let current
-  try { current = new URL(String(req.query.url || '')) }
-  catch { return res.status(400).end() }
-  if (current.protocol !== 'https:' || !posterHostAllowed(current.hostname)) return res.status(400).end()
-  let upstream
-  for (let redirects = 0; redirects <= 3; redirects++) {
-    upstream = await fetch(current, { headers: { 'user-agent': UA, accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8' }, redirect: 'manual' })
-    if (upstream.status >= 300 && upstream.status < 400) {
-      const location = upstream.headers.get('location')
-      if (!location || redirects === 3) return res.status(502).end()
-      current = new URL(location, current)
-      if (current.protocol !== 'https:' || !posterHostAllowed(current.hostname)) return res.status(502).end()
-      continue
-    }
-    break
-  }
-  if (!upstream?.ok) return res.status(upstream?.status || 502).end()
-  const type = String(upstream.headers.get('content-type') || '')
-  if (!type.startsWith('image/')) return res.status(415).end()
-  const data = Buffer.from(await upstream.arrayBuffer())
-  if (data.length > 8 * 1024 * 1024) return res.status(413).end()
-  res.set('Content-Type', type)
-  res.set('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800')
-  res.set('X-Content-Type-Options', 'nosniff')
-  res.send(data)
-}))
-
-app.get('/api/poster', wrap(async (req, res) => {
-  const imdb = String(req.query.imdb || '').trim()
-  const raw = String(req.query.title || '').trim().slice(0, 180)
-  const term = imdb || cleanTitle(raw)
-  if (!term) return res.json({ poster: '' })
-  const key = term.toLowerCase()
-  if (posterCache.has(key)) return res.json(posterCache.get(key))
-  let out = { poster: '', title: '', year: '', summary: '', rating: 0, genres: [] }
-  try {
-    const movies = await searchMovies(term)
-    const wanted = term.toLowerCase()
-    const score = m => {
-      const c = String(m.title || '').toLowerCase()
-      return (c === wanted ? 4 : 0) + (c.startsWith(wanted) || wanted.startsWith(c) ? 2 : 0) + (m.poster ? 1 : 0)
-    }
-    const best = [...movies].sort((a, b) => score(b) - score(a))[0]
-    if (best) out = {
-      poster: best.poster, title: best.title, year: best.year,
-      summary: best.summary, rating: best.rating, genres: best.genres, imdb: best.imdb
-    }
-  } catch {}
-  posterCache.set(key, out)
-  if (posterCache.size > 800) posterCache.clear()
-  res.json(out)
-}))
-
-app.get('/api/tv/search', wrap(async (req, res) => {
-  const q = String(req.query.q || '').trim()
-  if (!q) return res.json({ results: [] })
-  try { res.json(await tvSearch(q)) }
-  catch (e) { res.json({ results: [], error: e.message }) }
-}))
-
-app.get('/api/tv/show/:id', wrap(async (req, res) => {
-  try { res.json(await tvShow(Number(req.params.id))) }
-  catch (e) { res.json({ show: null, seasons: [], error: e.message }) }
-}))
-
-app.get('/api/tv/find', wrap(async (req, res) => {
-  const title = String(req.query.title || '').trim().slice(0, 100)
-  const season = Number(req.query.season || 1)
-  const episode = Number(req.query.episode || 1)
-  if (!title) return res.json({ results: [] })
-  try { res.json(await tvFind({ title, season, episode, dub: req.query.dub !== '0' })) }
-  catch (e) { res.json({ results: [], error: e.message }) }
-}))
-
-app.get('/api/live/meta', wrap(async (_req, res) => {
-  try { res.json(await liveMeta()) }
-  catch (e) { res.json({ countries: [], categories: [], total: 0, error: e.message }) }
-}))
-
-app.get('/api/live', wrap(async (req, res) => {
-  const country = String(req.query.country || '').trim().slice(0, 60)
-  const category = String(req.query.category || '').trim().slice(0, 60)
-  const q = String(req.query.q || '').trim().slice(0, 60)
-  const page = Math.max(1, Number(req.query.page || 1))
-  const limit = Math.max(12, Math.min(120, Number(req.query.limit || 60)))
-  try { res.json(await liveChannels({ country, category, q, page, limit })) }
-  catch (e) { res.json({ channels: [], total: 0, page, error: e.message }) }
-}))
-
-const proxify = u => '/api/live/proxy?url=' + encodeURIComponent(u)
-
-function rewritePlaylist(text, baseUrl) {
-  const abs = u => { try { return new URL(u, baseUrl).href } catch { return u } }
-  return String(text).split(/\r?\n/).map(line => {
-    const t = line.trim()
-    if (!t) return line
-    if (t.startsWith('#')) return t.replace(/URI="([^"]+)"/g, (_, u) => `URI="${proxify(abs(u))}"`)
-    return proxify(abs(t))
-  }).join('\n')
-}
-
-app.get('/api/live/proxy', wrap(async (req, res) => {
-  const target = String(req.query.url || '')
-  if (!/^https?:\/\//i.test(target)) return res.status(400).send('url invalida')
-  let up
-  try {
-    up = await fetch(target, { headers: { 'user-agent': UA, accept: '*/*' }, redirect: 'follow' })
-  } catch (e) {
-    return res.status(502).send('falha no stream: ' + e.message)
-  }
-  if (!up.ok) return res.status(up.status).end()
-  const ct = String(up.headers.get('content-type') || '')
-  const isPlaylist = /mpegurl/i.test(ct) || /\.m3u8(\?|$)/i.test(target)
-  res.set('Access-Control-Allow-Origin', '*')
-  res.set('Cache-Control', 'no-store')
-  if (isPlaylist) {
-    res.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8')
-    return res.send(rewritePlaylist(await up.text(), target))
-  }
-  res.set('Content-Type', ct || 'application/octet-stream')
-  if (up.body) Readable.fromWeb(up.body).pipe(res)
-  else res.end()
-}))
-
-app.get('/api/archive', wrap(async (req, res) => {
-  const q = String(req.query.q || '').trim().slice(0, 80)
-  const collection = String(req.query.col || '').trim().slice(0, 40)
-  const page = Math.max(1, Number(req.query.page || 1))
-  const limit = Math.max(6, Math.min(48, Number(req.query.limit || 24)))
-  try { res.json(await archiveSearch({ q, collection, page, limit })) }
-  catch (e) { res.json({ results: [], total: 0, error: e.message }) }
-}))
-
-app.get('/api/archive/:id', wrap(async (req, res) => {
-  const info = await archiveStream(String(req.params.id))
-  if (!info) return res.status(404).json({ error: 'sem arquivo reproduzivel neste item' })
-  res.json(info)
-}))
-
-app.get('/api/storage', (_req, res) => res.json(storageInfo()))
-
-app.post('/api/cleanup', wrap(async (_req, res) => {
-  const before = storageInfo().bytes
-  const torrents = await stopAll()
-  await new Promise(r => setTimeout(r, 400))
-  const after = storageInfo().bytes
-  res.json({ ok: true, torrents, freed: Math.max(0, before - after), bytes: after })
-}))
-
-app.get('/api/status/:hash', (req, res) => {
-  if (!hash40(req.params.hash)) return res.status(400).json({ error: 'hash invalido' })
-  res.json(status(req.params.hash))
-})
-
-app.post('/api/stop/:hash', wrap(async (req, res) => {
-  await stop(req.params.hash)
-  res.json({ ok: true })
-}))
-
-app.get('/api/diag/:hash', wrap(async (req, res) => {
-  if (!hash40(req.params.hash)) return res.status(400).json({ error: 'hash invalido' })
-  res.json(await diagnose(String(req.params.hash).toLowerCase(), String(req.query.name || '')))
-}))
-
-app.get('/api/prepare/:hash', wrap(async (req, res) => {
-  const hash = String(req.params.hash).toLowerCase()
-  let torrent
-  try {
-    torrent = await ensureTorrent(hash, String(req.query.name || ''))
-  } catch (e) {
-    return res.status(504).json({ error: e.message })
-  }
-  const list = listFiles(torrent)
-  const picked = pickVideo(torrent, req.query.file)
-  const out = { hash, name: torrent.name, main: list.main, files: list.files, externalSubs: externalSubs(torrent), ffmpeg: await ensureFfmpeg() }
-  if (picked) {
-    out.file = picked.index
-    out.playable = /\.(mp4|m4v|webm|ogv)$/i.test(picked.file.name)
-    out.media = mediaInfo(await getProbe(torrent, picked.file))
-    out.mode = out.ffmpeg ? await decideMode(torrent, picked.file) : 'direct'
-  } else {
-    out.mode = 'direct'
-  }
-  res.json(out)
-}))
-
-app.get('/api/stream/:hash', wrap(async (req, res) => {
-  const torrent = await ensureTorrent(String(req.params.hash).toLowerCase(), String(req.query.name || ''))
-  await serveMedia({
-    torrent,
-    fileIndex: req.query.file,
-    mode: String(req.query.mode || 'auto'),
-    audioTrack: Number(req.query.audio || 0),
-    pos: Number(req.query.pos || 0),
-    q: String(req.query.q || ''),
-    hint: String(req.query.hint || ''),
-    req, res
-  })
-}))
-
-app.get('/api/subs/:hash', wrap(async (req, res) => {
-  const torrent = await ensureTorrent(String(req.params.hash).toLowerCase(), String(req.query.name || ''))
-  let vtt
-  if (req.query.track !== undefined) {
-    const picked = pickVideo(torrent, req.query.file)
-    if (!picked) return res.status(404).json({ error: 'arquivo nao encontrado' })
-    vtt = await embeddedSubVtt(torrent, picked.file, req.query.track)
-  } else {
-    vtt = await externalSubVtt(torrent, req.query.ext)
-  }
-  res.set('Content-Type', 'text/vtt; charset=utf-8').set('Cache-Control', 'no-store').send(vtt)
-}))
-
-app.get('/api/progress', (_req, res) => res.json({ items: progress.recent(24) }))
-app.get('/api/progress/:key', (req, res) => res.json(progress.get(req.params.key) || {}))
-app.delete('/api/progress', (_req, res) => { progress.clear(); res.json({ ok: true }) })
-app.post('/api/progress', (req, res) => {
-  const b = req.body || {}
-  if (!b.key) return res.status(400).json({ error: 'key obrigatoria' })
-  progress.set(String(b.key), {
-    t: Number(b.t) || 0, d: Number(b.d) || 0,
-    title: b.title || '', poster: b.poster || '', year: b.year || '',
-    hash: b.hash || '', file: b.file ?? null, name: b.name || ''
-  })
-  res.json({ ok: true })
-})
-app.delete('/api/progress/:key', (req, res) => { progress.del(req.params.key); res.json({ ok: true }) })
-
-app.use('/api', (_req, res) => res.status(404).json({ error: 'rota nao encontrada' }))
-
-const server = USE_HTTPS
-  ? https.createServer(ensureCerts(path.join(__dirname, 'certs')), app)
-  : http.createServer(app)
-
-const scheme = USE_HTTPS ? 'https' : 'http'
-
-server.listen(PORT, '0.0.0.0', async () => {
-  const ff = await ensureFfmpeg()
-  console.log('')
-  console.log('  cinep2p no ar' + (USE_HTTPS ? ' (HTTPS)' : ''))
-  console.log('')
-  console.log(`  Neste PC:  ${scheme}://localhost:${PORT}`)
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const a of list || []) {
-      if (a.family === 'IPv4' && !a.internal) {
-        console.log(`  Na rede:   ${scheme}://${a.address}:${PORT}   <- celular, TV Box, projetor`)
-      }
-    }
-  }
-  console.log('')
-  console.log(`  ffmpeg: ${ff ? 'ok (' + ffmpegInfo().source + ')' : 'NAO ENCONTRADO'}`)
-  console.log('  dica: para instalar como app no celular, use npm run https')
-  console.log('')
-  console.log('  Ctrl+C para parar.')
-  console.log('')
-})
-
-process.on('SIGINT', () => { destroyClient(); process.exit(0) })
+process.on('SIGINT', () => desligar('SIGINT'));
+process.on('SIGTERM', () => desligar('SIGTERM'));
+process.on('unhandledRejection', (e) => {
+    log.aviso('promise rejeitada:', e instanceof Error ? (e.stack || e.message) : String(e));
+});
