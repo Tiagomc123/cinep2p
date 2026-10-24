@@ -1,0 +1,81 @@
+/* ================= CineP2P 6.0 - abas, episodios, audio, externo ================= */
+
+.tipo-tabs{display:flex;gap:3px;margin-left:6px;flex:0 0 auto}
+.tipo-tab{
+  border:0;background:transparent;color:#9aa2b1;font-weight:700;font-size:13.5px;
+  padding:8px 12px;border-radius:9px;cursor:pointer;position:relative;white-space:nowrap;
+}
+.tipo-tab.active{color:#fff;background:rgba(255,255,255,.08)}
+.tipo-tab.active::after{
+  content:"";position:absolute;left:12px;right:12px;bottom:2px;height:2px;
+  background:var(--brand);border-radius:2px;
+}
+.drawer-tipos{display:flex;gap:6px;padding:0 0 12px}
+.drawer-tipos .tipo-tab{flex:1;text-align:center;background:rgba(255,255,255,.05)}
+
+.bottom-nav{grid-template-columns:repeat(5,1fr)}
+
+/* ------------------------------ episodios ------------------------------ */
+.temporadas{display:flex;gap:10px;align-items:center;margin:6px 0 14px;flex-wrap:wrap}
+.temporadas label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:#9aa2b1}
+.temporadas select{padding:10px 12px;border-radius:9px;border:1px solid #24272f;background:#1b1e26;min-width:190px}
+
+.episodios{display:flex;flex-direction:column;gap:10px;margin-top:4px}
+.episodio{
+  display:flex;gap:12px;text-align:left;padding:10px;border-radius:12px;cursor:pointer;
+  border:1px solid #24272f;background:rgba(255,255,255,.02);color:inherit;width:100%;
+  transition:border-color .15s, background .15s;
+}
+.episodio:hover{border-color:#3a445e;background:rgba(255,255,255,.06)}
+.episodio:active{transform:scale(.995)}
+.ep-thumb{
+  position:relative;flex:0 0 118px;height:68px;border-radius:9px;overflow:hidden;
+  background:#14161c;display:grid;place-items:center;
+}
+.ep-thumb img{width:100%;height:100%;object-fit:cover}
+.ep-play{
+  position:absolute;inset:0;display:grid;place-items:center;font-size:18px;color:#fff;
+  background:rgba(0,0,0,.35);text-shadow:0 2px 8px #000;
+}
+.ep-info{min-width:0;flex:1}
+.ep-info strong{display:block;font-size:13.5px;margin-bottom:3px}
+.ep-meta{font-size:11.5px;color:#9aa2b1;display:block;margin-bottom:5px}
+.ep-info p{
+  margin:0;font-size:12.5px;line-height:1.5;color:#b9c1cf;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+}
+.ep-num{color:var(--brand);font-weight:800;margin-right:5px}
+
+/* ------------------------------ audio / externo ------------------------------ */
+.pv-vlc{background:rgba(255,122,0,.9) !important;color:#fff}
+.pv-btn.pv-audio-ok{background:rgba(61,220,132,.85) !important;color:#06210f}
+
+.pv-aviso{
+  position:absolute;left:12px;right:12px;top:calc(62px + env(safe-area-inset-top));
+  z-index:7;display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:11px 14px;border-radius:12px;
+  background:rgba(229,9,20,.92);color:#fff;font-size:13px;font-weight:600;
+  box-shadow:0 10px 30px rgba(0,0,0,.5);
+}
+.pv-aviso .btn{background:rgba(0,0,0,.35);border-color:transparent;color:#fff}
+
+.pv-externo{display:flex;flex-direction:column;gap:9px}
+.pv-externo-item{
+  display:flex;justify-content:space-between;align-items:center;gap:10px;
+  padding:14px;border:1px solid #24272f;border-radius:12px;cursor:pointer;
+  background:rgba(255,255,255,.02);
+}
+.pv-externo-item:active{background:rgba(255,255,255,.07)}
+.pv-externo-item strong{font-size:14px;display:block}
+.pv-externo-item span{font-size:11.5px;color:#9aa2b1}
+.pv-url{
+  margin-top:8px;padding:11px;border-radius:10px;background:#000;border:1px solid #24272f;
+  font-size:11px;color:#8ce4ff;word-break:break-all;line-height:1.6;
+}
+
+@media (max-width:520px){
+  .brand{font-size:17px;padding:0 2px}
+  .tipo-tab{padding:7px 9px;font-size:12.5px}
+  .topbar{gap:4px}
+  .ep-thumb{flex:0 0 96px;height:56px}
+}

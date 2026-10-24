@@ -1,20 +1,20 @@
 ﻿<#
-    CineP2P 4.0 - PT-BR RIGOROSO + Player imediato (30s / legendas) + concorrencia total
-    -----------------------------------------------------------------------------------
-    Executa SOBRE a versao anterior (CineP2P 3.0).
+    CineP2P 8.0 - Player Universal: stream bruto + audio decodificado no navegador
+    -------------------------------------------------------------------------------
+    Executa SOBRE o CineP2P 7.0 (mantendo Series/SXXEXX e o filtro anti-mistura).
 
-    Novidades desta rodada:
-      * Classificador rigoroso de audio brasileiro (antidublagem estrangeira)
-      * Registro de confianca por fonte (trackers nacionais = PT-BR nativo)
-      * 3 scrapers nacionais novos (RedeTorrent, BluDV, TorrentDosFilmes)
-      * Selecao automatica do melhor magnet PT-BR (sem modal intermediario)
-      * Player abre IMEDIATAMENTE e carrega tudo dentro da area do video
-      * Controles: +/-30s, seek, volume, fullscreen e seletor de LEGENDAS
-      * Legendas: arquivos do proprio torrent (.srt/.ass/.vtt) convertidos p/ VTT
-      * Limpeza absoluta de disco mantida (cache/<jobId> destruido ao sair)
+    Mudancas:
+      1. src/streamer.js: TRANSCODE=nunca por padrao. Sem ffprobe, sem ffmpeg.
+         Stream BitTorrent bruto com Range: bytes completo. canPlay com 1%.
+      2. public/app.js: player universal. Le o cabecalho MKV no proprio navegador,
+         identifica as faixas de audio e, quando o codec e AC3/EAC3/DTS ou a faixa
+         PT nao e a primeira, ativa um pipeline de RESGATE: demux MKV em JS +
+         decodificacao via Web Audio API, com a faixa em portugues selecionada
+         automaticamente e sincronizada com o video.
+      3. src/ranking.js: descarte sumario de instaladores/ativadores/ISOs.
+      4. public/index.html: sem avisos, sem barras, sem botoes extras.
 
-    Uso:  powershell -ExecutionPolicy Bypass -File .\atualizar.ps1
-    Flags: -SkipInstall  -Root <pasta>
+    Uso: powershell -ExecutionPolicy Bypass -File .\atualizar.ps1
 #>
 [CmdletBinding()]
 param(
@@ -22,7 +22,6 @@ param(
     [string]$Root
 )
 
-# ----------------------------------------------------------------------
 if ($PSVersionTable.PSVersion.Major -le 5 -and -not $env:CINEP2P_UTF8) {
     try {
         $selfPath = $MyInvocation.MyCommand.Path
@@ -68,15 +67,15 @@ function Write-ProjectFile {
 function Write-Step { param([string]$Text) Write-Host ''; Write-Host ("== " + $Text) -ForegroundColor Cyan }
 
 Write-Host ''
-Write-Host '  CineP2P 4.0 - PT-BR rigoroso + player imediato' -ForegroundColor White
-Write-Host '  ----------------------------------------------' -ForegroundColor DarkGray
+Write-Host '  CineP2P 8.0 - Player universal + audio no navegador' -ForegroundColor White
+Write-Host '  ---------------------------------------------------' -ForegroundColor DarkGray
 
 # ----------------------------------------------------------------------
 Write-Step 'Backup'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $BackupDir = Join-Path $Root ('.backup-' + $Stamp)
 $madeBackup = $false
-foreach ($t in @('server.js', 'src', 'public', '.env', 'package.json')) {
+foreach ($t in @('server.js', 'src', 'public', '.env')) {
     $p = Join-Path $Root $t
     if (Test-Path -LiteralPath $p) {
         if (-not $madeBackup) { New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null; $madeBackup = $true }
@@ -85,219 +84,57 @@ foreach ($t in @('server.js', 'src', 'public', '.env', 'package.json')) {
 }
 if ($madeBackup) { Write-Host ("  backup: " + (Split-Path -Leaf $BackupDir)) -ForegroundColor DarkGray }
 
-New-Item -ItemType Directory -Force -Path (Join-Path $Root 'src\scrapers') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $Root 'src') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Root 'public') | Out-Null
 
 # ======================================================================
-Write-Step 'Filtro PT-BR rigoroso'
-
-# ----------------------------------------------------------------------
-$fontesJs = @'
-'use strict';
-
-/**
- * Registro de confianca por fonte.
- *
- * nacional = true  -> tracker lusofono: "DUBLADO"/"NACIONAL" significa
- *                     nativamente portugues do Brasil (nao precisa de marcador extra)
- * regiao           -> 'br' | 'fr' | 'global' (usado para desconfiar de dublagem alheia)
- */
-const FONTES = {
-  'Commandotorrents': { nacional: true,  regiao: 'br' },
-  'Lapumia':          { nacional: true,  regiao: 'br' },
-  'RedeTorrent':      { nacional: true,  regiao: 'br' },
-  'BluDV':            { nacional: true,  regiao: 'br' },
-  'TorrentDosFilmes': { nacional: true,  regiao: 'br' },
-
-  'Torrent9':         { nacional: false, regiao: 'fr' },
-
-  'Torrentio':        { nacional: false, regiao: 'global' },
-  'YTS':              { nacional: false, regiao: 'global' },
-  'ThePirateBay':     { nacional: false, regiao: 'global' },
-  'EZTV':             { nacional: false, regiao: 'global' },
-  'SolidTorrents':    { nacional: false, regiao: 'global' },
-  'TorrentGalaxy':    { nacional: false, regiao: 'global' },
-  '1337x':            { nacional: false, regiao: 'global' }
-};
-
-function info(nome) {
-  return FONTES[nome] || { nacional: false, regiao: 'global' };
-}
-
-module.exports = { FONTES: FONTES, info: info };
-'@
-Write-ProjectFile 'src/fontes.js' $fontesJs
-
-# ----------------------------------------------------------------------
-$ptbrJs = @'
-'use strict';
-
-/**
- * Classificador RIGOROSO de audio brasileiro.
- *
- * O problema real: o mundo inteiro escreve "DUBLADO" no titulo. Um release
- * russo/espanhol/frances tambem diz "DUBLADO". Aqui a classificacao exige
- * prova ou desconfia explicitamente.
- *
- * Niveis:
- *   confirmado  -> marcador PT-BR explicito, OU fonte nacional + DUBLADO/DUAL
- *   provavel    -> DUAL AUDIO limpo, ou DUBLADO sem nenhum termo estrangeiro
- *   incerto     -> DUBLADO/DUAL convivendo com idiomas estrangeiros
- *   estrangeiro -> dublagem estrangeira declarada (russo, VF, castellano...)
- */
-
-const fontes = require('./fontes');
-
-const RE_PTBR = [
-  /\bpt[\s._-]?br\b/i,
-  /\bptbr\b/i,
-  /\[\s?br\s?\]/i,
-  /\(\s?br\s?\)/i,
-  /\bbrasileir[ao]\b/i,
-  /\bnacional\b/i,
-  /\bportugu[eê]s\b/i,
-  /\bdublado\s?br\b/i,
-  /\bdub\s?br\b/i,
-  /\baudio[\s._-]?(pt|por)\b/i,
-  /(?:\+|\be\b)\s*(?:por|pt)\b/i,
-  /\bpor\s*\+/i,
-  /\bpt[\s._-]?pt\b/i
-];
-
-const RE_ESTRANGEIROS = [
-  { nome: 'russo',    re: /\bruss?[oa]?\b|\brus\b|\brussian\b|русск|италь/i },
-  { nome: 'espanhol', re: /\bespanhol\b|\bespa[nñ]ol\b|\bcastellano\b|\blatino\b|\besp\b|\bspa\b/i },
-  { nome: 'ingles',   re: /\bingl[eê]s\b|\benglish\b|\beng\b/i },
-  { nome: 'frances',  re: /\bfranc[eê]s\b|\bfrench\b|\btruefrench\b|\bvff?\b|\bvostfr\b/i },
-  { nome: 'alemao',   re: /\balem[aã]o\b|\bgerman\b|\bdeutsch\b/i },
-  { nome: 'italiano', re: /\bitalian[oa]\b|\bita\b/i },
-  { nome: 'hindi',    re: /\bhindi\b|\btamil\b|\btelugu\b/i },
-  { nome: 'asiatico', re: /\bjapon[eê]s\b|\bjap\b|\bchin[eê]s\b|\bchinese\b|\bkorean\b|\bkor\b/i }
-];
-
-const RE_ADJ_ESTRANGEIRO = /(dublad\w*|dual[\s._-]?audio|audio[\s._-]?dual|\bdual\b)\W{0,3}(rus\w*|esp\w*|castellano|latino|ingl\w*|english|\beng\b|franc\w*|french|vff?|alem\w*|german|deutsch|ital\w*|hindi|jap\w*|chin\w*|kor\w*)/i;
-
-const RE_ESTRANGEIRO_MAIS_PT = /(rus\w*|esp\w*|castellano|latino|ingl\w*|english|franc\w*|alem\w*|ital\w*|hindi)\s*\+\s*(por|pt|ptbr|dublado|portugu)/i;
-
-const PESOS = {
-  confirmado: 100,
-  provavel: 70,
-  incerto: 30,
-  estrangeiro: 10,
-  desconhecido: 0
-};
-
-function normalizar(txt) {
-  return ' ' + String(txt || '').replace(/[._]/g, ' ').replace(/\s+/g, ' ').toLowerCase().trim() + ' ';
-}
-
-function rotulo(nivel, sinais) {
-  if (sinais.dual) return nivel === 'confirmado' ? 'Dual Audio (PT-BR)' : (nivel === 'provavel' ? 'Dual Audio (provavel PT-BR)' : 'Dual Audio ?');
-  if (sinais.dublado) {
-    if (nivel === 'confirmado') return 'Dublado PT-BR';
-    if (nivel === 'provavel') return 'Dublado (provavel PT-BR)';
-    return 'Dublado ?';
-  }
-  if (sinais.leg) return 'Legendado';
-  return 'Original';
-}
-
-/**
- * @param {string} titulo  nome do release
- * @param {string} fonte   nome do indexador (para checar confianca)
- */
-function avaliar(titulo, fonte) {
-  const t = normalizar(titulo);
-  const meta = fontes.info(fonte);
-
-  const sinais = {
-    ptbr: RE_PTBR.some(function (r) { return r.test(t); }),
-    dublado: /dublad|dublagem|\bdub\b/.test(t),
-    dual: /\bdual\b|\bmulti\b/.test(t),
-    leg: /legendad|\bleg\b|subtitulad|\bsub\b/.test(t)
-  };
-
-  const riscos = [];
-  RE_ESTRANGEIROS.forEach(function (e) { if (e.re.test(t)) riscos.push(e.nome); });
-
-  const adjEstrangeiro = RE_ADJ_ESTRANGEIRO.test(t);
-  const estrangeiroComPt = RE_ESTRANGEIRO_MAIS_PT.test(t);
-  const motivos = [];
-  let nivel;
-
-  if (estrangeiroComPt && !sinais.ptbr) {
-    nivel = 'confirmado';
-    motivos.push('idioma estrangeiro listado junto com POR/PT');
-    sinais.ptbr = true;
-  } else if (sinais.ptbr && !adjEstrangeiro) {
-    nivel = 'confirmado';
-    motivos.push('marcador PT-BR explicito');
-  } else if (sinais.ptbr) {
-    nivel = 'provavel';
-    motivos.push('marcador PT-BR com dublagem estrangeira citada');
-  } else if (meta.nacional && (sinais.dublado || sinais.dual)) {
-    nivel = 'confirmado';
-    motivos.push('fonte nacional (' + meta.regiao.toUpperCase() + ') + ' + (sinais.dual ? 'DUAL AUDIO' : 'DUBLADO'));
-  } else if (sinais.dual && riscos.length === 0) {
-    nivel = 'provavel';
-    motivos.push('DUAL AUDIO sem termo estrangeiro');
-  } else if (sinais.dual) {
-    nivel = 'incerto';
-    motivos.push('DUAL AUDIO convivendo com ' + riscos.join('/'));
-  } else if (sinais.dublado && riscos.length === 0 && meta.regiao !== 'fr') {
-    nivel = 'provavel';
-    motivos.push('DUBLADO sem termo estrangeiro');
-  } else if (sinais.dublado) {
-    nivel = 'incerto';
-    motivos.push('DUBLADO possivelmente estrangeiro (' + riscos.join('/') + ')');
-  } else if (adjEstrangeiro) {
-    nivel = 'estrangeiro';
-    motivos.push('dublagem estrangeira declarada');
-  } else if (sinais.leg) {
-    nivel = 'incerto';
-    motivos.push('legendado');
-  } else {
-    nivel = 'desconhecido';
-  }
-
-  return {
-    nivel: nivel,
-    peso: PESOS[nivel],
-    audio: rotulo(nivel, sinais),
-    motivos: motivos,
-    riscos: riscos,
-    fonteNacional: meta.nacional,
-    regiaoFonte: meta.regiao,
-    elegivel: (nivel === 'confirmado' || nivel === 'provavel')
-  };
-}
-
-module.exports = { avaliar: avaliar, PESOS: PESOS, RE_PTBR: RE_PTBR };
-'@
-Write-ProjectFile 'src/ptbr.js' $ptbrJs
+Write-Step 'Ranking: descarte de instaladores'
 
 # ----------------------------------------------------------------------
 $rankingJs = @'
 'use strict';
 
 /**
- * Ranking final: PT-BR confirmado > PT-BR provavel > seeders > qualidade.
- * Deduplica por infoHash mantendo a melhor ocorrencia.
+ * Ranking: identidade -> descarte de instalador -> nivel de audio -> seeders.
+ *
+ * Regra nova: qualquer resultado que pareca instalador de PC, ativador ou
+ * imagem de disco e sumariamente rejeitado antes de tudo.
  */
 
 const ptbr = require('./ptbr');
+const validar = require('./validar');
 
-function pesoQualidade(q) {
-  switch (String(q || '').toLowerCase()) {
-    case '2160p': return 3.2;
-    case '1080p': return 4;
-    case '720p': return 2.4;
-    case '480p': return 1;
-    default: return 1.5;
-  }
+const RANK_NIVEL = {
+  duals51: 6, confirmado: 5, provavel: 4, incerto: 3, fraco: 2, estrangeiro: 1, desconhecido: 0
+};
+
+/* Sinais fortes: sozinhos ja condenam o arquivo */
+const RE_INSTALADOR_FORTE = /(monkrus|preactivated|pre-activated|\bkeygen\b|\bcrack(ed|eado)?\b|\bactivator\b|\bativador\b|\bportable\b|\bkms(?:pico|auto)?\b|\.exe\b|\.iso\b|\.img\b|\.zip\b|\.rar\b|\.7z\b|\.msi\b|\bx64\b|\bx86\b|\bwin(?:dows)?\b)/i;
+
+/* Sinais fracos: so condenam se nao houver marcador de video */
+const RE_INSTALADOR_FRACO = /(\brepack\b|\bpatch\b|\bsetup\b|\binstaller\b|\binstalador\b|\bserial\b|\bmedicine\b|\bupdate\b)/i;
+
+const RE_MARCADOR_VIDEO = /(2160p|1440p|1080p|720p|480p|4k|bluray|bdrip|brrip|webrip|web[\s._-]?dl|remux|hdtv|dvdrip|x264|x265|h264|h265|hevc|av1)/i;
+
+function ehInstalador(nome) {
+  const n = String(nome || '');
+  if (RE_INSTALADOR_FORTE.test(n)) return true;
+  if (RE_INSTALADOR_FRACO.test(n) && !RE_MARCADOR_VIDEO.test(n)) return true;
+  if (RE_INSTALADOR_FRACO.test(n) && !/\b(19|20)\d{2}\b/.test(n) && !RE_MARCADOR_VIDEO.test(n)) return true;
+  return false;
 }
 
-const PESO_NIVEL = { confirmado: 3200, provavel: 1800, incerto: 480, estrangeiro: 90, desconhecido: 0 };
+function pad(n) { return String(n || 1).padStart(2, '0'); }
+
+function bonusQualidade(q) {
+  switch (String(q || '').toLowerCase()) {
+    case '1080p': return 520;
+    case '720p': return 300;
+    case '2160p': return 430;
+    case '480p': return 80;
+    default: return 150;
+  }
+}
 
 function contemPalavras(titulo, alvo) {
   if (!alvo) return false;
@@ -308,18 +145,32 @@ function contemPalavras(titulo, alvo) {
 }
 
 function pontuar(item, ctx) {
-  let s = PESO_NIVEL[item.ptbr.nivel] || 0;
-  s += pesoQualidade(item.quality) * 340;
-  s += Math.log10(Math.max(1, item.seeders)) * 150;
+  let s = (RANK_NIVEL[item.ptbr.nivel] || 0) * 100000;
+  s += Math.log10(Math.max(1, item.seeders) + 1) * 1200;
+  s += bonusQualidade(item.quality);
 
-  if (item.ptbr.fonteNacional) s += 220;
-  if (ctx.ano && String(item.title).indexOf(String(ctx.ano)) !== -1) s += 180;
-  if (contemPalavras(item.title, ctx.titulo)) s += 150;
-  if (contemPalavras(item.title, ctx.tituloOriginal)) s += 120;
-  if (item.fileIdx !== null && item.fileIdx !== undefined) s += 60;
-  if (/(\bcam\b|\bts\b|hdcam|hdts|telesync)/i.test(item.title)) s -= 260;
-  if (item.seeders === 0) s -= 110;
-  if (item.sizeBytes && item.sizeBytes < 250 * 1024 * 1024) s -= 50;
+  if (item.ptbr.temDual51) s += 900;
+  if (contemPalavras(item.title, ctx.titulo)) s += 220;
+  if (contemPalavras(item.title, ctx.tituloOriginal)) s += 180;
+  if (item.fileIdx !== null && item.fileIdx !== undefined) s += 70;
+
+  if (ctx.tipo === 'tv') {
+    const tag = 'S' + pad(ctx.temporada) + 'E' + pad(ctx.episodio);
+    const reExato = new RegExp(tag, 'i');
+    const reOutroEp = /\bS\d{1,2}E\d{1,2}\b/i;
+    const rePack = /(complete|completa|temporada\s*\d|season\s*\d|\bpack\b)/i;
+    if (reExato.test(item.title)) s += 1200;
+    else if (reOutroEp.test(item.title)) s -= 200;
+    if (rePack.test(item.title) && !reExato.test(item.title)) s -= 600;
+  } else if (ctx.ano && String(item.title).indexOf(String(ctx.ano)) !== -1) {
+    s += 260;
+  }
+
+  if (item.quality === '2160p' && item.seeders < 15) s -= 900;
+  if (item.quality === '2160p' && /(\bdv\b|dolby[\s._-]?vision|hdr10|\bhdr\b)/i.test(item.title)) s -= 250;
+  if (/(\bcam\b|\bts\b|hdcam|hdts|telesync)/i.test(item.title)) s -= 450;
+  if (item.seeders === 0) s -= 400;
+  if (item.sizeBytes && item.sizeBytes < 200 * 1024 * 1024) s -= 60;
 
   return s;
 }
@@ -336,6 +187,7 @@ function normalizar(item) {
     seeders: Number(item.seeders || 0),
     fileIdx: (item.fileIdx === null || item.fileIdx === undefined) ? null : item.fileIdx,
     source: item.source || 'Desconhecida',
+    imdbConfirmado: !!item.imdbConfirmado,
     score: 0,
     ptbr: null,
     elegivel: false
@@ -349,10 +201,7 @@ function deduplicar(lista) {
     if (!chave) return;
     const atual = mapa.get(chave);
     if (!atual) { mapa.set(chave, item); return; }
-    if (item.score > atual.score) {
-      mapa.set(chave, item);
-      return;
-    }
+    if (item.score > atual.score) { mapa.set(chave, item); return; }
     if (item.seeders > atual.seeders) atual.seeders = item.seeders;
     if (!atual.size && item.size) { atual.size = item.size; atual.sizeBytes = item.sizeBytes; }
     if (atual.fileIdx === null && item.fileIdx !== null) atual.fileIdx = item.fileIdx;
@@ -362,9 +211,36 @@ function deduplicar(lista) {
 }
 
 function preparar(lista, ctx) {
-  const validos = lista
+  const estrito = process.env.FILTRO_ESTRITO !== '0';
+  const semInstalador = process.env.FILTRO_INSTALADOR !== '0';
+
+  const validos = [];
+  const descartados = [];
+
+  lista
     .filter(function (i) { return i && i.magnet && /^magnet:/i.test(i.magnet); })
-    .map(normalizar);
+    .forEach(function (bruto) {
+      const item = normalizar(bruto);
+
+      if (semInstalador && ehInstalador(item.title)) {
+        item.valido = false;
+        item.motivoInvalido = 'descartado: instalador/ativador/iso';
+        descartados.push(item);
+        return;
+      }
+
+      if (!estrito || item.imdbConfirmado) {
+        item.valido = true;
+        item.motivoInvalido = item.imdbConfirmado ? 'imdb id confirmado' : 'filtro desligado';
+      } else {
+        const v = validar.validar(item.title, ctx);
+        item.valido = v.ok;
+        item.motivoInvalido = v.ok ? v.motivo : ('descartado: ' + v.motivo);
+      }
+
+      if (item.valido) validos.push(item);
+      else descartados.push(item);
+    });
 
   validos.forEach(function (i) {
     i.ptbr = ptbr.avaliar(i.title, i.source);
@@ -373,341 +249,87 @@ function preparar(lista, ctx) {
   });
 
   const unicos = deduplicar(validos);
-  unicos.sort(function (a, b) {
-    if (a.elegivel !== b.elegivel) return a.elegivel ? -1 : 1;
-    return b.score - a.score;
-  });
-  return unicos;
+  unicos.sort(function (a, b) { return b.score - a.score; });
+  return { validos: unicos, descartados: descartados };
 }
 
-module.exports = { preparar: preparar, pontuar: pontuar };
+module.exports = { preparar: preparar, RANK_NIVEL: RANK_NIVEL, ehInstalador: ehInstalador };
 '@
 Write-ProjectFile 'src/ranking.js' $rankingJs
 
-# ----------------------------------------------------------------------
-$magnetsJs = @'
-'use strict';
-
-/**
- * Esteira concorrente: todos os scrapers em paralelo (Promise.all),
- * unificacao, dedupe por hash, classificacao PT-BR e escolha automatica.
- */
-
-const scrapers = require('./scrapers');
-const ranking = require('./ranking');
-
-async function buscar(ctx) {
-  const t0 = Date.now();
-  const resultados = await scrapers.executar(ctx);
-
-  const stats = resultados.map(function (r) {
-    return { fonte: r.label, nacional: !!r.nacional, itens: r.itens.length, ms: r.ms, erro: r.erro };
-  }).sort(function (a, b) { return b.itens - a.itens; });
-
-  let brutos = [];
-  resultados.forEach(function (r) {
-    r.itens.forEach(function (item) {
-      item.source = item.source || r.label;
-      brutos.push(item);
-    });
-  });
-
-  const ranqueados = ranking.preparar(brutos, ctx);
-  const elegiveis = ranqueados.filter(function (f) { return f.elegivel; });
-  const melhor = elegiveis[0] || ranqueados[0] || null;
-
-  return {
-    melhor: melhor,
-    fontes: ranqueados.slice(0, 40),
-    ptbr: elegiveis.slice(0, 20),
-    total: ranqueados.length,
-    ptbrTotal: elegiveis.length,
-    confirmados: ranqueados.filter(function (f) { return f.ptbr.nivel === 'confirmado'; }).length,
-    ms: Date.now() - t0,
-    scrapers: stats
-  };
-}
-
-module.exports = { buscar: buscar };
-'@
-Write-ProjectFile 'src/magnets.js' $magnetsJs
-
 # ======================================================================
-Write-Step 'Scrapers nacionais'
-
-# ----------------------------------------------------------------------
-$scraperRede = @'
-'use strict';
-
-const http = require('./_http');
-
-const HOSTS = ['https://redetorrent.com', 'https://www.redetorrent.com'];
-
-module.exports = {
-  name: 'redetorrent',
-  label: 'RedeTorrent',
-  nacional: true,
-  supports: function () { return true; },
-  search: async function (ctx) {
-    const termo = encodeURIComponent(ctx.tituloOriginal || ctx.titulo || '');
-    if (!termo) return [];
-    for (const host of HOSTS) {
-      try {
-        const url = host + '/?s=' + termo;
-        const html = await http.fetchText(url);
-        const direto = http.rowsFromHtml(html, { source: 'RedeTorrent' });
-        if (direto.length >= 2) return direto.slice(0, 20);
-        const profundo = await http.deepSearch(url, 'href="(' + host.replace(/\./g, '\\.') + '/[^"?#]+)"', 4, 'RedeTorrent');
-        if (profundo.length) return profundo.slice(0, 20);
-      } catch (e) { }
-    }
-    return [];
-  }
-};
-'@
-Write-ProjectFile 'src/scrapers/redetorrent.js' $scraperRede
-
-# ----------------------------------------------------------------------
-$scraperBludv = @'
-'use strict';
-
-const http = require('./_http');
-
-const HOSTS = ['https://bludv.xyz', 'https://bludv.tv', 'https://bludv.site'];
-
-module.exports = {
-  name: 'bludv',
-  label: 'BluDV',
-  nacional: true,
-  supports: function () { return true; },
-  search: async function (ctx) {
-    const termo = encodeURIComponent(ctx.tituloOriginal || ctx.titulo || '');
-    if (!termo) return [];
-    for (const host of HOSTS) {
-      try {
-        const url = host + '/?s=' + termo;
-        const html = await http.fetchText(url);
-        const direto = http.rowsFromHtml(html, { source: 'BluDV' });
-        if (direto.length >= 2) return direto.slice(0, 20);
-        const profundo = await http.deepSearch(url, 'href="(' + host.replace(/\./g, '\\.') + '/[^"?#]+)"', 4, 'BluDV');
-        if (profundo.length) return profundo.slice(0, 20);
-      } catch (e) { }
-    }
-    return [];
-  }
-};
-'@
-Write-ProjectFile 'src/scrapers/bludv.js' $scraperBludv
-
-# ----------------------------------------------------------------------
-$scraperTdf = @'
-'use strict';
-
-const http = require('./_http');
-
-const HOSTS = ['https://torrentdosfilmes.tv', 'https://www.torrentdosfilmes.tv'];
-
-module.exports = {
-  name: 'torrentdosfilmes',
-  label: 'TorrentDosFilmes',
-  nacional: true,
-  supports: function () { return true; },
-  search: async function (ctx) {
-    const termo = encodeURIComponent(ctx.tituloOriginal || ctx.titulo || '');
-    if (!termo) return [];
-    for (const host of HOSTS) {
-      const candidatos = [
-        host + '/?s=' + termo,
-        host + '/torrents/search/?search=' + termo
-      ];
-      for (const url of candidatos) {
-        try {
-          const html = await http.fetchText(url);
-          const direto = http.rowsFromHtml(html, { source: 'TorrentDosFilmes' });
-          if (direto.length >= 2) return direto.slice(0, 20);
-          const profundo = await http.deepSearch(url, 'href="(' + host.replace(/\./g, '\\.') + '/[^"?#]+)"', 4, 'TorrentDosFilmes');
-          if (profundo.length) return profundo.slice(0, 20);
-        } catch (e) { }
-      }
-    }
-    return [];
-  }
-};
-'@
-Write-ProjectFile 'src/scrapers/torrentdosfilmes.js' $scraperTdf
-
-# ----------------------------------------------------------------------
-$scrapersIndex = @'
-'use strict';
-
-/**
- * Registry de scrapers. Tudo roda em PARALELO via Promise.all.
- * Fontes nacionais primeiro (elas provam PT-BR nativamente).
- */
-
-const TODOS = [
-  require('./commandotorrents'),
-  require('./lapumia'),
-  require('./redetorrent'),
-  require('./bludv'),
-  require('./torrentdosfilmes'),
-  require('./torrent9'),
-  require('./torrentio'),
-  require('./yts'),
-  require('./piratebay'),
-  require('./eztv'),
-  require('./solidtorrents'),
-  require('./torrentgalaxy'),
-  require('./x1337')
-];
-
-function ativos() {
-  const env = String(process.env.SCRAPERS_ENABLED || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-  if (!env.length) return TODOS;
-  return TODOS.filter(function (s) { return env.indexOf(s.name) !== -1; });
-}
-
-async function executar(ctx) {
-  const lista = ativos();
-  const tarefas = lista.map(async function (s) {
-    const t0 = Date.now();
-    if (s.supports && !s.supports(ctx)) {
-      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: [], ms: 0, erro: null };
-    }
-    try {
-      const itens = await s.search(ctx);
-      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: Array.isArray(itens) ? itens : [], ms: Date.now() - t0, erro: null };
-    } catch (e) {
-      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: [], ms: Date.now() - t0, erro: e.message };
-    }
-  });
-  return Promise.all(tarefas);
-}
-
-module.exports = { executar: executar, todos: TODOS, ativos: ativos };
-'@
-Write-ProjectFile 'src/scrapers/index.js' $scrapersIndex
-
-# ======================================================================
-Write-Step 'Legendas + player'
-
-# ----------------------------------------------------------------------
-$subtitulosJs = @'
-'use strict';
-
-/**
- * Suporte a legendas: detecta arquivos de legenda dentro do proprio torrent
- * e converte para WebVTT (unico formato que o <track> do navegador entende).
- */
-
-const EXT = /\.(srt|ass|ssa|vtt|sub|sbv)$/i;
-
-function ehLegenda(nome) { return EXT.test(String(nome || '')); }
-
-function extensao(nome) {
-  const m = /\.([a-z0-9]+)$/i.exec(String(nome || ''));
-  return m ? m[1].toLowerCase() : 'srt';
-}
-
-function idiomaDe(nome) {
-  const n = String(nome || '').toLowerCase();
-  if (/pt[\s._-]?br|ptbr|portugu|brasil|\bpt\b|\bpor\b|\bbr\b/.test(n)) return { code: 'pt-BR', label: 'Portugues (BR)' };
-  if (/english|\beng\b|\ben\b|ingles/.test(n)) return { code: 'en', label: 'Ingles' };
-  if (/spanish|espa|castellano|latino|\bes\b/.test(n)) return { code: 'es', label: 'Espanhol' };
-  if (/french|franc|\bfr\b/.test(n)) return { code: 'fr', label: 'Frances' };
-  return { code: 'pt-BR', label: 'Legenda' };
-}
-
-/** Decodifica respeitando arquivos antigos em Windows-1252 (comum no BR). */
-function decodificar(buffer) {
-  const utf8 = buffer.toString('utf8');
-  if (utf8.indexOf('\uFFFD') === -1) return utf8;
-  return buffer.toString('latin1');
-}
-
-function srtParaVtt(texto) {
-  const corpo = String(texto)
-    .replace(/^\uFEFF/, '')
-    .replace(/\r+/g, '')
-    .replace(/(\d{1,2}:\d{2}:\d{2}),(\d{1,3})/g, '$1.$2')
-    .replace(/^WEBVTT\s*/i, '');
-  return 'WEBVTT\n\n' + corpo.replace(/\n{3,}/g, '\n\n').trim() + '\n';
-}
-
-function tempoAss(valor) {
-  const m = /(\d+):(\d{2}):(\d{2})[.,](\d{1,2})/.exec(String(valor || '').trim());
-  if (!m) return null;
-  const cs = m[4].padEnd(3, '0').slice(0, 3);
-  return m[1].padStart(2, '0') + ':' + m[2] + ':' + m[3] + '.' + cs;
-}
-
-function assParaVtt(texto) {
-  const saida = ['WEBVTT', ''];
-  let n = 0;
-  String(texto).replace(/\r/g, '').split('\n').forEach(function (linha) {
-    if (linha.indexOf('Dialogue:') !== 0) return;
-    const partes = linha.slice('Dialogue:'.length).split(',');
-    if (partes.length < 10) return;
-    const ini = tempoAss(partes[1]);
-    const fim = tempoAss(partes[2]);
-    const txt = partes.slice(9).join(',').replace(/\{[^}]*\}/g, '').replace(/\\N|\\n/g, '\n').trim();
-    if (!ini || !fim || !txt) return;
-    n++;
-    saida.push(String(n), ini + ' --> ' + fim, txt, '');
-  });
-  return saida.join('\n');
-}
-
-function converter(texto, ext) {
-  const e = String(ext || 'srt').toLowerCase();
-  if (e === 'vtt') return /^WEBVTT/i.test(texto) ? texto : 'WEBVTT\n\n' + texto;
-  if (e === 'ass' || e === 'ssa') return assParaVtt(texto);
-  return srtParaVtt(texto);
-}
-
-module.exports = { ehLegenda: ehLegenda, extensao: extensao, idiomaDe: idiomaDe, decodificar: decodificar, converter: converter };
-'@
-Write-ProjectFile 'src/subtitulos.js' $subtitulosJs
+Write-Step 'Streamer: stream bruto, zero CPU'
 
 # ----------------------------------------------------------------------
 $streamerJs = @'
 'use strict';
 
 /**
- * Player P2P blindado + legendas + limpeza absoluta de disco.
+ * Streamer 8.0 - modo BRUTO.
  *
- *  - announce list massiva no magnet, no add() e re-anuncio a cada 6s
- *  - timeout com retentativas automaticas
- *  - cada job vive em cache/<jobId> e a pasta e destruida ao fechar
- *  - legendas do proprio torrent sao coletadas e servidas em WebVTT
+ *  - TRANSCODE=nunca (padrao): nenhum ffprobe, nenhum ffmpeg. O arquivo do
+ *    torrent e servido direto com Range: bytes, CPU zero, inicio instantaneo.
+ *  - canPlay em 1% de buffer (ou 2 MB), o que faz o video comecar na hora.
+ *  - O frontend cuida do audio: le o cabecalho MKV, escolhe a faixa PT e,
+ *    se o codec for AC3/EAC3/DTS, decodifica em JS via Web Audio.
+ *  - TRANSCODE=auto|sempre continua disponivel (usa ffmpeg, agora opcional).
  */
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const WebTorrent = require('webtorrent');
+
 const trackers = require('./trackers');
 const subtitulos = require('./subtitulos');
 
 const TRACKERS = trackers.TRACKERS;
 const appendTrackers = trackers.appendTrackers;
 
+const MODO_TRANSCODE = String(process.env.TRANSCODE || 'nunca').toLowerCase();
+
+/* ------------------- ffmpeg (so carrega se precisar) ---------------- */
+
+let ffmpegLib = null;
+let FFMPEG_PATH = '';
+let FFPROBE_PATH = '';
+
+function carregarFfmpeg() {
+  if (ffmpegLib) return;
+  try { ffmpegLib = require('fluent-ffmpeg'); } catch (e) { ffmpegLib = null; }
+  FFMPEG_PATH = process.env.FFMPEG_PATH || '';
+  FFPROBE_PATH = process.env.FFPROBE_PATH || '';
+  if (!FFMPEG_PATH) { try { FFMPEG_PATH = require('@ffmpeg-installer/ffmpeg').path; } catch (e) { } }
+  if (!FFPROBE_PATH) { try { FFPROBE_PATH = require('@ffprobe-installer/ffprobe').path; } catch (e) { } }
+  if (ffmpegLib && FFMPEG_PATH) ffmpegLib.setFfmpegPath(FFMPEG_PATH);
+  if (ffmpegLib && FFPROBE_PATH) ffmpegLib.setFfprobePath(FFPROBE_PATH);
+}
+
+if (MODO_TRANSCODE !== 'nunca') carregarFfmpeg();
+
+const VIDEO_OK_MP4 = /^(h264|hevc|vp9|av1|vp8)$/i;
+const AUDIO_OK_NAV = /^(aac|mp3|opus|vorbis|flac)$/i;
+
+/* ----------------------------- constantes -------------------------- */
+
 const cacheSetting = process.env.TORRENT_CACHE_DIR || 'cache';
 const CACHE_ROOT = path.isAbsolute(cacheSetting) ? cacheSetting : path.join(__dirname, '..', cacheSetting);
 
 const CACHE_MODE = (process.env.CACHE_MODE || 'session').toLowerCase();
-const METADATA_TIMEOUT = Number(process.env.METADATA_TIMEOUT || 40) * 1000;
-const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT || 12 * 60 * 1000);
+const METADATA_TIMEOUT = Number(process.env.METADATA_TIMEOUT || 60) * 1000;
+const BUFFER_TIMEOUT = Number(process.env.BUFFER_TIMEOUT || 150) * 1000;
+const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT || 15 * 60 * 1000);
 const MAX_JOBS = Number(process.env.MAX_JOBS || 3);
-const MAX_CONNS = Number(process.env.MAX_CONNS || 200);
-const MIN_BUFFER_PERCENT = Number(process.env.MIN_BUFFER_PERCENT || 3);
-const MIN_BUFFER_MB = Number(process.env.MIN_BUFFER_MB || 8);
+const MAX_CONNS = Number(process.env.MAX_CONNS || 300);
+const MIN_BUFFER_PERCENT = Number(process.env.MIN_BUFFER_PERCENT || 1);
+const MIN_BUFFER_MB = Number(process.env.MIN_BUFFER_MB || 2);
 const MAX_SUBS = Number(process.env.MAX_SUBS || 8);
+const USAR_UTP = process.env.ENABLE_UTP === '1';
 
 fs.mkdirSync(CACHE_ROOT, { recursive: true });
 
 const client = new WebTorrent({
-  maxConns: MAX_CONNS, dht: true, tracker: true, lsd: true, utp: true, webSeeds: true
+  maxConns: MAX_CONNS, dht: true, tracker: true, lsd: true, utp: USAR_UTP, webSeeds: true
 });
 
 client.on('error', function (e) { console.error('[webtorrent] ' + e.message); });
@@ -774,8 +396,11 @@ function start(params) {
     fileIdx: (params.fileIdx === undefined || params.fileIdx === null || params.fileIdx === '') ? null : Number(params.fileIdx),
     peers: 0, progress: 0, buffer: 0, speed: 0, downloaded: 0, total: 0,
     fileName: '', streamUrl: null, canPlay: false,
-    subs: [], subsSelecionadas: [],
-    tentativas: 0, torrent: null, file: null, nudge: null, timers: []
+    subs: [], tentativas: 0,
+    transcode: MODO_TRANSCODE !== 'nunca',
+    analisado: MODO_TRANSCODE === 'nunca',
+    duracao: 0, videoCodec: '', audioCodec: '', audioIdx: 0, motivoTranscode: '',
+    torrent: null, file: null, nudge: null, vigia: null, timers: []
   };
 
   jobs.set(id, job);
@@ -785,6 +410,7 @@ function start(params) {
 
 function limparTimers(job) {
   if (job.nudge) { clearInterval(job.nudge); job.nudge = null; }
+  if (job.vigia) { clearInterval(job.vigia); job.vigia = null; }
   (job.timers || []).forEach(function (t) { clearTimeout(t); });
   job.timers = [];
 }
@@ -805,41 +431,40 @@ function attach(job) {
   try { torrent.strategy = 'sequential'; } catch (e) { }
 
   job.nudge = setInterval(function () {
-    if (job.state === 'pronto') return;
+    if (job.canPlay) return;
     job.peers = torrent.numPeers || 0;
     if (job.peers === 0) {
       TRACKERS.forEach(function (t) { try { torrent.addTracker(t); } catch (e) { } });
-      job.message = 'Reforcando announce list (' + TRACKERS.length + ' trackers)...';
-    }
-  }, 6000);
-
-  job.timers.push(setTimeout(function () {
-    if (job.state === 'pronto') return;
-    job.message = 'Metadados demorando. Tentando trackers alternativos...';
-  }, 14000));
-
-  job.timers.push(setTimeout(function () {
-    if (job.state === 'pronto') return;
-    if (job.tentativas < 2) {
-      job.tentativas += 1;
-      job.message = 'Tentativa ' + job.tentativas + ' expirada. Reiniciando...';
-      restart(job);
+      job.message = 'Reanunciando em ' + TRACKERS.length + ' trackers...';
     } else {
-      job.state = 'erro';
-      job.message = 'Tempo esgotado: nenhum peer respondeu.';
-      limparTimers(job);
+      job.message = 'Conectado a ' + job.peers + ' peers. Buscando metadados...';
     }
-  }, METADATA_TIMEOUT));
+  }, 5000);
+
+  job.vigia = setInterval(function () {
+    if (job.canPlay) return;
+    const idade = agora() - job.createdAt;
+    if (!job.file) {
+      if (idade > METADATA_TIMEOUT) tentarDeNovo(job, 'metadados');
+      return;
+    }
+    if (job.downloaded === 0 && (torrent.numPeers || 0) === 0 && idade > METADATA_TIMEOUT + BUFFER_TIMEOUT) {
+      tentarDeNovo(job, 'buffer');
+    }
+  }, 5000);
 
   torrent.on('metadata', function () {
     job.state = 'metadados';
     job.message = 'Metadados recebidos. Selecionando video...';
-    setTimeout(function () { onReady(job); }, 400);
+    setTimeout(function () { onReady(job); }, 200);
   });
 
   torrent.on('ready', function () { onReady(job); });
-  torrent.on('noPeers', function () { job.message = 'Sem peers no momento, reforcando trackers...'; });
-  torrent.on('wire', function () { job.peers = torrent.numPeers || 0; });
+  torrent.on('noPeers', function () { job.message = 'Sem peers, reanunciando...'; });
+  torrent.on('wire', function () {
+    job.peers = torrent.numPeers || 0;
+    if (!job.canPlay) job.message = 'Conectado a ' + job.peers + ' peers.';
+  });
 
   torrent.on('download', function () {
     job.progress = torrent.progress || 0;
@@ -848,12 +473,15 @@ function attach(job) {
     job.peers = torrent.numPeers || 0;
     if (job.file) {
       job.buffer = (job.file.progress || 0) * 100;
-      if (!job.canPlay) {
+      if (!job.canPlay && job.analisado) {
         const baixado = job.file.downloaded || 0;
         if (job.buffer >= MIN_BUFFER_PERCENT || baixado >= MIN_BUFFER_MB * 1024 * 1024) {
           job.canPlay = true;
           job.state = 'pronto';
-          job.message = 'Buffer pronto.';
+          job.message = 'Pronto.';
+        } else {
+          job.state = 'bufferizando';
+          job.message = 'Preparando stream... ' + job.buffer.toFixed(1) + '%';
         }
       }
     }
@@ -868,13 +496,29 @@ function attach(job) {
   torrent.on('warning', function (e) { console.warn('[torrent] ' + e.message); });
 }
 
-function restart(job) {
-  limparTimers(job);
+function tentarDeNovo(job, motivo) {
+  if (job.tentativas >= 3) {
+    job.state = 'erro';
+    job.message = 'Tempo esgotado (' + motivo + '): nenhum peer respondeu apos 4 tentativas.';
+    limparTimers(job);
+    return;
+  }
+  job.tentativas += 1;
+  job.message = 'Tentativa ' + job.tentativas + '/3 (' + motivo + '). Reiniciando...';
+  reiniciar(job);
+}
+
+function reiniciar(job) {
   try { if (job.torrent) job.torrent.destroy({ destroyStore: false }); } catch (e) { }
+  limparTimers(job);
   job.torrent = null;
-  job.state = 'conectando';
+  job.file = null;
+  job.canPlay = false;
+  job.downloaded = 0;
   job.peers = 0;
-  setTimeout(function () { if (job.state !== 'pronto' && !job.torrent) attach(job); }, 500);
+  job.state = 'conectando';
+  job.createdAt = agora();
+  setTimeout(function () { if (!job.torrent) attach(job); }, 500);
 }
 
 function pickFile(torrent, fileIdx) {
@@ -926,7 +570,7 @@ function onReady(job) {
   job.total = file.length;
   job.streamUrl = '/api/play/stream?jobId=' + job.id;
   job.state = 'bufferizando';
-  job.message = 'Conectando aos peers (buffer)...';
+  job.message = 'Preparando stream...';
 
   job.subs = coletarSubs(torrent, file);
   const manter = [file].concat(job.subs.map(function (s) { return torrent.files[s.fileIndex]; }));
@@ -934,6 +578,85 @@ function onReady(job) {
   (torrent.files || []).forEach(function (f) {
     if (manter.indexOf(f) === -1) { try { f.deselect(); } catch (e) { } }
   });
+
+  // Modo bruto: nada de ffprobe, nada de ffmpeg. Ja esta analisado.
+  if (MODO_TRANSCODE === 'nunca') {
+    job.analisado = true;
+    job.transcode = false;
+    job.motivoTranscode = 'bruto';
+    return;
+  }
+
+  job.message = 'Analisando codecs...';
+  analisar(job).catch(function () { }).then(function () {
+    job.analisado = true;
+    job.message = job.transcode ? 'Convertendo audio...' : 'Stream direto.';
+  });
+}
+
+/* ------------------- ffprobe (apenas modo transcode) --------------- */
+
+function ffprobeStream(file) {
+  return new Promise(function (resolve) {
+    if (!FFPROBE_PATH) { resolve(null); return; }
+    const { spawn } = require('child_process');
+    let saida = '';
+    let stream = null, proc = null;
+    const fim = function (valor) {
+      try { if (stream) stream.destroy(); } catch (e) { }
+      try { if (proc && !proc.killed) proc.kill('SIGKILL'); } catch (e) { }
+      resolve(valor);
+    };
+    try {
+      proc = spawn(FFPROBE_PATH, [
+        '-hide_banner', '-loglevel', 'error',
+        '-probesize', '5000000', '-analyzeduration', '5000000',
+        '-print_format', 'json', '-show_streams', '-show_format', 'pipe:0'
+      ], { windowsHide: true });
+    } catch (e) { resolve(null); return; }
+
+    const timer = setTimeout(function () { fim(null); }, 25000);
+    proc.stdout.on('data', function (c) { saida += c.toString(); });
+    proc.on('close', function () {
+      clearTimeout(timer);
+      let json = null;
+      try { json = JSON.parse(saida); } catch (e) { json = null; }
+      fim(json);
+    });
+    proc.on('error', function () { clearTimeout(timer); fim(null); });
+
+    try {
+      stream = file.createReadStream({ start: 0, end: Math.min(file.length - 1, 8 * 1024 * 1024) });
+      stream.on('error', function () { });
+      stream.pipe(proc.stdin);
+      proc.stdin.on('error', function () { });
+    } catch (e) { }
+  });
+}
+
+async function analisar(job) {
+  const info = await ffprobeStream(job.file);
+  if (!info || !info.streams) { job.transcode = MODO_TRANSCODE === 'sempre'; return; }
+
+  const videos = info.streams.filter(function (s) { return s.codec_type === 'video'; });
+  const audios = info.streams.filter(function (s) { return s.codec_type === 'audio'; });
+
+  job.videoCodec = videos[0] ? String(videos[0].codec_name || '') : '';
+  job.duracao = (info.format && Number(info.format.duration)) || 0;
+
+  let idxPt = -1;
+  audios.forEach(function (a, i) {
+    const lang = String((a.tags && (a.tags.language || a.tags.LANGUAGE)) || '').toLowerCase();
+    if (idxPt === -1 && /por|pt|bra/.test(lang)) idxPt = i;
+  });
+  job.audioIdx = idxPt >= 0 ? idxPt : 0;
+  job.audioCodec = audios[job.audioIdx] ? String(audios[job.audioIdx].codec_name || '') : '';
+
+  const audioRuim = job.audioCodec && !AUDIO_OK_NAV.test(job.audioCodec);
+  const videoRuim = job.videoCodec && !VIDEO_OK_MP4.test(job.videoCodec);
+
+  if (MODO_TRANSCODE === 'sempre') job.transcode = true;
+  else job.transcode = !!(audioRuim || videoRuim);
 }
 
 /* ------------------------------- HTTP ------------------------------ */
@@ -948,6 +671,15 @@ function handle(jobId, req, res) {
   const file = job.file;
   if (!file) { res.writeHead(202, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Aguardando metadados...'); return; }
 
+  const modoPedido = String(req.query.modo || '').toLowerCase();
+  const modo = modoPedido || (job.transcode ? 'transcode' : 'direto');
+
+  if (modo === 'transcode') servirTranscode(job, req, res);
+  else servirDireto(job, req, res);
+}
+
+function servirDireto(job, req, res) {
+  const file = job.file;
   const total = file.length;
   const base = {
     'content-type': mimeFor(file.name),
@@ -985,13 +717,66 @@ function handle(jobId, req, res) {
   stream.pipe(res);
 }
 
+function servirTranscode(job, req, res) {
+  if (!ffmpegLib) carregarFfmpeg();
+  if (!ffmpegLib || !FFMPEG_PATH) { servirDireto(job, req, res); return; }
+
+  const t = Math.max(0, Number(req.query.t) || 0);
+  const file = job.file;
+  const bytesPorSeg = job.duracao > 0 ? (file.length / job.duracao) : 0;
+  const inicio = (t > 0 && bytesPorSeg > 0) ? Math.min(file.length - 1, Math.floor(bytesPorSeg * t)) : 0;
+
+  res.writeHead(200, {
+    'content-type': 'video/mp4',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+    'transfer-encoding': 'chunked'
+  });
+
+  let entrada;
+  try { entrada = file.createReadStream({ start: inicio }); }
+  catch (e) { res.end(); return; }
+
+  const cmd = ffmpegLib(entrada);
+  cmd.inputOptions(['-probesize', '5000000', '-analyzeduration', '5000000']);
+  if (t > 0) cmd.inputOptions(['-itsoffset', String(-t)]);
+
+  const opts = [
+    '-map 0:v:0',
+    '-map 0:a:' + job.audioIdx,
+    '-max_muxing_queue_size 2048',
+    '-movflags frag_keyframe+empty_moov+default_base_moof',
+    '-avoid_negative_ts make_zero'
+  ];
+
+  if (VIDEO_OK_MP4.test(job.videoCodec)) cmd.videoCodec('copy');
+  else { cmd.videoCodec('libx264'); opts.push('-preset ultrafast', '-crf 23', '-pix_fmt yuv420p', '-threads 0'); }
+
+  opts.push('-c:a aac', '-ac 2', '-b:a 192k', '-ar 48000');
+  cmd.outputOptions(opts);
+  cmd.format('mp4');
+
+  cmd.on('error', function () { try { res.end(); } catch (e) { } });
+
+  let encerrado = false;
+  const limpar = function () {
+    if (encerrado) return;
+    encerrado = true;
+    try { entrada.destroy(); } catch (e) { }
+    try { cmd.kill('SIGKILL'); } catch (e) { }
+  };
+  req.on('close', limpar);
+  res.on('close', limpar);
+
+  try { cmd.pipe(res, { end: true }); } catch (e) { try { res.end(); } catch (er) { } }
+}
+
 /* ---------------------------- legendas ----------------------------- */
 
 function lerArquivo(file, limite) {
   return new Promise(function (resolve, reject) {
     const pedacos = [];
-    let total = 0;
-    let resolvido = false;
+    let total = 0, resolvido = false;
     const stream = file.createReadStream();
     const fim = function (erro) {
       if (resolvido) return;
@@ -1001,8 +786,7 @@ function lerArquivo(file, limite) {
     };
     const timer = setTimeout(function () { try { stream.destroy(); } catch (e) { } fim(); }, 25000);
     stream.on('data', function (c) {
-      pedacos.push(c);
-      total += c.length;
+      pedacos.push(c); total += c.length;
       if (total > (limite || 4 * 1024 * 1024)) { try { stream.destroy(); } catch (e) { } fim(); }
     });
     stream.on('end', function () { fim(); });
@@ -1019,12 +803,7 @@ async function legenda(jobId, idx) {
   if (!file) return null;
   job.lastAccess = agora();
   const texto = await lerArquivo(file);
-  return {
-    nome: sub.nome,
-    code: sub.code,
-    label: sub.label,
-    vtt: subtitulos.converter(texto, subtitulos.extensao(file.name))
-  };
+  return { nome: sub.nome, code: sub.code, label: sub.label, vtt: subtitulos.converter(texto, subtitulos.extensao(file.name)) };
 }
 
 /* ------------------------------ status ----------------------------- */
@@ -1039,7 +818,6 @@ function status(jobId) {
     state: job.state,
     message: job.message,
     titulo: job.titulo,
-    qualidade: job.qualidade,
     fileName: job.fileName,
     peers: t ? (t.numPeers || 0) : job.peers,
     progress: t ? (t.progress || 0) : 0,
@@ -1048,7 +826,9 @@ function status(jobId) {
     downloaded: t ? (t.downloaded || 0) : 0,
     total: job.total || 0,
     canPlay: !!job.canPlay,
-    minBuffer: MIN_BUFFER_PERCENT,
+    tentativa: job.tentativas,
+    transcode: !!job.transcode,
+    duracao: job.duracao || 0,
     subs: job.subs ? job.subs.map(function (s) { return { idx: s.idx, nome: s.nome, code: s.code, label: s.label }; }) : [],
     elapsed: Math.round((agora() - job.createdAt) / 1000),
     streamUrl: job.streamUrl
@@ -1060,10 +840,8 @@ function stop(jobId) {
   if (!job) return false;
   limparTimers(job);
   jobs.delete(jobId);
-
   const dir = job.dir;
   const finalizar = function () { if (CACHE_MODE !== 'keep') apagarPasta(dir); };
-
   try {
     if (job.torrent) job.torrent.destroy({ destroyStore: true }, function () { finalizar(); });
     else finalizar();
@@ -1089,240 +867,11 @@ process.on('SIGTERM', function () { try { client.destroy(); } catch (e) { } stop
 
 module.exports = {
   start: start, status: status, stop: stop, stopTudo: stopTudo,
-  handle: handle, legenda: legenda, jobs: jobs, CACHE_ROOT: CACHE_ROOT
+  handle: handle, legenda: legenda, jobs: jobs, CACHE_ROOT: CACHE_ROOT,
+  FFMPEG_OK: !!FFMPEG_PATH, FFPROBE_OK: !!FFPROBE_PATH, MODO_TRANSCODE: MODO_TRANSCODE
 };
 '@
 Write-ProjectFile 'src/streamer.js' $streamerJs
-
-# ======================================================================
-Write-Step 'Servidor'
-
-# ----------------------------------------------------------------------
-$serverJs = @'
-'use strict';
-
-/**
- * CineP2P 4.0 - API desacoplada (Capacitor/Cordova ready).
- */
-
-require('dotenv').config();
-
-if (typeof fetch !== 'function') { console.error('Node.js 18+ necessario.'); process.exit(1); }
-
-const path = require('path');
-const express = require('express');
-
-const tmdb = require('./src/tmdb');
-const magnets = require('./src/magnets');
-const streamer = require('./src/streamer');
-
-const PORT = Number(process.env.PORT || 3000);
-const HOST = process.env.HOST || '0.0.0.0';
-const VERSAO = '4.0.0';
-
-const app = express();
-app.disable('x-powered-by');
-app.use(express.json());
-
-app.use(function (req, res, next) {
-  res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-allow-headers', 'content-type,range,accept');
-  res.setHeader('access-control-expose-headers', 'content-range,content-length,accept-ranges');
-  res.setHeader('access-control-allow-methods', 'GET,HEAD,POST,OPTIONS');
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-  next();
-});
-
-function fail(res, err, status) {
-  const code = (err && err.code === 'TMDB_NOT_CONFIGURED') ? 503 : (status || 500);
-  console.error('[api] ' + (err && err.message));
-  res.status(code).json({ error: (err && err.message) ? err.message : 'Erro interno.' });
-}
-
-/* ------------------------------ config ----------------------------- */
-
-app.get('/api/health', function (req, res) {
-  res.json({ ok: true, versao: VERSAO, tmdb: tmdb.isConfigured(), uptime: Math.round(process.uptime()) });
-});
-
-app.get('/api/config', function (req, res) {
-  res.json({
-    versao: VERSAO,
-    tmdbConfigurado: tmdb.isConfigured(),
-    idioma: tmdb.cfg().language,
-    cache: streamer.CACHE_ROOT,
-    minBuffer: Number(process.env.MIN_BUFFER_PERCENT || 3)
-  });
-});
-
-app.get('/api/generos', async function (req, res) {
-  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
-  try { res.json({ generos: await tmdb.generos(tipo) }); } catch (err) { fail(res, err); }
-});
-
-/* ------------------------------- home ------------------------------ */
-
-app.get('/api/home', async function (req, res) {
-  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
-  try {
-    const base = tipo === 'tv'
-      ? [tmdb.list('/tv/popular', null, 'tv'), tmdb.list('/tv/top_rated', null, 'tv'), tmdb.list('/trending/tv/week', null, 'tv')]
-      : [tmdb.list('/movie/popular', null, 'movie'), tmdb.list('/movie/top_rated', null, 'movie'), tmdb.list('/trending/movie/week', null, 'movie')];
-
-    const r = await Promise.all(base.concat([
-      tmdb.lancamentos(tipo),
-      tmdb.porGenero(tipo, tipo === 'tv' ? 10759 : 28),
-      tmdb.porGenero(tipo, 35),
-      tmdb.porGenero(tipo, 16),
-      tmdb.porGenero(tipo, tipo === 'tv' ? 9648 : 53),
-      tmdb.porGenero(tipo, 27)
-    ]));
-
-    const hero = (r[2] && r[2][0]) || (r[0] && r[0][0]) || null;
-    const rows = [
-      { titulo: 'Lancamentos (Ultimo Ano)', itens: (r[3] || []).slice(0, 20) },
-      { titulo: 'Populares', itens: (r[0] || []).slice(0, 20) },
-      { titulo: 'Em Alta Agora', itens: (r[2] || []).slice(0, 20) },
-      { titulo: 'Mais Bem Avaliados', itens: (r[1] || []).slice(0, 20) },
-      { titulo: 'Acao', itens: (r[4] || []).slice(0, 20) },
-      { titulo: 'Comedia', itens: (r[5] || []).slice(0, 20) },
-      { titulo: 'Animacao', itens: (r[6] || []).slice(0, 20) },
-      { titulo: 'Suspense', itens: (r[7] || []).slice(0, 20) },
-      { titulo: 'Terror', itens: (r[8] || []).slice(0, 20) }
-    ].filter(function (x) { return x.itens.length; });
-
-    res.json({ tipo: tipo, hero: hero, rows: rows, atualizado: Date.now() });
-  } catch (err) { fail(res, err); }
-});
-
-/* ---------------------------- catalogo ----------------------------- */
-
-app.get('/api/filmes/populares', async function (req, res) {
-  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
-  try { res.json({ itens: await tmdb.list(tipo === 'tv' ? '/tv/popular' : '/movie/popular', { page: req.query.pagina || 1 }, tipo) }); }
-  catch (err) { fail(res, err); }
-});
-
-app.get('/api/filmes/lancamentos', async function (req, res) {
-  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
-  try { res.json({ itens: await tmdb.lancamentos(tipo) }); } catch (err) { fail(res, err); }
-});
-
-app.get('/api/filmes/top', async function (req, res) {
-  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
-  try { res.json({ itens: await tmdb.list(tipo === 'tv' ? '/tv/top_rated' : '/movie/top_rated', { page: req.query.pagina || 1 }, tipo) }); }
-  catch (err) { fail(res, err); }
-});
-
-app.get('/api/filmes/genero/:id', async function (req, res) {
-  const tipo = req.query.tipo === 'tv' ? 'tv' : 'movie';
-  try { res.json({ itens: await tmdb.porGenero(tipo, req.params.id, req.query.pagina) }); }
-  catch (err) { fail(res, err); }
-});
-
-app.get('/api/media/:tipo/:id', async function (req, res) {
-  const tipo = req.params.tipo === 'tv' ? 'tv' : 'movie';
-  try { res.json(await tmdb.detalhes(tipo, req.params.id)); } catch (err) { fail(res, err); }
-});
-
-app.get('/api/buscar', async function (req, res) {
-  const q = String(req.query.q || '').trim();
-  if (q.length < 2) return res.json({ itens: [] });
-  try { res.json({ itens: await tmdb.buscar(q, req.query.tipo || null) }); } catch (err) { fail(res, err); }
-});
-
-/* ---------------------------- torrents ----------------------------- */
-
-app.get('/api/torrent', async function (req, res) {
-  const q = req.query;
-  const ctx = {
-    titulo: q.titulo || q.query || '',
-    tituloOriginal: q.tituloOriginal || '',
-    ano: q.ano || '',
-    imdbId: q.imdbId || null,
-    tipo: q.tipo === 'tv' ? 'tv' : 'movie',
-    temporada: Number(q.temporada) || 1,
-    episodio: Number(q.episodio) || 1
-  };
-  if (!ctx.titulo && !ctx.imdbId) return res.status(400).json({ error: 'Informe titulo ou imdbId.' });
-  try {
-    const r = await magnets.buscar(ctx);
-    res.json({
-      melhor: r.melhor,
-      fontes: r.fontes,
-      ptbr: r.ptbr,
-      total: r.total,
-      ptbrTotal: r.ptbrTotal,
-      confirmados: r.confirmados,
-      ms: r.ms,
-      scrapers: r.scrapers
-    });
-  } catch (err) { fail(res, err); }
-});
-
-/* ------------------------------ player ----------------------------- */
-
-app.get('/api/play', function (req, res) {
-  if (!req.query.magnet) return res.status(400).json({ error: 'Parametro magnet obrigatorio.' });
-  try {
-    const job = streamer.start({
-      magnet: String(req.query.magnet),
-      fileIdx: req.query.fileIdx,
-      titulo: req.query.titulo,
-      qualidade: req.query.qualidade
-    });
-    res.json({ jobId: job.id, statusUrl: '/api/play/status?jobId=' + job.id, streamUrl: '/api/play/stream?jobId=' + job.id });
-  } catch (err) { fail(res, err); }
-});
-
-app.get('/api/play/status', function (req, res) {
-  const s = streamer.status(String(req.query.jobId || ''));
-  if (!s) return res.status(404).json({ error: 'Job nao encontrado.' });
-  res.json(s);
-});
-
-app.get('/api/play/stream', function (req, res) { streamer.handle(String(req.query.jobId || ''), req, res); });
-
-app.get('/api/play/subs', function (req, res) {
-  const s = streamer.status(String(req.query.jobId || ''));
-  if (!s) return res.status(404).json({ error: 'Job nao encontrado.' });
-  res.json({ subs: s.subs || [] });
-});
-
-app.get('/api/play/subtitle', async function (req, res) {
-  try {
-    const r = await streamer.legenda(String(req.query.jobId || ''), Number(req.query.idx) || 0);
-    if (!r) { res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }); res.end('Legenda indisponivel.'); return; }
-    res.writeHead(200, {
-      'content-type': 'text/vtt; charset=utf-8',
-      'cache-control': 'no-store',
-      'access-control-allow-origin': '*'
-    });
-    res.end(r.vtt);
-  } catch (err) { fail(res, err); }
-});
-
-app.all('/api/play/stop', function (req, res) {
-  const id = String((req.query && req.query.jobId) || '');
-  res.json({ parado: id ? streamer.stop(id) : (streamer.stopTudo(), true) });
-});
-
-app.use('/api', function (req, res) { res.status(404).json({ error: 'Rota nao encontrada: ' + req.originalUrl }); });
-
-/* ---------------------------- estaticos ---------------------------- */
-
-app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
-app.get('*', function (req, res) { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
-
-app.listen(PORT, HOST, function () {
-  console.log('');
-  console.log('  CineP2P ' + VERSAO + ' -> http://localhost:' + PORT);
-  console.log('  Cache (apagado ao fechar o player): ' + streamer.CACHE_ROOT);
-  if (!tmdb.isConfigured()) console.log('  ATENCAO: TMDB_API_KEY ausente no .env');
-  console.log('');
-});
-'@
-Write-ProjectFile 'server.js' $serverJs
 
 # ======================================================================
 Write-Step 'Frontend'
@@ -1344,6 +893,7 @@ $indexHtml = @'
 <link rel="preconnect" href="https://image.tmdb.org">
 <link rel="stylesheet" href="/styles.css">
 <link rel="stylesheet" href="/player.css">
+<link rel="stylesheet" href="/series.css">
 </head>
 <body>
 
@@ -1354,6 +904,11 @@ $indexHtml = @'
 
   <a class="brand" id="brand" href="#">Cine<span>P2P</span></a>
 
+  <nav class="tipo-tabs" id="tipoTabs">
+    <button class="tipo-tab active" data-tipo="movie">Filmes</button>
+    <button class="tipo-tab" data-tipo="tv">Series</button>
+  </nav>
+
   <nav class="topnav" id="topnav">
     <button class="nav-link active" data-view="inicio">Inicio</button>
     <button class="nav-link" data-view="buscar">Buscar</button>
@@ -1363,7 +918,6 @@ $indexHtml = @'
   </nav>
 
   <div class="topbar-actions">
-    <button class="chip" id="tipoToggle">Filmes</button>
     <button class="icon-btn" id="searchBtn" aria-label="Buscar">
       <svg viewBox="0 0 24 24" width="21" height="21"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2" fill="none"/><path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     </button>
@@ -1377,6 +931,10 @@ $indexHtml = @'
       <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     </button>
   </div>
+  <div class="drawer-tipos">
+    <button class="tipo-tab active" data-tipo="movie">Filmes</button>
+    <button class="tipo-tab" data-tipo="tv">Series</button>
+  </div>
   <nav class="drawer-nav">
     <button class="nav-link" data-view="inicio">Inicio</button>
     <button class="nav-link" data-view="buscar">Buscar</button>
@@ -1384,7 +942,7 @@ $indexHtml = @'
     <button class="nav-link" data-view="lista">Minha Lista</button>
     <button class="nav-link" data-view="categorias">Categorias</button>
   </nav>
-  <p class="drawer-foot">CineP2P 4.0 &middot; audio PT-BR priorizado</p>
+  <p class="drawer-foot">CineP2P 8.0</p>
 </aside>
 <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
 
@@ -1396,7 +954,7 @@ $indexHtml = @'
 
   <section id="view-buscar" class="view hidden">
     <div class="searchbar">
-      <input id="searchInput" type="search" placeholder="Buscar filmes, series..." autocomplete="off">
+      <input id="searchInput" type="search" placeholder="Buscar..." autocomplete="off">
       <button class="btn small" id="searchGo">Buscar</button>
     </div>
     <div id="searchResults" class="grid"></div>
@@ -1421,20 +979,24 @@ $indexHtml = @'
 </main>
 
 <nav class="bottom-nav">
-  <button class="bn-item active" data-view="inicio">
-    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+  <button class="bn-item active" data-view="inicio" data-tipo="movie">
+    <svg viewBox="0 0 24 24" width="21" height="21"><path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
     <span>Inicio</span>
   </button>
-  <button class="bn-item" data-view="buscar">
-    <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2" fill="none"/><path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-    <span>Buscar</span>
+  <button class="bn-item" data-view="inicio" data-tipo="movie" data-aba="filmes">
+    <svg viewBox="0 0 24 24" width="21" height="21"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 5v14M16 5v14" stroke="currentColor" stroke-width="2"/></svg>
+    <span>Filmes</span>
+  </button>
+  <button class="bn-item" data-view="inicio" data-tipo="tv" data-aba="series">
+    <svg viewBox="0 0 24 24" width="21" height="21"><rect x="3" y="7" width="18" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 3l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <span>Series</span>
   </button>
   <button class="bn-item" data-view="lista">
-    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 4.6-7 9-7 9z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <svg viewBox="0 0 24 24" width="21" height="21"><path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 4.6-7 9-7 9z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
     <span>Lista</span>
   </button>
   <button class="bn-item" data-view="historico">
-    <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <svg viewBox="0 0 24 24" width="21" height="21"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     <span>Historico</span>
   </button>
 </nav>
@@ -1451,7 +1013,7 @@ $indexHtml = @'
 
 <!-- ============================ PLAYER ============================ -->
 <div id="player" class="player hidden">
-  <video id="video" playsinline webkit-playsinline preload="metadata"></video>
+  <video id="video" playsinline webkit-playsinline preload="auto" autoplay></video>
 
   <div class="pv-top" id="pvTop">
     <button class="pv-btn" id="pvClose" aria-label="Voltar">
@@ -1519,119 +1081,22 @@ $indexHtml = @'
 Write-ProjectFile 'public/index.html' $indexHtml
 
 # ----------------------------------------------------------------------
-$playerCss = @'
-/* ================= CineP2P - player imediato + controles ================= */
-
-.player{position:fixed;inset:0;z-index:120;background:#000;display:flex;align-items:center;justify-content:center}
-.player video{width:100%;height:100%;max-height:100%;object-fit:contain;background:#000}
-
-.pv-btn{
-  border:0;background:rgba(0,0,0,.42);color:#fff;border-radius:50%;
-  width:44px;height:44px;display:grid;place-items:center;cursor:pointer;
-  transition:background .15s, transform .12s;flex:0 0 auto;
-}
-.pv-btn:active{transform:scale(.92);background:rgba(255,255,255,.18)}
-.pv-btn.pv-txt{width:auto;border-radius:999px;padding:0 16px;font-weight:700;font-size:13.5px}
-.pv-btn.pv-cc{font-weight:800;font-size:13px;letter-spacing:.5px}
-.pv-btn.ativo{background:var(--brand);color:#fff}
-.pv-btn:disabled{opacity:.4}
-
-.pv-top{
-  position:absolute;top:0;left:0;right:0;z-index:5;
-  display:flex;align-items:center;gap:10px;padding:10px 12px;
-  padding-top:calc(10px + env(safe-area-inset-top));
-  background:linear-gradient(180deg,rgba(0,0,0,.85),transparent);
-  transition:opacity .25s;
-}
-.pv-title{flex:1;font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 2px 8px #000}
-
-.pv-center{
-  position:absolute;inset:0;z-index:3;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;gap:14px;text-align:center;padding:30px;
-  background:radial-gradient(600px 400px at 50% 50%, rgba(20,24,34,.9), #000 75%);
-  transition:opacity .3s, visibility .3s;
-}
-.pv-center.oculto{opacity:0;visibility:hidden}
-.pv-msg{margin:0;font-size:15px;font-weight:600}
-.pv-stats{margin:0;font-size:12.5px;color:#9aa2b1}
-.pv-fonte{margin:0;font-size:11.5px;color:#5f6878;max-width:80vw;line-height:1.5}
-.pv-bar{width:min(340px,78vw);height:6px;border-radius:99px;background:#20242e;overflow:hidden}
-.pv-bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--brand),#ff7b73);transition:width .3s}
-.pv-spinner{
-  width:40px;height:40px;border-radius:50%;
-  border:3px solid rgba(255,255,255,.14);border-top-color:var(--brand);
-  animation:girar .85s linear infinite;
-}
-@keyframes girar{to{transform:rotate(360deg)}}
-.pv-erro{color:#ff8f88;font-size:13.5px;line-height:1.6;max-width:420px}
-
-.pv-bottom{
-  position:absolute;left:0;right:0;bottom:0;z-index:5;
-  padding:10px 14px calc(14px + env(safe-area-inset-bottom));
-  background:linear-gradient(0deg,rgba(0,0,0,.92),transparent);
-  transition:opacity .25s;
-}
-.pv-seek{position:relative;height:26px;display:flex;align-items:center;cursor:pointer;touch-action:none}
-.pv-seek-track{position:relative;width:100%;height:5px;border-radius:99px;background:rgba(255,255,255,.22);overflow:hidden}
-.pv-seek-track i{display:block;height:100%;width:0;background:var(--brand)}
-.pv-seek-knob{
-  position:absolute;top:50%;left:0;width:14px;height:14px;border-radius:50%;
-  background:#fff;transform:translate(-50%,-50%);box-shadow:0 2px 8px rgba(0,0,0,.7);
-  pointer-events:none;
-}
-.pv-row{display:flex;align-items:center;gap:6px;margin-top:4px}
-.pv-time{font-size:12.5px;color:#c8cfda;margin-left:6px;font-variant-numeric:tabular-nums}
-.pv-spacer{flex:1}
-
-.player.controles-ocultos .pv-top,
-.player.controles-ocultos .pv-bottom{opacity:0;pointer-events:none}
-.player.controles-ocultos{cursor:none}
-
-.pv-sheet{
-  position:absolute;right:0;top:0;bottom:0;z-index:9;width:min(420px,92vw);
-  background:rgba(12,13,17,.97);backdrop-filter:blur(10px);
-  border-left:1px solid #24272f;display:flex;flex-direction:column;
-  animation:entrarSheet .18s ease;
-}
-@keyframes entrarSheet{from{transform:translateX(30px);opacity:.5}to{transform:translateX(0);opacity:1}}
-.pv-sheet-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid #24272f}
-.pv-sheet-body{flex:1;overflow:auto;padding:12px 14px 30px}
-.pv-fonte-item{
-  display:flex;justify-content:space-between;align-items:center;gap:10px;
-  padding:11px 12px;border:1px solid #24272f;border-radius:11px;margin-bottom:8px;
-  background:rgba(255,255,255,.02);cursor:pointer;
-}
-.pv-fonte-item.atual{border-color:var(--brand);background:rgba(229,9,20,.12)}
-.pv-fonte-item:active{background:rgba(255,255,255,.07)}
-.pv-fonte-nome{font-size:12.5px;color:#d9dfe9;line-height:1.35;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.pv-fonte-tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px;font-size:11px;color:#9aa2b1}
-.pv-badge{font-weight:800;padding:2px 7px;border-radius:6px;background:rgba(51,198,255,.16);color:var(--accent)}
-.pv-badge.br{background:rgba(61,220,132,.18);color:var(--ok)}
-.pv-badge.ruim{background:rgba(255,255,255,.08);color:#8d95a5}
-.pv-legenda-item{display:flex;justify-content:space-between;padding:13px;border-radius:11px;margin-bottom:6px;cursor:pointer;border:1px solid #24272f}
-.pv-legenda-item.atual{border-color:var(--brand);background:rgba(229,9,20,.12)}
-.pv-vazio{color:#9aa2b1;font-size:13px;text-align:center;padding:26px 10px;line-height:1.6}
-
-@media (min-width:860px){
-  .pv-time{font-size:13.5px}
-  .pv-btn{width:48px;height:48px}
-  .player:fullscreen .pv-center{background:radial-gradient(700px 500px at 50% 50%, rgba(20,24,34,.92), #000 78%)}
-}
-'@
-Write-ProjectFile 'public/player.css' $playerCss
-
-# ----------------------------------------------------------------------
 $appJs = @'
 'use strict';
 
 /* =====================================================================
-   CineP2P 4.0 - frontend vanilla (mobile-first, Capacitor-ready)
-   Player abre IMEDIATAMENTE; toda a informacao tecnica fica dentro do video.
+   CineP2P 8.0 - player universal
+
+   Video: stream BitTorrent bruto (Range), abre instantaneo.
+   Audio: o navegador le o cabecalho MKV, escolhe a faixa PT e, quando o
+          codec e AC3/EAC3/DTS (ou a faixa PT nao e a primeira), ativa o
+          RESGATE: demux MKV em JavaScript + decodificacao via Web Audio,
+          sincronizada com o video. Nenhum servidor de transcode.
    ===================================================================== */
 
 const API_BASE = String(window.CINEP2P_API_BASE || '').replace(/\/+$/, '');
 const PLACEHOLDER = '/placeholder.svg';
+const NIVEIS_BONS = ['duals51', 'confirmado', 'provavel'];
 
 const $ = function (s, r) { return (r || document).querySelector(s); };
 const $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
@@ -1649,6 +1114,8 @@ const state = {
   tipo: LS.get(K.tipo, 'movie'),
   generos: [],
   media: null,
+  temporada: 1,
+  episodio: 1,
   job: null,
   poll: null,
   podeTocar: false,
@@ -1657,8 +1124,13 @@ const state = {
   ultimoSalvar: 0,
   fontes: [],
   melhor: null,
+  tentativa: 0,
   subs: [],
   legendaAtiva: null,
+  total: 0,
+  duracao: 0,
+  mudo: false,
+  volume: 1,
   esconderTimer: null,
   arrastandoSeek: false
 };
@@ -1670,16 +1142,17 @@ const els = {
   categoriasChips: $('#categoriasChips'), categoriasGrid: $('#categoriasGrid'),
   modal: $('#modal'), modalBody: $('#modalBody'),
   toast: $('#toast'), drawer: $('#drawer'), drawerBackdrop: $('#drawerBackdrop'),
-  tipoToggle: $('#tipoToggle'),
   player: $('#player'), video: $('#video'),
-  pvTop: $('#pvTop'), pvBottom: $('#pvBottom'), pvCenter: $('#pvCenter'),
-  pvTitle: $('#pvTitle'), pvMsg: $('#pvMsg'), pvStats: $('#pvStats'), pvFill: $('#pvFill'),
-  pvFonte: $('#pvFonte'), pvTime: $('#pvTime'), pvProgress: $('#pvProgress'), pvKnob: $('#pvKnob'),
-  pvSeek: $('#pvSeek'), pvSheet: $('#pvSheet'), pvSheetBody: $('#pvSheetBody'), pvSheetTitle: $('#pvSheetTitle'),
+  pvCenter: $('#pvCenter'), pvTitle: $('#pvTitle'),
+  pvMsg: $('#pvMsg'), pvStats: $('#pvStats'), pvFill: $('#pvFill'), pvFonte: $('#pvFonte'),
+  pvTime: $('#pvTime'), pvProgress: $('#pvProgress'), pvKnob: $('#pvKnob'), pvSeek: $('#pvSeek'),
+  pvSheet: $('#pvSheet'), pvSheetBody: $('#pvSheetBody'), pvSheetTitle: $('#pvSheetTitle'),
   icoPlay: $('#icoPlay'), icoPause: $('#icoPause'), icoVol: $('#icoVol'), icoMudo: $('#icoMudo')
 };
 
 /* ------------------------------ utils ------------------------------ */
+
+function pad(n) { return String(n || 1).padStart(2, '0'); }
 
 function esc(s) {
   return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -1695,34 +1168,29 @@ function fmtSize(b) {
   while (v >= 1024 && i < u.length - 1) { v = v / 1024; i++; }
   return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + ' ' + u[i];
 }
-
 function fmtSpeed(b) { const n = Number(b); return n > 0 ? fmtSize(n) + '/s' : '0 B/s'; }
-
 function fmtTime(s) {
   if (!isFinite(s) || s < 0) s = 0;
   s = Math.floor(s);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(sec).padStart(2, '0');
 }
+function esperar(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
 let toastTimer = null;
 function toast(msg, tipo) {
   els.toast.textContent = msg;
   els.toast.className = 'toast' + (tipo === 'error' ? ' error' : '');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(function () { els.toast.classList.add('hidden'); }, 4600);
+  toastTimer = setTimeout(function () { els.toast.classList.add('hidden'); }, 4000);
 }
 
 function url(path, params) {
   const u = new URL(API_BASE + path, API_BASE ? API_BASE + '/' : window.location.origin);
-  if (params) {
-    Object.keys(params).forEach(function (k) {
-      const v = params[k];
-      if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, v);
-    });
-  }
+  if (params) Object.keys(params).forEach(function (k) {
+    const v = params[k];
+    if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, v);
+  });
   return u.toString();
 }
 
@@ -1763,12 +1231,22 @@ function setView(nome) {
     const el = $('#view-' + v);
     if (el) el.classList.toggle('hidden', v !== nome);
   });
-  $$('.nav-link, .bn-item').forEach(function (b) { b.classList.toggle('active', b.dataset.view === nome); });
+  $$('.nav-link').forEach(function (b) { b.classList.toggle('active', b.dataset.view === nome); });
   window.scrollTo({ top: 0 });
   if (nome === 'lista') renderLista();
   if (nome === 'historico') renderHistorico();
   if (nome === 'categorias') renderCategorias();
   if (nome === 'buscar') setTimeout(function () { els.searchInput.focus(); }, 120);
+}
+
+function setTipo(tipo) {
+  state.tipo = tipo === 'tv' ? 'tv' : 'movie';
+  LS.set(K.tipo, state.tipo);
+  $$('.tipo-tab').forEach(function (b) { b.classList.toggle('active', b.dataset.tipo === state.tipo); });
+  $$('.bn-item[data-aba]').forEach(function (b) { b.classList.toggle('active', b.dataset.tipo === state.tipo); });
+  els.searchInput.placeholder = state.tipo === 'tv' ? 'Buscar series...' : 'Buscar filmes...';
+  api('/api/generos', { tipo: state.tipo }).then(function (g) { state.generos = g.generos || []; }).catch(function () { });
+  carregarInicio();
 }
 
 function abrirDrawer() { els.drawer.classList.remove('hidden'); els.drawerBackdrop.classList.remove('hidden'); }
@@ -1791,18 +1269,20 @@ function renderHero(item) {
   els.hero.style.backgroundImage = 'url("' + (item.backdrop || item.poster || PLACEHOLDER) + '")';
   els.hero.innerHTML =
     '<div class="hero-inner">' +
-      '<p class="hero-kicker">Destaque de hoje</p>' +
+      '<p class="hero-kicker">' + (item.tipo === 'tv' ? 'Serie em destaque' : 'Destaque de hoje') + '</p>' +
       '<h1 class="hero-title">' + esc(item.titulo) + '</h1>' +
-      '<p class="hero-meta">' + esc(item.ano || '') +
-        (item.nota ? ' &middot; &#9733; ' + item.nota.toFixed(1) : '') + '</p>' +
+      '<p class="hero-meta">' + esc(item.ano || '') + (item.nota ? ' &middot; &#9733; ' + item.nota.toFixed(1) : '') + '</p>' +
       '<p class="hero-sinopse">' + esc(item.sinopse || '') + '</p>' +
       '<div class="hero-actions">' +
-        '<button class="btn primary" id="heroAssistir">Assistir agora</button>' +
+        '<button class="btn primary" id="heroAssistir">' + (item.tipo === 'tv' ? 'Ver episodios' : 'Assistir agora') + '</button>' +
         '<button class="btn ghost" id="heroTrailer">Assistir trailer</button>' +
         '<button class="btn ghost" id="heroFavoritar">Favoritar</button>' +
       '</div>' +
     '</div>';
-  $('#heroAssistir').addEventListener('click', function () { assistir(item); });
+  $('#heroAssistir').addEventListener('click', function () {
+    if (item.tipo === 'tv') abrirDetalhes('tv', item.id, false);
+    else assistir(item);
+  });
   $('#heroTrailer').addEventListener('click', function () { abrirDetalhes(item.tipo || 'movie', item.id, true); });
   $('#heroFavoritar').addEventListener('click', function () { alternarFavorito(item); });
 }
@@ -1818,8 +1298,10 @@ async function carregarInicio() {
     const data = await api('/api/home', { tipo: state.tipo });
     renderHero(data.hero);
     let html = '';
-    const continuar = LS.get(K.continuar, []);
-    if (continuar.length) html += rowHtml('Continue Assistindo', continuar, { progresso: true });
+    if (state.tipo === 'movie') {
+      const continuar = LS.get(K.continuar, []);
+      if (continuar.length) html += rowHtml('Continue Assistindo', continuar, { progresso: true });
+    }
     data.rows.forEach(function (r) { html += rowHtml(r.titulo, r.itens, {}); });
     els.rows.innerHTML = html || '<p class="vazio">Sem resultados.</p>';
   } catch (e) {
@@ -1834,7 +1316,7 @@ function mostrarAviso() {
   const div = document.createElement('div');
   div.id = 'aviso';
   div.className = 'aviso';
-  div.innerHTML = 'Configure a chave do TMDb no <code>.env</code>: <code>TMDB_API_KEY=sua_chave</code> e reinicie.';
+  div.innerHTML = 'Configure a chave do TMDb no <code>.env</code>: <code>TMDB_API_KEY=sua_chave</code>.';
   els.rows.parentNode.insertBefore(div, els.rows);
 }
 
@@ -1850,7 +1332,7 @@ async function buscar(termo) {
   } catch (e) { els.searchResults.innerHTML = '<p class="vazio">' + esc(e.message) + '</p>'; }
 }
 
-/* ----------------------- lista / historico / cats ------------------ */
+/* --------------------- lista / historico / categorias -------------- */
 
 function renderLista() { els.listaGrid.innerHTML = gridHtml(LS.get(K.lista, []), {}); }
 function renderHistorico() { els.historicoGrid.innerHTML = gridHtml(LS.get(K.historico, []), { progresso: true }); }
@@ -1891,15 +1373,18 @@ function alternarFavorito(item) {
   if (state.view === 'lista') renderLista();
 }
 
-function marcarHistorico(item) {
+function marcarHistorico(item, rotulo) {
+  const alvo = Object.assign(resumo(item), { rotulo: rotulo || item.titulo, atualizado: Date.now() });
   const h = LS.get(K.historico, []).filter(function (i) { return chaveItem(i) !== chaveItem(item); });
-  h.unshift(Object.assign(resumo(item), { atualizado: Date.now() }));
+  h.unshift(alvo);
   LS.set(K.historico, h.slice(0, 80));
 }
 
-function salvarProgresso(seg, dur) {
-  if (!state.media || !dur) return;
-  const pct = Math.min(100, (seg / dur) * 100);
+function salvarProgresso() {
+  if (!state.media || state.media.tipo === 'tv') return;
+  const dur = els.video.duration;
+  if (!dur || !isFinite(dur)) return;
+  const pct = Math.min(100, (els.video.currentTime / dur) * 100);
   if (pct < 1 || pct > 98) return;
   const chave = chaveItem(state.media);
   const lista = LS.get(K.continuar, []).filter(function (i) { return chaveItem(i) !== chave; });
@@ -1937,6 +1422,18 @@ function renderDetalhes(m, abrirTrailer) {
       '</div><span>' + esc(c.nome) + '</span></div>';
   }).join('');
 
+  const temporadas = (m.temporadas && m.temporadas.length) ? m.temporadas : [{ numero: 1, nome: 'Temporada 1' }];
+  const blocoSeries = m.tipo === 'tv'
+    ? '<div class="temporadas">' +
+        '<label>Temporada<select id="selTemporada">' +
+          temporadas.map(function (t) {
+            return '<option value="' + t.numero + '">' + esc(t.nome || ('Temporada ' + t.numero)) + '</option>';
+          }).join('') +
+        '</select></label>' +
+      '</div>' +
+      '<div id="episodiosBox" class="episodios"><p class="vazio">Carregando episodios...</p></div>'
+    : '';
+
   els.modalBody.innerHTML =
     '<div class="details" style="--bd:url(\'' + (m.backdrop || m.poster || PLACEHOLDER) + '\')">' +
       '<div class="details-top">' +
@@ -1946,28 +1443,66 @@ function renderDetalhes(m, abrirTrailer) {
           '<p class="details-meta">' + esc(m.ano || '') +
             (m.nota ? ' &middot; &#9733; ' + m.nota.toFixed(1) : '') +
             (m.duracao ? ' &middot; ' + m.duracao + ' min' : '') +
-            (m.tipo === 'tv' ? ' &middot; Serie' : '') + '</p>' +
+            (m.tipo === 'tv' ? ' &middot; ' + temporadas.length + ' temporada(s)' : '') + '</p>' +
           (generos ? '<p class="details-gen">' + generos + '</p>' : '') +
         '</div>' +
       '</div>' +
       '<div class="details-body">' +
         '<p class="details-sinopse">' + esc(m.sinopse || 'Sinopse nao disponivel.') + '</p>' +
         '<div class="details-actions">' +
-          '<button class="btn primary big" id="btnAssistir">Assistir agora</button>' +
+          (m.tipo === 'tv' ? '' : '<button class="btn primary big" id="btnAssistir">Assistir agora</button>') +
           '<div class="linha">' +
             (m.trailer ? '<button class="btn ghost" id="btnTrailer">Trailer</button>' : '') +
             '<button class="btn ghost" id="btnFavoritar">Favoritar</button>' +
             (m.imdbId ? '<a class="btn ghost" target="_blank" rel="noreferrer" href="https://www.imdb.com/title/' + esc(m.imdbId) + '/">IMDb</a>' : '') +
           '</div>' +
         '</div>' +
+        blocoSeries +
         (elenco ? '<div class="elenco"><h3>Elenco</h3><div class="elenco-list">' + elenco + '</div></div>' : '') +
       '</div>' +
     '</div>';
 
-  $('#btnAssistir').addEventListener('click', function () { fecharModal(); assistir(m); });
+  if ($('#btnAssistir')) $('#btnAssistir').addEventListener('click', function () { fecharModal(); assistir(m); });
   if ($('#btnTrailer')) $('#btnTrailer').addEventListener('click', function () { mostrarTrailer(m.trailer); });
   $('#btnFavoritar').addEventListener('click', function () { alternarFavorito(m); });
   if (abrirTrailer && m.trailer) mostrarTrailer(m.trailer);
+
+  if (m.tipo === 'tv') {
+    $('#selTemporada').addEventListener('change', function () { carregarTemporada(m, Number(this.value)); });
+    carregarTemporada(m, temporadas[0].numero);
+  }
+}
+
+async function carregarTemporada(m, numero) {
+  const box = $('#episodiosBox');
+  if (!box) return;
+  box.innerHTML = '<p class="vazio">Carregando episodios...</p>';
+  try {
+    const d = await api('/api/serie/' + m.id + '/temporada/' + numero);
+    if (!d.episodios.length) { box.innerHTML = '<p class="vazio">Temporada sem episodios cadastrados.</p>'; return; }
+    box.innerHTML = d.episodios.map(function (ep) {
+      return '<button class="episodio" data-ep="' + ep.numero + '">' +
+          '<div class="ep-thumb">' +
+            (ep.imagem ? '<img loading="lazy" src="' + esc(ep.imagem) + '" alt="" onerror="this.onerror=null;this.src=\'' + PLACEHOLDER + '\'">' : '') +
+            '<span class="ep-play">&#9654;</span>' +
+          '</div>' +
+          '<div class="ep-info">' +
+            '<strong><span class="ep-num">E' + pad(ep.numero) + '</span>' + esc(ep.titulo) + '</strong>' +
+            '<span class="ep-meta">' + (ep.duracao ? ep.duracao + ' min' : '') + (ep.data ? ' &middot; ' + esc(ep.data) : '') + '</span>' +
+            '<p>' + esc(ep.sinopse || 'Sinopse nao disponivel.') + '</p>' +
+          '</div>' +
+        '</button>';
+    }).join('');
+
+    $$('#episodiosBox .episodio').forEach(function (b) {
+      b.addEventListener('click', function () {
+        const ep = Number(b.dataset.ep);
+        const rotulo = m.titulo + ' S' + pad(numero) + 'E' + pad(ep);
+        fecharModal();
+        assistir(m, { temporada: numero, episodio: ep, rotulo: rotulo });
+      });
+    });
+  } catch (e) { box.innerHTML = '<p class="vazio">' + esc(e.message) + '</p>'; }
 }
 
 function mostrarTrailer(trailer) {
@@ -1980,6 +1515,451 @@ function mostrarTrailer(trailer) {
   box.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
+/* =========================== DEMUX MKV ============================== */
+
+const EBML = {
+  SEG: 0x18538067, INFO: 0x1549A966, TRACKS: 0x1654AE6B, ENTRY: 0xAE,
+  TRACKNUM: 0xD7, TRACKTYPE: 0x83, CODECID: 0x86, CODECPRIV: 0x63A2,
+  LANG: 0x22B59C, LANG2: 0x22B59D, AUDIO: 0xE1, CHANNELS: 0x9F,
+  CLUSTER: 0x1F43B675, TIMECODE: 0xE7, SIMPLEBLOCK: 0xA3, BLOCKGROUP: 0xA0, BLOCK: 0xA1,
+  SCALE: 0x2AD7B1, HEADER: 0x1A45DFA3
+};
+
+function criarParserMkv(cb) {
+  let buf = new Uint8Array(0);
+  let pos = 0;
+  const fins = [];
+  const tipos = [];
+  let escala = 1000000;
+  let tsCluster = 0;
+  let entry = {};
+  let modoSimples = false;
+  let sincronizado = false;
+  let ligado = true;
+
+  function lerId(p) {
+    if (p >= buf.length) return null;
+    const b0 = buf[p];
+    if (b0 === 0) return null;
+    let n = 1;
+    if (!(b0 & 0x80)) {
+      if (b0 & 0x40) n = 2; else if (b0 & 0x20) n = 3; else if (b0 & 0x10) n = 4; else return null;
+    }
+    if (p + n > buf.length) return null;
+    let v = 0;
+    for (let i = 0; i < n; i++) v = v * 256 + buf[p + i];
+    return { v: v, n: n };
+  }
+
+  function lerTam(p) {
+    if (p >= buf.length) return null;
+    const b0 = buf[p];
+    if (b0 === 0) return null;
+    let n = 1, mask = 0x80;
+    while (n <= 8 && !(b0 & mask)) { mask >>= 1; n++; }
+    if (n > 8 || p + n > buf.length) return null;
+    let v = b0 & (mask - 1);
+    let todosFf = ((b0 & (mask - 1)) === (mask - 1));
+    for (let i = 1; i < n; i++) {
+      v = v * 256 + buf[p + i];
+      if (buf[p + i] !== 0xFF) todosFf = false;
+    }
+    return { v: v, n: n, desconhecido: todosFf };
+  }
+
+  function uint(p, fim) {
+    if (fim > buf.length) return null;
+    let v = 0;
+    for (let i = p; i < fim; i++) v = v * 256 + buf[i];
+    return v;
+  }
+
+  function texto(p, fim) {
+    if (fim > buf.length) return null;
+    let s = '';
+    for (let i = p; i < fim; i++) { const c = buf[i]; if (c >= 32 && c < 127) s += String.fromCharCode(c); }
+    return s.trim();
+  }
+
+  function finalizarEntry() {
+    if (entry && entry.n && entry.tipo === 2 && cb.aoFaixa) {
+      cb.aoFaixa({
+        numero: entry.n,
+        lang: (entry.lang || '').toLowerCase(),
+        codec: entry.codec || '',
+        canais: entry.canais || 0,
+        codecPrivado: entry.codecPrivado || null
+      });
+    }
+    entry = {};
+  }
+
+  function blocos(p, fim) {
+    const tn = lerTam(p);
+    if (!tn) return;
+    let off = p + tn.n;
+    if (off + 3 > fim) return;
+    let ts = (buf[off] << 8) | buf[off + 1];
+    if (ts & 0x8000) ts -= 0x10000;
+    off += 2;
+    const flags = buf[off]; off++;
+    const lace = (flags >> 1) & 3;
+    const partes = [];
+
+    if (lace === 0) {
+      partes.push([off, fim]);
+    } else {
+      const n = buf[off] + 1; off++;
+      const tamanhos = [];
+      if (lace === 1) {
+        let total = 0;
+        for (let i = 0; i < n - 1; i++) {
+          let s = 0, b;
+          do { b = buf[off++]; s += b; } while (b === 255 && off < fim);
+          tamanhos.push(s); total += s;
+        }
+        tamanhos.push(Math.max(0, fim - off - total));
+      } else if (lace === 3) {
+        const s0 = lerTam(off);
+        if (!s0) return;
+        off += s0.n;
+        tamanhos.push(s0.v);
+        let total = s0.v;
+        for (let i = 1; i < n - 1; i++) {
+          const d = lerTam(off);
+          if (!d) return;
+          off += d.n;
+          const dv = d.v - Math.pow(2, 7 * d.n - 1) + 1;
+          tamanhos.push(dv); total += dv;
+        }
+        tamanhos.push(Math.max(0, fim - off - total));
+      } else {
+        const t = Math.floor((fim - off) / n);
+        for (let i = 0; i < n; i++) tamanhos.push(t);
+      }
+      let cur = off;
+      tamanhos.forEach(function (t) { partes.push([cur, cur + t]); cur += t; });
+    }
+
+    const tsSeg = (tsCluster + ts) * escala / 1e9;
+    partes.forEach(function (pp) {
+      if (pp[1] > pp[0] && cb.aoFrame) cb.aoFrame(tn.v, tsSeg, buf.subarray(pp[0], pp[1]));
+    });
+  }
+
+  function processar() {
+    let voltas = 0;
+    while (ligado && voltas++ < 200000) {
+      while (fins.length && pos >= fins[fins.length - 1]) {
+        const t = tipos.pop(); fins.pop();
+        if (t === 'entry') finalizarEntry();
+      }
+      if (buf.length - pos < 2) break;
+
+      if (modoSimples && !sincronizado) {
+        let achou = -1;
+        for (let i = pos; i + 4 <= buf.length; i++) {
+          if (buf[i] === 0x1F && buf[i + 1] === 0x43 && buf[i + 2] === 0xB6 && buf[i + 3] === 0x75) { achou = i; break; }
+        }
+        if (achou < 0) { pos = Math.max(pos, buf.length - 3); break; }
+        pos = achou;
+        sincronizado = true;
+      }
+
+      const id = lerId(pos);
+      if (!id) break;
+      const tam = lerTam(pos + id.n);
+      if (!tam) break;
+
+      const idv = id.v;
+      const ini = pos + id.n + tam.n;
+      const fim = tam.desconhecido ? Infinity : ini + tam.v;
+
+      if (idv === EBML.CLUSTER) { tsCluster = 0; pos = ini; fins.push(fim); tipos.push('cluster'); continue; }
+      if (idv === EBML.SEG || idv === EBML.HEADER) { pos = ini; fins.push(fim); tipos.push('seg'); continue; }
+      if (idv === EBML.INFO) { pos = ini; fins.push(fim); tipos.push('info'); continue; }
+      if (!modoSimples && idv === EBML.TRACKS) { pos = ini; fins.push(fim); tipos.push('tracks'); continue; }
+      if (!modoSimples && idv === EBML.ENTRY) { entry = {}; pos = ini; fins.push(fim); tipos.push('entry'); continue; }
+      if (idv === EBML.AUDIO) { pos = ini; fins.push(fim); tipos.push('audio'); continue; }
+      if (idv === EBML.BLOCKGROUP) { pos = ini; fins.push(fim); tipos.push('bg'); continue; }
+
+      if (idv === EBML.SCALE) { const r = uint(ini, fim); if (r === null) break; escala = r || escala; pos = fim; continue; }
+      if (idv === EBML.TIMECODE) { const r = uint(ini, fim); if (r === null) break; tsCluster = r; pos = fim; continue; }
+
+      if (!modoSimples && idv === EBML.TRACKNUM) { const r = uint(ini, fim); if (r === null) break; entry.n = r; pos = fim; continue; }
+      if (!modoSimples && idv === EBML.TRACKTYPE) { const r = uint(ini, fim); if (r === null) break; entry.tipo = r; pos = fim; continue; }
+      if (!modoSimples && idv === EBML.CHANNELS) { const r = uint(ini, fim); if (r === null) break; entry.canais = r; pos = fim; continue; }
+      if (!modoSimples && idv === EBML.CODECID) { const r = texto(ini, fim); if (r === null) break; entry.codec = r; pos = fim; continue; }
+      if (!modoSimples && (idv === EBML.LANG || idv === EBML.LANG2)) { const r = texto(ini, fim); if (r === null) break; if (!entry.lang) entry.lang = r; pos = fim; continue; }
+      if (!modoSimples && idv === EBML.CODECPRIV) { if (fim > buf.length) break; entry.codecPrivado = buf.subarray(ini, fim); pos = fim; continue; }
+
+      if (idv === EBML.SIMPLEBLOCK || idv === EBML.BLOCK) {
+        if (fim > buf.length) break;
+        blocos(ini, fim);
+        pos = fim;
+        continue;
+      }
+
+      if (fim === Infinity) { pos = ini; fins.push(fim); tipos.push('x'); continue; }
+      if (fim > buf.length) break;
+      pos = fim;
+    }
+
+    if (pos > 0) { buf = buf.subarray(pos); pos = 0; }
+  }
+
+  return {
+    empurrar: function (dados) {
+      if (!ligado) return;
+      const novo = new Uint8Array(buf.length + dados.length);
+      novo.set(buf, 0);
+      novo.set(dados, buf.length);
+      buf = novo;
+      processar();
+    },
+    modoSimples: function () { modoSimples = true; sincronizado = false; },
+    desligar: function () { ligado = false; }
+  };
+}
+
+function juntarBytes(lista) {
+  let total = 0;
+  lista.forEach(function (b) { total += b.length; });
+  const out = new Uint8Array(total);
+  let p = 0;
+  lista.forEach(function (b) { out.set(b, p); p += b.length; });
+  return out;
+}
+
+function comAdts(frame, asc) {
+  if (!asc || asc.length < 2) return frame;
+  const objType = (asc[0] >> 3) & 0x1F;
+  const perfil = Math.max(0, objType - 1);
+  const freq = ((asc[0] & 0x07) << 1) | ((asc[1] >> 7) & 0x01);
+  const canais = (asc[1] >> 3) & 0x0F;
+  const tam = frame.length + 7;
+  const h = new Uint8Array(7);
+  h[0] = 0xFF; h[1] = 0xF1;
+  h[2] = (perfil << 6) | (freq << 2) | ((canais >> 2) & 1);
+  h[3] = ((canais & 3) << 6) | ((tam >> 11) & 3);
+  h[4] = (tam >> 3) & 0xFF;
+  h[5] = ((tam & 7) << 5) | 0x1F;
+  h[6] = 0xFC;
+  const out = new Uint8Array(tam);
+  out.set(h, 0);
+  out.set(frame, 7);
+  return out;
+}
+
+/* ========================== RESGATE DE AUDIO ======================== */
+
+const audio = {
+  ctx: null,
+  ganho: null,
+  ativo: false,
+  abort: null,
+  leitor: null,
+  parser: null,
+  trackNum: 0,
+  asc: null,
+  aac: false,
+  pendente: [],
+  pendenteTs: 0,
+  pendenteTam: 0,
+  fila: [],
+  fontes: [],
+  ultimoTs: 0,
+  processando: false,
+  falhas: 0,
+  info: null
+};
+
+function pararResgate() {
+  audio.ativo = false;
+  if (audio.abort) { try { audio.abort.abort(); } catch (e) { } audio.abort = null; }
+  if (audio.parser) { audio.parser.desligar(); audio.parser = null; }
+  audio.fontes.forEach(function (s) { try { s.stop(); } catch (e) { } });
+  audio.fontes = [];
+  audio.fila = [];
+  audio.pendente = [];
+  audio.pendenteTam = 0;
+  audio.pendenteTs = 0;
+  audio.ultimoTs = 0;
+  audio.leitor = null;
+}
+
+function volumeAplicado() {
+  return state.mudo ? 0 : state.volume;
+}
+
+async function analisarCabecalho() {
+  const alvo = API_BASE + state.streamUrl;
+  const res = await fetch(alvo, { headers: { Range: 'bytes=0-1048575' } });
+  const dados = new Uint8Array(await res.arrayBuffer());
+  const info = { container: '?', audio: [] };
+  if (dados.length > 8 && dados[0] === 0x1A && dados[1] === 0x45 && dados[2] === 0xDF && dados[3] === 0xA3) info.container = 'mkv';
+  else if (dados.length > 12 && dados[4] === 0x66 && dados[5] === 0x74 && dados[6] === 0x79 && dados[7] === 0x70) info.container = 'mp4';
+  if (info.container !== 'mkv') return info;
+
+  const parser = criarParserMkv({
+    aoFaixa: function (f) { info.audio.push(f); },
+    aoFrame: function () { }
+  });
+  parser.empurrar(dados);
+  parser.desligar();
+  return info;
+}
+
+function decidirResgate(info) {
+  if (!info || info.container !== 'mkv') return false;
+  const faixas = info.audio || [];
+  if (!faixas.length) return false;
+
+  const pt = faixas.filter(function (f) { return /por|pt|bra|portugu/.test(f.lang); })[0];
+  const alvo = pt || faixas[0];
+  const codec = String(alvo.codec || '').toLowerCase();
+
+  const seguro = /(a_aac|aac|a_mp3|mp3|a_opus|a_vorbis|a_flac|a_ac3|eac3|ec-3)/.test(codec);
+  const problematico = /(dts|dca|truehd|mlp|pcm|lpcm|a_real)/.test(codec);
+  const primeiro = faixas[0] === alvo;
+
+  if (problematico) return true;
+  if (!primeiro) return true;
+  if (!seguro) return true;
+  return false;
+}
+
+async function iniciarResgate(info, inicioBytes) {
+  pararResgate();
+
+  const faixas = info.audio || [];
+  const pt = faixas.filter(function (f) { return /por|pt|bra|portugu/.test(f.lang); })[0];
+  const alvo = pt || faixas[0];
+  if (!alvo) return;
+
+  audio.info = info;
+  audio.trackNum = alvo.numero;
+  audio.asc = alvo.codecPrivado || null;
+  audio.aac = /aac/i.test(alvo.codec || '');
+
+  if (!audio.ctx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audio.ctx = new Ctx();
+    audio.ganho = audio.ctx.createGain();
+    audio.ganho.gain.value = volumeAplicado();
+    audio.ganho.connect(audio.ctx.destination);
+  }
+  try { if (audio.ctx.state === 'suspended') await audio.ctx.resume(); } catch (e) { }
+
+  const ctrl = new AbortController();
+  audio.abort = ctrl;
+  audio.ativo = true;
+  audio.falhas = 0;
+  audio.ultimoTs = 0;
+
+  const parser = criarParserMkv({
+    aoFaixa: function () { },
+    aoFrame: function (tn, ts, bytes) {
+      if (tn !== audio.trackNum) return;
+      if (ts + 0.4 < els.video.currentTime - 1) return;
+      let b = bytes;
+      if (audio.aac) b = comAdts(bytes, audio.asc);
+      if (audio.pendenteTs === 0) audio.pendenteTs = ts;
+      audio.pendente.push(new Uint8Array(b));
+      audio.pendenteTam += b.length;
+      if (ts - audio.pendenteTs >= 0.45) descarregar();
+    }
+  });
+  if (inicioBytes > 0) parser.modoSimples();
+  audio.parser = parser;
+
+  try {
+    const res = await fetch(API_BASE + state.streamUrl, {
+      headers: { Range: 'bytes=' + inicioBytes + '-' },
+      signal: ctrl.signal
+    });
+    if (!res.body) throw new Error('sem corpo');
+    audio.leitor = res.body.getReader();
+  } catch (e) {
+    audio.ativo = false;
+    return;
+  }
+
+  while (audio.ativo) {
+    if (audio.ultimoTs - els.video.currentTime > 12) { await esperar(150); continue; }
+    let r;
+    try { r = await audio.leitor.read(); } catch (e) { break; }
+    if (r.done) break;
+    parser.empurrar(r.value);
+  }
+}
+
+function descarregar() {
+  if (!audio.pendente.length) return;
+  const dados = juntarBytes(audio.pendente);
+  const ts = audio.pendenteTs;
+  audio.pendente = [];
+  audio.pendenteTam = 0;
+  audio.pendenteTs = 0;
+  audio.fila.push({ ts: ts, dados: dados });
+  processarFila();
+}
+
+async function processarFila() {
+  if (audio.processando) return;
+  audio.processando = true;
+  while (audio.fila.length && audio.ativo) {
+    const item = audio.fila.shift();
+    if (item.ts + 1 < els.video.currentTime - 0.5) continue;
+    try {
+      const copia = item.dados.slice(0);
+      const buf = await audio.ctx.decodeAudioData(copia.buffer);
+      agendar(item.ts, buf);
+      audio.falhas = 0;
+      if (els.video.muted !== true && audio.fontes.length === 1) {
+        els.video.muted = true;
+        audio.ganho.gain.value = volumeAplicado();
+      }
+    } catch (e) {
+      audio.falhas++;
+      if (audio.falhas > 12) { audio.ativo = false; els.video.muted = false; }
+    }
+  }
+  audio.processando = false;
+}
+
+function agendar(ts, buf) {
+  const agora = audio.ctx.currentTime;
+  let quando = agora + (ts - els.video.currentTime);
+  if (quando < agora + 0.02) quando = agora + 0.02;
+  const src = audio.ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audio.ganho);
+  try { src.start(quando); } catch (e) { return; }
+  audio.fontes.push(src);
+  audio.ultimoTs = Math.max(audio.ultimoTs, ts + buf.duration);
+  src.onended = function () {
+    const i = audio.fontes.indexOf(src);
+    if (i >= 0) audio.fontes.splice(i, 1);
+  };
+}
+
+function byteEstimado(t) {
+  const dur = els.video.duration;
+  if (!dur || !isFinite(dur) || !state.total) return 0;
+  return Math.max(0, Math.floor((t / dur) * state.total));
+}
+
+async function reiniciarResgate() {
+  if (!audio.info) return;
+  const t = els.video.currentTime;
+  pararResgate();
+  audio.fontes.forEach(function (s) { try { s.stop(); } catch (e) { } });
+  audio.fontes = [];
+  await iniciarResgate(audio.info, byteEstimado(t));
+}
+
 /* =============================== PLAYER ============================ */
 
 function abrirPlayer(titulo) {
@@ -1987,21 +1967,17 @@ function abrirPlayer(titulo) {
   state.streamUrl = null;
   state.subs = [];
   state.legendaAtiva = null;
+  state.tentativa = 0;
+  pararResgate();
   els.video.removeAttribute('src');
   $$('#video track').forEach(function (t) { t.remove(); });
   els.video.load();
   els.pvTitle.textContent = titulo || 'Reproduzindo';
   els.pvCenter.classList.remove('oculto');
-  els.pvCenter.innerHTML =
-    '<div class="pv-spinner"></div>' +
-    '<p class="pv-msg" id="pvMsg">Buscando fontes PT-BR...</p>' +
-    '<div class="pv-bar"><i id="pvFill"></i></div>' +
-    '<p class="pv-stats" id="pvStats"></p>' +
-    '<p class="pv-fonte" id="pvFonte"></p>';
-  els.pvMsg = $('#pvMsg'); els.pvStats = $('#pvStats'); els.pvFill = $('#pvFill'); els.pvFonte = $('#pvFonte');
-  els.pvFill.style.width = '0%';
+  els.pvMsg.textContent = 'Buscando fontes DUAL 5.1 PT-BR...';
   els.pvStats.textContent = '';
   els.pvFonte.textContent = '';
+  els.pvFill.style.width = '0%';
   els.pvProgress.style.width = '0%';
   els.pvKnob.style.left = '0%';
   els.pvTime.textContent = '0:00 / 0:00';
@@ -2019,6 +1995,7 @@ function fecharPlayer() {
   }
   clearTimeout(state.poll);
   clearTimeout(state.esconderTimer);
+  pararResgate();
   try { els.video.pause(); } catch (e) { }
   els.video.removeAttribute('src');
   els.video.load();
@@ -2028,33 +2005,34 @@ function fecharPlayer() {
   if (state.view === 'inicio') carregarInicio();
 }
 
-/** Clicou em assistir: player aparece JÁ, sem modal nenhum. */
-async function assistir(media) {
+async function assistir(media, extra) {
+  const ex = extra || {};
   state.media = media;
-  marcarHistorico(media);
-  abrirPlayer(media.titulo);
+  state.temporada = ex.temporada || 1;
+  state.episodio = ex.episodio || 1;
+  marcarHistorico(media, ex.rotulo);
+  abrirPlayer(ex.rotulo || media.titulo);
 
   const params = {
     titulo: media.titulo,
     tituloOriginal: media.tituloOriginal,
     ano: media.ano,
     imdbId: media.imdbId,
-    tipo: media.tipo
+    tmdbId: media.id,
+    tipo: media.tipo,
+    temporada: state.temporada,
+    episodio: state.episodio
   };
 
   try {
     const data = await api('/api/torrent', params);
     state.fontes = data.fontes || [];
     state.melhor = data.melhor;
-    if (!state.melhor) {
-      erroPlayer('Nenhum torrent encontrado. Tente pelo titulo original.');
-      return;
-    }
-    els.pvFonte.textContent = 'Fonte selecionada: ' + state.melhor.source + ' - ' + (state.melhor.ptbr ? state.melhor.ptbr.audio : '');
+    if (!state.melhor) { erroPlayer('Nenhum torrent encontrado para este titulo.'); return; }
+    els.pvFonte.textContent = state.melhor.source + ' - ' +
+      (state.melhor.ptbr ? state.melhor.ptbr.audio : '') + ' - ' + state.melhor.seeders + ' seeds';
     iniciarJob(state.melhor);
-  } catch (e) {
-    erroPlayer(e.message);
-  }
+  } catch (e) { erroPlayer(e.message); }
 }
 
 async function iniciarJob(fonte) {
@@ -2068,6 +2046,7 @@ async function iniciarJob(fonte) {
   state.podeTocar = false;
   state.legendaAtiva = null;
   state.subs = [];
+  pararResgate();
   els.video.removeAttribute('src');
   $$('#video track').forEach(function (t) { t.remove(); });
   els.video.load();
@@ -2077,44 +2056,71 @@ async function iniciarJob(fonte) {
 
   try {
     const data = await api('/api/play', {
-      magnet: fonte.magnet,
-      fileIdx: fonte.fileIdx,
-      titulo: fonte.title,
-      qualidade: fonte.quality
+      magnet: fonte.magnet, fileIdx: fonte.fileIdx, titulo: fonte.title, qualidade: fonte.quality
     });
     state.job = data.jobId;
     poll();
   } catch (e) { erroPlayer(e.message); }
 }
 
-function erroPlayer(msg) {
+function proximaFonte() {
+  const atual = state.melhor;
+  const idx = state.fontes.findIndex(function (f) { return atual && f.hash === atual.hash; });
+  return state.fontes[idx + 1] || null;
+}
+
+function erroPlayer(msg, permitirTroca) {
   clearTimeout(state.poll);
+
+  if (permitirTroca !== false && state.tentativa < 3) {
+    const proxima = proximaFonte();
+    if (proxima) {
+      state.tentativa += 1;
+      state.melhor = proxima;
+      els.pvCenter.classList.remove('oculto');
+      els.pvMsg.textContent = 'Fonte sem peer. Tentando outra (' + state.tentativa + '/3)...';
+      els.pvStats.textContent = proxima.title;
+      els.pvFonte.textContent = proxima.source + ' - ' + proxima.seeders + ' seeds';
+      iniciarJob(proxima);
+      return;
+    }
+  }
+
   els.pvCenter.classList.remove('oculto');
   els.pvCenter.innerHTML =
     '<p class="pv-erro">' + esc(msg) + '</p>' +
     '<button class="btn small" id="pvOutraFonte">Escolher outra fonte</button>' +
     '<button class="btn small ghost" id="pvSair">Sair</button>';
-  $('#pvOutraFonte').addEventListener('click', function () { abrirSheetFontes(); });
+  $('#pvOutraFonte').addEventListener('click', abrirSheetFontes);
   $('#pvSair').addEventListener('click', fecharPlayer);
 }
 
+let analiseEmCurso = false;
+
 function atualizarOverlay(s) {
+  if (s.total) state.total = s.total;
+
   if (s.canPlay && !state.podeTocar) {
     state.podeTocar = true;
     state.streamUrl = s.streamUrl;
-    if (API_BASE) els.video.crossOrigin = 'anonymous';
     els.video.src = API_BASE + s.streamUrl;
     const p = els.video.play();
     if (p && p.catch) p.catch(function () { });
     carregarLegendas();
+    if (!analiseEmCurso) {
+      analiseEmCurso = true;
+      analisarCabecalho().then(function (info) {
+        if (decidirResgate(info)) iniciarResgate(info, 0);
+      }).catch(function () { }).then(function () { analiseEmCurso = false; });
+    }
   }
 
   els.pvFill.style.width = Math.max(2, Math.min(100, s.buffer || 0)).toFixed(0) + '%';
 
   if (!state.podeTocar) {
     els.pvMsg.textContent = s.message || 'Conectando aos peers...';
-    els.pvStats.textContent = (s.buffer || 0).toFixed(1) + '% do buffer | ' + s.peers + ' peers | ' +
-      fmtSpeed(s.speed) + ' | ' + fmtSize(s.downloaded) + ' de ' + fmtSize(s.total) + ' | ' + s.elapsed + 's';
+    els.pvStats.textContent = (s.buffer || 0).toFixed(1) + '% | ' + s.peers + ' peers | ' +
+      fmtSpeed(s.speed) + ' | ' + fmtSize(s.downloaded) + ' de ' + fmtSize(s.total);
   } else {
     els.pvMsg.textContent = 'Iniciando...';
     els.pvStats.textContent = s.peers + ' peers | ' + fmtSpeed(s.speed);
@@ -2128,7 +2134,7 @@ async function poll() {
     atualizarOverlay(s);
     if (s.state === 'erro') { erroPlayer(s.message); return; }
   } catch (e) { erroPlayer(e.message); return; }
-  state.poll = setTimeout(poll, state.podeTocar ? 2500 : 850);
+  state.poll = setTimeout(poll, state.podeTocar ? 2500 : 700);
 }
 
 /* ----------------------------- legendas ---------------------------- */
@@ -2175,7 +2181,7 @@ function abrirSheetFontes() {
   const html = state.fontes.map(function (f, i) {
     const atual = state.melhor && f.hash === state.melhor.hash ? ' atual' : '';
     const nivel = f.ptbr ? f.ptbr.nivel : 'desconhecido';
-    const cls = nivel === 'confirmado' || nivel === 'provavel' ? 'br' : (nivel === 'estrangeiro' ? 'ruim' : '');
+    const cls = NIVEIS_BONS.indexOf(nivel) !== -1 ? 'br' : (nivel === 'estrangeiro' ? 'ruim' : '');
     return '<div class="pv-fonte-item' + atual + '" data-fonte-idx="' + i + '">' +
         '<div><div class="pv-fonte-nome">' + esc(f.title) + '</div>' +
           '<div class="pv-fonte-tags">' +
@@ -2193,15 +2199,16 @@ function abrirSheetFontes() {
     n.addEventListener('click', function () {
       const f = state.fontes[Number(n.dataset.fonteIdx)];
       state.melhor = f;
+      state.tentativa = 0;
       els.pvSheet.classList.add('hidden');
-      els.pvFonte.textContent = 'Fonte: ' + f.source + ' - ' + (f.ptbr ? f.ptbr.audio : '');
+      els.pvFonte.textContent = f.source + ' - ' + (f.ptbr ? f.ptbr.audio : '') + ' - ' + f.seeders + ' seeds';
       iniciarJob(f);
     });
   });
 }
 
 function abrirSheetLegendas() {
-  if (!state.subs.length) { abrirSheet('Legendas', '<p class="pv-vazio">Nenhuma legenda encontrada dentro do torrent.</p>'); return; }
+  if (!state.subs.length) { abrirSheet('Legendas', '<p class="pv-vazio">Nenhuma legenda dentro do torrent.</p>'); return; }
   const itens = [{ idx: null, label: 'Desativado', code: '' }].concat(state.subs);
   const html = itens.map(function (s) {
     const atual = (state.legendaAtiva === s.idx) ? ' atual' : '';
@@ -2224,11 +2231,8 @@ function abrirSheetLegendas() {
 function mostrarControles() {
   els.player.classList.remove('controles-ocultos');
   clearTimeout(state.esconderTimer);
-  if (!els.video.paused && !els.pvSheet.classList.contains('hidden') === false) { /* noop */ }
   state.esconderTimer = setTimeout(function () {
-    if (!els.video.paused && els.pvSheet.classList.contains('hidden')) {
-      els.player.classList.add('controles-ocultos');
-    }
+    if (!els.video.paused && els.pvSheet.classList.contains('hidden')) els.player.classList.add('controles-ocultos');
   }, 3400);
 }
 
@@ -2245,10 +2249,11 @@ function pular(segundos) {
 
 function atualizarTempo() {
   const dur = isFinite(els.video.duration) ? els.video.duration : 0;
-  const pct = dur ? (els.video.currentTime / dur) * 100 : 0;
+  const atual = els.video.currentTime || 0;
+  const pct = dur ? Math.min(100, (atual / dur) * 100) : 0;
   els.pvProgress.style.width = pct + '%';
   els.pvKnob.style.left = pct + '%';
-  els.pvTime.textContent = fmtTime(els.video.currentTime) + ' / ' + fmtTime(dur);
+  els.pvTime.textContent = fmtTime(atual) + ' / ' + fmtTime(dur);
 }
 
 function seekPara(clientX) {
@@ -2264,20 +2269,26 @@ function wire() {
   $('#drawerClose').addEventListener('click', fecharDrawer);
   els.drawerBackdrop.addEventListener('click', fecharDrawer);
 
-  $$('.nav-link, .bn-item').forEach(function (b) {
+  $$('.nav-link').forEach(function (b) {
     b.addEventListener('click', function () { setView(b.dataset.view); fecharDrawer(); });
+  });
+
+  $$('.tipo-tab').forEach(function (b) {
+    b.addEventListener('click', function () { setTipo(b.dataset.tipo); setView('inicio'); fecharDrawer(); });
+  });
+
+  $$('.bn-item').forEach(function (b) {
+    b.addEventListener('click', function () {
+      if (b.dataset.aba) setTipo(b.dataset.tipo);
+      setView(b.dataset.view);
+      $$('.bn-item').forEach(function (x) { x.classList.remove('active'); });
+      b.classList.add('active');
+      fecharDrawer();
+    });
   });
 
   $('#brand').addEventListener('click', function (e) { e.preventDefault(); setView('inicio'); });
   $('#searchBtn').addEventListener('click', function () { setView('buscar'); });
-
-  els.tipoToggle.addEventListener('click', function () {
-    state.tipo = state.tipo === 'movie' ? 'tv' : 'movie';
-    LS.set(K.tipo, state.tipo);
-    els.tipoToggle.textContent = state.tipo === 'movie' ? 'Filmes' : 'Series';
-    carregarInicio();
-  });
-  els.tipoToggle.textContent = state.tipo === 'movie' ? 'Filmes' : 'Series';
 
   $('#searchGo').addEventListener('click', function () { buscar(els.searchInput.value); });
   els.searchInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') buscar(els.searchInput.value); });
@@ -2298,7 +2309,6 @@ function wire() {
     if (e.target.closest('[data-close]')) fecharModal();
   });
 
-  /* ---- player ---- */
   $('#pvClose').addEventListener('click', fecharPlayer);
   $('#pvFontes').addEventListener('click', abrirSheetFontes);
   $('#pvSheetClose').addEventListener('click', function () { els.pvSheet.classList.add('hidden'); });
@@ -2306,21 +2316,24 @@ function wire() {
   $('#pvBack30').addEventListener('click', function () { pular(-30); });
   $('#pvFwd30').addEventListener('click', function () { pular(30); });
   $('#pvCC').addEventListener('click', abrirSheetLegendas);
+
   $('#pvMute').addEventListener('click', function () {
-    els.video.muted = !els.video.muted;
-    els.icoVol.classList.toggle('hidden', els.video.muted);
-    els.icoMudo.classList.toggle('hidden', !els.video.muted);
+    state.mudo = !state.mudo;
+    els.icoVol.classList.toggle('hidden', state.mudo);
+    els.icoMudo.classList.toggle('hidden', !state.mudo);
+    if (audio.ativo && audio.ganho) audio.ganho.gain.value = volumeAplicado();
+    else els.video.muted = state.mudo;
   });
+
   $('#pvFull').addEventListener('click', function () {
-    const alvo = els.player;
     if (document.fullscreenElement) document.exitFullscreen();
-    else if (alvo.requestFullscreen) alvo.requestFullscreen();
+    else if (els.player.requestFullscreen) els.player.requestFullscreen();
     else if (els.video.webkitEnterFullscreen) els.video.webkitEnterFullscreen();
   });
 
   els.pvSeek.addEventListener('pointerdown', function (e) {
     state.arrastandoSeek = true;
-    els.pvSeek.setPointerCapture(e.pointerId);
+    try { els.pvSeek.setPointerCapture(e.pointerId); } catch (err) { }
     seekPara(e.clientX);
   });
   els.pvSeek.addEventListener('pointermove', function (e) { if (state.arrastandoSeek) seekPara(e.clientX); });
@@ -2334,19 +2347,17 @@ function wire() {
     else mostrarControles();
   });
 
+  els.video.addEventListener('loadedmetadata', atualizarTempo);
   els.video.addEventListener('play', function () {
-    els.icoPlay.classList.add('hidden');
-    els.icoPause.classList.remove('hidden');
-    mostrarControles();
+    els.icoPlay.classList.add('hidden'); els.icoPause.classList.remove('hidden'); mostrarControles();
+    if (audio.ctx && audio.ctx.state === 'suspended') { try { audio.ctx.resume(); } catch (e) { } }
   });
   els.video.addEventListener('pause', function () {
-    els.icoPlay.classList.remove('hidden');
-    els.icoPause.classList.add('hidden');
-    mostrarControles();
+    els.icoPlay.classList.remove('hidden'); els.icoPause.classList.add('hidden'); mostrarControles();
+    if (audio.ctx && audio.ctx.state === 'running') { try { audio.ctx.suspend(); } catch (e) { } }
   });
   els.video.addEventListener('playing', function () {
-    els.pvCenter.classList.add('oculto');
-    mostrarControles();
+    els.pvCenter.classList.add('oculto'); mostrarControles();
   });
   els.video.addEventListener('waiting', function () {
     if (state.podeTocar) {
@@ -2360,11 +2371,13 @@ function wire() {
     const agora = Date.now();
     if (agora - state.ultimoSalvar < 5000) return;
     state.ultimoSalvar = agora;
-    if (els.video.duration) salvarProgresso(els.video.currentTime, els.video.duration);
+    salvarProgresso();
   });
-  els.video.addEventListener('loadedmetadata', atualizarTempo);
+  els.video.addEventListener('seeked', function () {
+    if (audio.ativo) reiniciarResgate();
+  });
   els.video.addEventListener('error', function () {
-    if (state.podeTocar) toast('O navegador nao reproduziu este arquivo. Use "Fontes" para trocar ou abra no VLC.', 'error');
+    if (state.podeTocar) toast('Falha na reproducao. Use Fontes para trocar.', 'error');
   });
 
   document.addEventListener('keydown', function (e) {
@@ -2391,13 +2404,13 @@ function wire() {
 
 async function init() {
   wire();
+  setTipo(state.tipo);
   try {
     const cfg = await api('/api/config');
     if (!cfg.tmdbConfigurado) mostrarAviso();
     const g = await api('/api/generos', { tipo: state.tipo });
     state.generos = g.generos || [];
   } catch (e) { if (/TMDB_API_KEY/.test(e.message)) mostrarAviso(); }
-  carregarInicio();
   renderLista();
   renderHistorico();
 }
@@ -2422,28 +2435,37 @@ if ($existingKey -ne '' -and $existingKey -ne 'SUA_CHAVE_AQUI') { $keyToWrite = 
 
 $envContent = @"
 # ============================================================
-#  CineP2P 4.0
+#  CineP2P 8.0 - stream bruto + audio decodificado no navegador
 #  TMDB_API_KEY obrigatoria. https://www.themoviedb.org/settings/api
 # ============================================================
 TMDB_API_KEY=$keyToWrite
 TMDB_LANGUAGE=pt-BR
 TMDB_REGION=BR
 
-# Servidor (0.0.0.0 permite abrir no celular da mesma rede)
+# Servidor
 PORT=3000
 HOST=0.0.0.0
 
-# Scrapers (vazio = todos os 13 em paralelo)
+# Filtros
+FILTRO_ESTRITO=1
+FILTRO_INSTALADOR=1
+
+# Scrapers (vazio = todos)
 SCRAPER_TIMEOUT=9
 SCRAPERS_ENABLED=
 
-# Player / buffer
-METADATA_TIMEOUT=40
-MAX_CONNS=200
+# Player - modo BRUTO: nenhum ffmpeg, CPU zero, inicio instantaneo
+TRANSCODE=nunca
+METADATA_TIMEOUT=60
+BUFFER_TIMEOUT=150
+MAX_CONNS=300
 MAX_JOBS=3
-IDLE_TIMEOUT=720000
-MIN_BUFFER_PERCENT=3
-MIN_BUFFER_MB=8
+IDLE_TIMEOUT=900000
+MIN_BUFFER_PERCENT=1
+MIN_BUFFER_MB=2
+
+# uTP: 0 = somente TCP
+ENABLE_UTP=0
 
 # Legendas
 MAX_SUBS=8
@@ -2460,9 +2482,9 @@ if ($keyToWrite -ne 'SUA_CHAVE_AQUI') { Write-Host '  TMDB_API_KEY preservada' -
 $packageJson = @'
 {
   "name": "cinep2p",
-  "version": "4.0.0",
+  "version": "8.0.0",
   "private": true,
-  "description": "Clone Netflix de streaming P2P com catalogo TMDb e selecao automatica de audio PT-BR.",
+  "description": "Streaming P2P com filtro IMDb e audio decodificado no proprio navegador.",
   "type": "commonjs",
   "main": "server.js",
   "scripts": { "start": "node server.js", "dev": "node server.js" },
@@ -2471,6 +2493,11 @@ $packageJson = @'
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "webtorrent": "^1.9.7"
+  },
+  "optionalDependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
+    "fluent-ffmpeg": "^2.1.3"
   }
 }
 '@
@@ -2478,43 +2505,41 @@ Write-ProjectFile 'package.json' $packageJson
 
 # ----------------------------------------------------------------------
 $readme = @'
-# CineP2P 4.0
+# CineP2P 8.0
 
-Catalogo TMDb PT-BR + streaming P2P com selecao automatica de audio brasileiro.
+## Arquitetura do player
+
+Servidor serve o arquivo BitTorrent BRUTO com `Range: bytes`. Zero CPU,
+zero ffmpeg, sem ffprobe. O video comeca com 1% de buffer.
+
+O audio e resolvido no navegador:
+
+1. Ao iniciar o video, o frontend baixa os primeiros 1 MB e faz o parse do
+   cabecalho MKV em JavaScript (EBML puro).
+2. Identifica as faixas de audio, o codec e o idioma de cada uma.
+3. Se a faixa em portugues nao for a primeira, ou o codec for AC3/EAC3/DTS/
+   TrueHD/PCM (que o navegador nao decodifica), ativa o RESGATE:
+   - segunda conexao HTTP com Range no mesmo stream;
+   - demux MKV em JS (SimpleBlock, lacing Xiph/EBML/fixo, timecodes);
+   - decodificacao via Web Audio API (`decodeAudioData`), com envelope ADTS
+     automatico para AAC;
+   - agendamento dos buffers contra `video.currentTime`, com video mutado.
+
+Resultado: audio em portugues audivel, sem transcode no servidor e sem
+nenhum player externo.
+
+## Filtros
+- `src/validar.js` descarta links de outros filmes (titulo + ano vs IMDb).
+- `src/ranking.js` descarta instaladores, ativadores, ISOs, RAR/ZIP, cracks.
+  Desligue com `FILTRO_INSTALADOR=0`.
 
 ## Rodar
-1. `TMDB_API_KEY=sua_chave` no `.env`
-2. `npm install`
-3. `npm start` -> http://localhost:3000 (celular: http://SEU-IP:3000)
+`npm start` -> http://localhost:3000
 
-## Classificacao de audio (src/ptbr.js)
-Niveis: `confirmado` > `provável` > `incerto` > `estrangeiro`.
-- `confirmado`: marcador PT-BR explicito OU fonte nacional (Commandotorrents,
-  Lapumia, RedeTorrent, BluDV, TorrentDosFilmes) + DUBLADO/DUAL AUDIO.
-- `provável`: DUAL AUDIO limpo, ou DUBLADO sem termo estrangeiro.
-- Rebaixa quando detecta dublagem alheia: russo, castellano, latino, VF,
-  truefrench, english, deutsch, italiano, hindi, japones...
-- So `confirmado`/`provável` podem virar "melhor fonte" automatica.
-
-## Player
-Abre imediatamente, sem modal. O buffer (peers, velocidade, %) roda dentro da
-area do video. Controles: play/pause, -30s, +30s, seek, volume, fullscreen e
-seletor de legendas (arquivos .srt/.ass/.vtt do proprio torrent, convertidos
-para WebVTT em `/api/play/subtitle`).
-
-## Disco
-Cada job vive em `cache/<jobId>`. Ao fechar o player, sair da pagina ou trocar
-de fonte: `destroy({destroyStore:true})` + rm recursivo com retry.
-`CACHE_MODE=keep` mantem os arquivos.
-
-## Endpoints
-`/api/home`, `/api/filmes/*`, `/api/buscar`, `/api/media/:tipo/:id`,
-`/api/torrent`, `/api/play`, `/api/play/status`, `/api/play/stream`,
-`/api/play/subs`, `/api/play/subtitle`, `/api/play/stop`.
-
-## Capacitor
-`public/` e estatico e sem rotas rigidas. Edite `public/config.js` com
-`window.CINEP2P_API_BASE = 'http://SEU_IP:3000'` e empacote normalmente.
+## Voltar ao transcode
+`TRANSCODE=auto` (so quando o codec exigir) ou `TRANSCODE=sempre`.
+Nesses modos o ffmpeg entra em acao; sem ele o app continua funcionando
+em modo bruto.
 '@
 Write-ProjectFile 'README.md' $readme
 
@@ -2534,24 +2559,23 @@ Write-Step 'Validando'
 if (Get-Command node -ErrorAction SilentlyContinue) {
     Push-Location -LiteralPath $Root
     try {
-        & node -e "require('./src/ptbr');require('./src/ranking');require('./src/subtitulos');require('./src/scrapers');require('./src/magnets');require('./src/streamer');console.log('  modulos ok')"
+        & node -e "require('./src/validar');require('./src/ranking');require('./src/magnets');require('./src/scrapers');const s=require('./src/streamer');console.log('  modulos ok | modo:', s.MODO_TRANSCODE)"
     } catch { }
     finally { Pop-Location }
 }
 
 Write-Host ''
 Write-Host '==================================================================' -ForegroundColor Green
-Write-Host ' CineP2P 4.0 aplicado' -ForegroundColor Green
+Write-Host ' CineP2P 8.0 aplicado' -ForegroundColor Green
 Write-Host '==================================================================' -ForegroundColor Green
 Write-Host ''
-Write-Host ' Filtro PT-BR: src/ptbr.js + src/fontes.js (5 fontes nacionais)' -ForegroundColor White
-Write-Host ' Player: abre imediato, buffer interno, -30s/+30s, legendas' -ForegroundColor White
-Write-Host ' Limpeza: cache/<jobId> destruido ao sair' -ForegroundColor White
+Write-Host ' Servidor: stream bruto com Range, CPU zero, sem ffmpeg' -ForegroundColor White
+Write-Host ' Player: demux MKV em JS + Web Audio, faixa PT automatica' -ForegroundColor White
+Write-Host ' Ranking: descarte de instalador/ativador/ISO' -ForegroundColor White
 Write-Host ''
 Write-Host ' PROXIMOS PASSOS:' -ForegroundColor Yellow
-Write-Host '   1) .env -> TMDB_API_KEY=sua_chave'
-Write-Host '   2) npm start'
-Write-Host '   3) http://localhost:3000'
+Write-Host '   1) npm start'
+Write-Host '   2) http://localhost:3000'
 Write-Host ''
 if ($madeBackup) { Write-Host (' Backup: ' + (Split-Path -Leaf $BackupDir)) -ForegroundColor DarkGray }
 Write-Host ''

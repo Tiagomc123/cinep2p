@@ -1,47 +1,44 @@
 'use strict';
 
 /**
- * Inteligencia de strings + deduplicacao + ordenacao.
+ * Ranking: identidade -> descarte de instalador -> nivel de audio -> seeders.
  *
- * Prioridade: DUBLADO > PT-BR/NACIONAL > DUAL AUDIO > seeders > qualidade.
- * Penaliza CAM/TS e resultados sem peers.
+ * Regra nova: qualquer resultado que pareca instalador de PC, ativador ou
+ * imagem de disco e sumariamente rejeitado antes de tudo.
  */
 
-const RE_DUB = /(dublado|dublada|\bdub\b|\bdublagem\b)/i;
-const RE_DUAL = /(dual[\s._-]?audio|\bdual\b)/i;
-const RE_PTBR = /(pt[\s._-]?br|ptbr|\bnacional\b|portugu[eê]s|\bbr\b|brazilian|webdl br|bluray br)/i;
-const RE_LEG = /(legendado|\bleg\b|subtitulad|\bsub\b)/i;
-const RE_CAM = /(\bcam\b|\bts\b|hdcam|hdts|telesync|pre[\s._-]?dvd)/i;
-const RE_REMO = /(remux|bluray|bdrip|brrip|web[\s._-]?dl|webrip|hdtv|dvdrip)/i;
+const ptbr = require('./ptbr');
+const validar = require('./validar');
 
-function analisarTitulo(nome) {
+const RANK_NIVEL = {
+  duals51: 6, confirmado: 5, provavel: 4, incerto: 3, fraco: 2, estrangeiro: 1, desconhecido: 0
+};
+
+/* Sinais fortes: sozinhos ja condenam o arquivo */
+const RE_INSTALADOR_FORTE = /(monkrus|preactivated|pre-activated|\bkeygen\b|\bcrack(ed|eado)?\b|\bactivator\b|\bativador\b|\bportable\b|\bkms(?:pico|auto)?\b|\.exe\b|\.iso\b|\.img\b|\.zip\b|\.rar\b|\.7z\b|\.msi\b|\bx64\b|\bx86\b|\bwin(?:dows)?\b)/i;
+
+/* Sinais fracos: so condenam se nao houver marcador de video */
+const RE_INSTALADOR_FRACO = /(\brepack\b|\bpatch\b|\bsetup\b|\binstaller\b|\binstalador\b|\bserial\b|\bmedicine\b|\bupdate\b)/i;
+
+const RE_MARCADOR_VIDEO = /(2160p|1440p|1080p|720p|480p|4k|bluray|bdrip|brrip|webrip|web[\s._-]?dl|remux|hdtv|dvdrip|x264|x265|h264|h265|hevc|av1)/i;
+
+function ehInstalador(nome) {
   const n = String(nome || '');
-  const info = {
-    dub: RE_DUB.test(n),
-    dual: RE_DUAL.test(n),
-    ptbr: RE_PTBR.test(n),
-    leg: RE_LEG.test(n),
-    cam: RE_CAM.test(n)
-  };
-  info.br = info.dub || info.dual || info.ptbr;
-  return info;
+  if (RE_INSTALADOR_FORTE.test(n)) return true;
+  if (RE_INSTALADOR_FRACO.test(n) && !RE_MARCADOR_VIDEO.test(n)) return true;
+  if (RE_INSTALADOR_FRACO.test(n) && !/\b(19|20)\d{2}\b/.test(n) && !RE_MARCADOR_VIDEO.test(n)) return true;
+  return false;
 }
 
-function rotuloAudio(info) {
-  if (info.dub) return 'Dublado';
-  if (info.dual) return 'Dual Audio';
-  if (info.ptbr) return 'PT-BR';
-  if (info.leg) return 'Legendado';
-  return 'Original';
-}
+function pad(n) { return String(n || 1).padStart(2, '0'); }
 
-function pesoQualidade(q) {
+function bonusQualidade(q) {
   switch (String(q || '').toLowerCase()) {
-    case '2160p': return 3.2;
-    case '1080p': return 4;
-    case '720p': return 2.4;
-    case '480p': return 1;
-    default: return 1.6;
+    case '1080p': return 520;
+    case '720p': return 300;
+    case '2160p': return 430;
+    case '480p': return 80;
+    default: return 150;
   }
 }
 
@@ -54,25 +51,31 @@ function contemPalavras(titulo, alvo) {
 }
 
 function pontuar(item, ctx) {
-  const info = item._info || analisarTitulo(item.title);
-  let s = 0;
+  let s = (RANK_NIVEL[item.ptbr.nivel] || 0) * 100000;
+  s += Math.log10(Math.max(1, item.seeders) + 1) * 1200;
+  s += bonusQualidade(item.quality);
 
-  if (info.dub) s += 1400;
-  if (info.ptbr) s += 1200;
-  if (info.dual) s += 1000;
-  if (info.br) s += 400;
-  if (info.leg) s += 120;
-
-  s += pesoQualidade(item.quality) * 380;
-  s += Math.log10(Math.max(1, item.seeders)) * 170;
-
-  if (ctx.ano && String(item.title).indexOf(String(ctx.ano)) !== -1) s += 220;
-  if (contemPalavras(item.title, ctx.titulo)) s += 180;
-  if (contemPalavras(item.title, ctx.tituloOriginal)) s += 150;
-  if (RE_REMO.test(item.title)) s += 90;
+  if (item.ptbr.temDual51) s += 900;
+  if (contemPalavras(item.title, ctx.titulo)) s += 220;
+  if (contemPalavras(item.title, ctx.tituloOriginal)) s += 180;
   if (item.fileIdx !== null && item.fileIdx !== undefined) s += 70;
-  if (info.cam) s -= 320;
-  if (item.seeders === 0) s -= 120;
+
+  if (ctx.tipo === 'tv') {
+    const tag = 'S' + pad(ctx.temporada) + 'E' + pad(ctx.episodio);
+    const reExato = new RegExp(tag, 'i');
+    const reOutroEp = /\bS\d{1,2}E\d{1,2}\b/i;
+    const rePack = /(complete|completa|temporada\s*\d|season\s*\d|\bpack\b)/i;
+    if (reExato.test(item.title)) s += 1200;
+    else if (reOutroEp.test(item.title)) s -= 200;
+    if (rePack.test(item.title) && !reExato.test(item.title)) s -= 600;
+  } else if (ctx.ano && String(item.title).indexOf(String(ctx.ano)) !== -1) {
+    s += 260;
+  }
+
+  if (item.quality === '2160p' && item.seeders < 15) s -= 900;
+  if (item.quality === '2160p' && /(\bdv\b|dolby[\s._-]?vision|hdr10|\bhdr\b)/i.test(item.title)) s -= 250;
+  if (/(\bcam\b|\bts\b|hdcam|hdts|telesync)/i.test(item.title)) s -= 450;
+  if (item.seeders === 0) s -= 400;
   if (item.sizeBytes && item.sizeBytes < 200 * 1024 * 1024) s -= 60;
 
   return s;
@@ -90,7 +93,10 @@ function normalizar(item) {
     seeders: Number(item.seeders || 0),
     fileIdx: (item.fileIdx === null || item.fileIdx === undefined) ? null : item.fileIdx,
     source: item.source || 'Desconhecida',
-    audio: rotuloAudio(analisarTitulo(nome))
+    imdbConfirmado: !!item.imdbConfirmado,
+    score: 0,
+    ptbr: null,
+    elegivel: false
   };
 }
 
@@ -101,7 +107,7 @@ function deduplicar(lista) {
     if (!chave) return;
     const atual = mapa.get(chave);
     if (!atual) { mapa.set(chave, item); return; }
-    // mantem o registro mais completo (seeders, fileIdx, tamanho)
+    if (item.score > atual.score) { mapa.set(chave, item); return; }
     if (item.seeders > atual.seeders) atual.seeders = item.seeders;
     if (!atual.size && item.size) { atual.size = item.size; atual.sizeBytes = item.sizeBytes; }
     if (atual.fileIdx === null && item.fileIdx !== null) atual.fileIdx = item.fileIdx;
@@ -111,16 +117,46 @@ function deduplicar(lista) {
 }
 
 function preparar(lista, ctx) {
-  const validos = lista
-    .filter(function (i) { return i && i.magnet && /^magnet:/i.test(i.magnet); })
-    .map(normalizar);
+  const estrito = process.env.FILTRO_ESTRITO !== '0';
+  const semInstalador = process.env.FILTRO_INSTALADOR !== '0';
 
-  validos.forEach(function (i) { i._info = analisarTitulo(i.title); });
+  const validos = [];
+  const descartados = [];
+
+  lista
+    .filter(function (i) { return i && i.magnet && /^magnet:/i.test(i.magnet); })
+    .forEach(function (bruto) {
+      const item = normalizar(bruto);
+
+      if (semInstalador && ehInstalador(item.title)) {
+        item.valido = false;
+        item.motivoInvalido = 'descartado: instalador/ativador/iso';
+        descartados.push(item);
+        return;
+      }
+
+      if (!estrito || item.imdbConfirmado) {
+        item.valido = true;
+        item.motivoInvalido = item.imdbConfirmado ? 'imdb id confirmado' : 'filtro desligado';
+      } else {
+        const v = validar.validar(item.title, ctx);
+        item.valido = v.ok;
+        item.motivoInvalido = v.ok ? v.motivo : ('descartado: ' + v.motivo);
+      }
+
+      if (item.valido) validos.push(item);
+      else descartados.push(item);
+    });
+
+  validos.forEach(function (i) {
+    i.ptbr = ptbr.avaliar(i.title, i.source);
+    i.elegivel = i.ptbr.elegivel;
+    i.score = pontuar(i, ctx);
+  });
 
   const unicos = deduplicar(validos);
-  unicos.forEach(function (i) { i.score = pontuar(i, ctx); });
   unicos.sort(function (a, b) { return b.score - a.score; });
-  return unicos;
+  return { validos: unicos, descartados: descartados };
 }
 
-module.exports = { preparar: preparar, analisarTitulo: analisarTitulo, rotuloAudio: rotuloAudio };
+module.exports = { preparar: preparar, RANK_NIVEL: RANK_NIVEL, ehInstalador: ehInstalador };

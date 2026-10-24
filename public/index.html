@@ -12,6 +12,8 @@
 <link rel="icon" href="/placeholder.svg">
 <link rel="preconnect" href="https://image.tmdb.org">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/player.css">
+<link rel="stylesheet" href="/series.css">
 </head>
 <body>
 
@@ -22,6 +24,11 @@
 
   <a class="brand" id="brand" href="#">Cine<span>P2P</span></a>
 
+  <nav class="tipo-tabs" id="tipoTabs">
+    <button class="tipo-tab active" data-tipo="movie">Filmes</button>
+    <button class="tipo-tab" data-tipo="tv">Series</button>
+  </nav>
+
   <nav class="topnav" id="topnav">
     <button class="nav-link active" data-view="inicio">Inicio</button>
     <button class="nav-link" data-view="buscar">Buscar</button>
@@ -31,7 +38,6 @@
   </nav>
 
   <div class="topbar-actions">
-    <button class="chip" id="tipoToggle">Filmes</button>
     <button class="icon-btn" id="searchBtn" aria-label="Buscar">
       <svg viewBox="0 0 24 24" width="21" height="21"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2" fill="none"/><path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     </button>
@@ -45,6 +51,10 @@
       <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     </button>
   </div>
+  <div class="drawer-tipos">
+    <button class="tipo-tab active" data-tipo="movie">Filmes</button>
+    <button class="tipo-tab" data-tipo="tv">Series</button>
+  </div>
   <nav class="drawer-nav">
     <button class="nav-link" data-view="inicio">Inicio</button>
     <button class="nav-link" data-view="buscar">Buscar</button>
@@ -52,7 +62,7 @@
     <button class="nav-link" data-view="lista">Minha Lista</button>
     <button class="nav-link" data-view="categorias">Categorias</button>
   </nav>
-  <p class="drawer-foot" id="drawerInfo">CineP2P 3.0</p>
+  <p class="drawer-foot">CineP2P 8.0</p>
 </aside>
 <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
 
@@ -64,7 +74,7 @@
 
   <section id="view-buscar" class="view hidden">
     <div class="searchbar">
-      <input id="searchInput" type="search" placeholder="Buscar filmes, series..." autocomplete="off">
+      <input id="searchInput" type="search" placeholder="Buscar..." autocomplete="off">
       <button class="btn small" id="searchGo">Buscar</button>
     </div>
     <div id="searchResults" class="grid"></div>
@@ -89,20 +99,24 @@
 </main>
 
 <nav class="bottom-nav">
-  <button class="bn-item active" data-view="inicio">
-    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+  <button class="bn-item active" data-view="inicio" data-tipo="movie">
+    <svg viewBox="0 0 24 24" width="21" height="21"><path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
     <span>Inicio</span>
   </button>
-  <button class="bn-item" data-view="buscar">
-    <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2" fill="none"/><path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-    <span>Buscar</span>
+  <button class="bn-item" data-view="inicio" data-tipo="movie" data-aba="filmes">
+    <svg viewBox="0 0 24 24" width="21" height="21"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 5v14M16 5v14" stroke="currentColor" stroke-width="2"/></svg>
+    <span>Filmes</span>
+  </button>
+  <button class="bn-item" data-view="inicio" data-tipo="tv" data-aba="series">
+    <svg viewBox="0 0 24 24" width="21" height="21"><rect x="3" y="7" width="18" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 3l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <span>Series</span>
   </button>
   <button class="bn-item" data-view="lista">
-    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 4.6-7 9-7 9z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <svg viewBox="0 0 24 24" width="21" height="21"><path d="M12 20s-7-4.4-7-9a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 4.6-7 9-7 9z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
     <span>Lista</span>
   </button>
   <button class="bn-item" data-view="historico">
-    <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <svg viewBox="0 0 24 24" width="21" height="21"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     <span>Historico</span>
   </button>
 </nav>
@@ -117,25 +131,63 @@
   </div>
 </div>
 
+<!-- ============================ PLAYER ============================ -->
 <div id="player" class="player hidden">
-  <div class="player-head">
-    <button class="icon-btn" id="closePlayer" aria-label="Fechar player">
-      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <video id="video" playsinline webkit-playsinline preload="auto" autoplay></video>
+
+  <div class="pv-top" id="pvTop">
+    <button class="pv-btn" id="pvClose" aria-label="Voltar">
+      <svg viewBox="0 0 24 24" width="24" height="24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
-    <span id="playerTitle" class="player-title">Reproduzindo</span>
-    <button class="icon-btn" id="copyStream" aria-label="Copiar URL">
-      <svg viewBox="0 0 24 24" width="20" height="20"><rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg>
-    </button>
+    <div class="pv-title" id="pvTitle">Reproduzindo</div>
+    <button class="pv-btn pv-txt" id="pvFontes">Fontes</button>
   </div>
-  <div class="player-stage">
-    <video id="video" controls playsinline webkit-playsinline preload="metadata"></video>
-    <div id="playerOverlay" class="player-overlay">
-      <div class="spinner"></div>
-      <p class="ov-msg">Conectando aos peers (buffer)...</p>
-      <div class="ov-bar"><div class="ov-fill"></div></div>
-      <p class="ov-stats"></p>
-      <button class="btn small ghost" id="cancelPlay">Cancelar</button>
+
+  <div class="pv-center" id="pvCenter">
+    <div class="pv-spinner"></div>
+    <p class="pv-msg" id="pvMsg">Conectando aos peers...</p>
+    <div class="pv-bar"><i id="pvFill"></i></div>
+    <p class="pv-stats" id="pvStats"></p>
+    <p class="pv-fonte" id="pvFonte"></p>
+  </div>
+
+  <div class="pv-bottom" id="pvBottom">
+    <div class="pv-seek" id="pvSeek">
+      <div class="pv-seek-track"><i id="pvProgress"></i></div>
+      <div class="pv-seek-knob" id="pvKnob"></div>
     </div>
+    <div class="pv-row">
+      <button class="pv-btn" id="pvPlay" aria-label="Play/Pause">
+        <svg id="icoPlay" viewBox="0 0 24 24" width="26" height="26"><path d="M7 4.5v15l13-7.5z" fill="currentColor"/></svg>
+        <svg id="icoPause" class="hidden" viewBox="0 0 24 24" width="26" height="26"><path d="M7 4.5h4v15H7zM13 4.5h4v15h-4z" fill="currentColor"/></svg>
+      </button>
+      <button class="pv-btn" id="pvBack30" aria-label="Voltar 30 segundos">
+        <svg viewBox="0 0 24 24" width="26" height="26"><path d="M11 5V2L6 6l5 4V7a6 6 0 1 1-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><text x="12" y="17" font-size="8" font-weight="700" fill="currentColor" text-anchor="middle">30</text></svg>
+      </button>
+      <button class="pv-btn" id="pvFwd30" aria-label="Avancar 30 segundos">
+        <svg viewBox="0 0 24 24" width="26" height="26"><path d="M13 5V2l5 4-5 4V7a6 6 0 1 0 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><text x="12" y="17" font-size="8" font-weight="700" fill="currentColor" text-anchor="middle">30</text></svg>
+      </button>
+      <span class="pv-time" id="pvTime">0:00 / 0:00</span>
+      <span class="pv-spacer"></span>
+      <button class="pv-btn" id="pvMute" aria-label="Volume">
+        <svg id="icoVol" viewBox="0 0 24 24" width="24" height="24"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <svg id="icoMudo" class="hidden" viewBox="0 0 24 24" width="24" height="24"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor"/><path d="M15 9l5 6M20 9l-5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <button class="pv-btn pv-cc" id="pvCC" aria-label="Legendas">CC</button>
+      <button class="pv-btn" id="pvFull" aria-label="Tela cheia">
+        <svg viewBox="0 0 24 24" width="24" height="24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="pv-sheet hidden" id="pvSheet">
+    <div class="pv-sheet-head">
+      <strong id="pvSheetTitle">Fontes</strong>
+      <button class="pv-btn" id="pvSheetClose" aria-label="Fechar">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="pv-sheet-body" id="pvSheetBody"></div>
   </div>
 </div>
 

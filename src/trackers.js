@@ -1,8 +1,9 @@
 'use strict';
 
 /**
- * Announce list massiva (trackers publicos atualizados).
- * Injetada em TODO magnet link e re-anunciada quando nao ha peers.
+ * Announce list MASSIVA. Toda requisicao do player sai com esta lista
+ * (magnet + opcao announce do WebTorrent + re-anuncio periodico).
+ * Maioria UDP para resposta imediata dos trackers.
  */
 const TRACKERS = [
   'udp://tracker.opentrackr.org:1337/announce',
@@ -45,59 +46,88 @@ const TRACKERS = [
   'udp://tracker.filemail.com:6969/announce',
   'udp://tracker.leech.ie:1337/announce',
   'udp://tracker.bitsearch.to:1337/announce',
+  'udp://tracker.uw0.xyz:6969/announce',
+  'udp://tracker.kuroy.me:5944/announce',
+  'udp://tr.bangumi.moe:6969/announce',
+  'udp://retracker.hotplug.ru:2710/announce',
+  'udp://tracker.army:6969/announce',
+  'udp://tracker.dix.tf:6969/announce',
+  'udp://tracker.parrotsec.org:6969/announce',
+  'udp://tracker.srv00.com:6969/announce',
+  'udp://tracker.bittorrent.cloud:6969/announce',
+  'udp://tracker.bt4g.com:2095/announce',
+  'udp://tracker.nitrix.me:6969/announce',
+  'udp://ipv4.tracker.harry.lu:80/announce',
+  'udp://tracker.open-tracker.org:1337/announce',
+  'udp://tracker2.dler.org:80/announce',
+  'udp://tracker3.dler.org:2710/announce',
+  'udp://tracker4.dler.org:443/announce',
+  'udp://udp.tracker.projectk.org:23333/announce',
+  'udp://tracker.zerobytes.xyz:1337/announce',
+  'udp://tracker.darkferret.dev:6969/announce',
+  'udp://tracker1.itzmx.com:8080/announce',
+  'udp://tracker2.itzmx.com:6961/announce',
+  'udp://tracker3.itzmx.com:6961/announce',
+  'udp://tracker4.itzmx.com:2710/announce',
+  'udp://tracker.corpscorp.online:80/announce',
+  'udp://tracker.lintk.me:2710/announce',
+  'udp://tracker.zhuqiy.com:6969/announce',
+  'udp://tracker.ml:6969/announce',
   'https://tracker.gbitt.info:443/announce',
   'https://tracker.tamersunion.org:443/announce',
   'https://tracker.imgoingto.icu:443/announce',
   'https://tracker.lilithraws.org:443/announce',
+  'https://tracker.foreverpirates.co:443/announce',
+  'https://tracker.bt4g.com:443/announce',
   'wss://tracker.openwebtorrent.com',
   'wss://tracker.btorrent.xyz',
   'wss://tracker.webtorrent.dev',
   'wss://tracker.files.fm:7073/announce'
 ];
 
-function uniq(list) {
-  const seen = new Set();
-  const out = [];
-  for (const item of list) {
+function uniq(lista) {
+  const vistos = new Set();
+  const saida = [];
+  for (const item of lista) {
     if (!item) continue;
-    const key = String(item).toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(item);
+    const chave = String(item).toLowerCase();
+    if (vistos.has(chave)) continue;
+    vistos.add(chave);
+    saida.push(item);
   }
-  return out;
+  return saida;
 }
 
 function extractAnnounce(magnet) {
-  const out = [];
+  const saida = [];
   const re = /[?&]tr=([^&]+)/g;
   let m;
   while ((m = re.exec(magnet)) !== null) {
-    try { out.push(decodeURIComponent(m[1])); } catch (e) { out.push(m[1]); }
+    try { saida.push(decodeURIComponent(m[1])); } catch (e) { saida.push(m[1]); }
   }
-  return out;
+  return saida;
 }
 
-function magnetFromHash(hash, name, extra) {
-  const parts = ['magnet:?xt=urn:btih:' + String(hash).toLowerCase()];
-  if (name) {
-    const dn = String(name).replace(/\s+/g, ' ').trim().slice(0, 120);
-    if (dn) parts.push('dn=' + encodeURIComponent(dn));
+function magnetFromHash(hash, nome, extra) {
+  const partes = ['magnet:?xt=urn:btih:' + String(hash).toLowerCase()];
+  if (nome) {
+    const dn = String(nome).replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (dn) partes.push('dn=' + encodeURIComponent(dn));
   }
   for (const tr of uniq((extra || []).concat(TRACKERS))) {
-    parts.push('tr=' + encodeURIComponent(tr));
+    partes.push('tr=' + encodeURIComponent(tr));
   }
-  return parts.join('&');
+  return partes.join('&');
 }
 
 function appendTrackers(magnet) {
   if (!magnet || !/^magnet:/i.test(magnet)) return magnet;
-  const have = new Set(extractAnnounce(magnet).map(function (t) { return t.toLowerCase(); }));
-  const missing = TRACKERS.filter(function (t) { return !have.has(t.toLowerCase()); });
-  if (!missing.length) return magnet;
-  let out = magnet;
-  for (const tr of missing) out += '&tr=' + encodeURIComponent(tr);
-  return out;
+  const tem = new Set(extractAnnounce(magnet).map(function (t) { return t.toLowerCase(); }));
+  const faltando = TRACKERS.filter(function (t) { return !tem.has(t.toLowerCase()); });
+  if (!faltando.length) return magnet;
+  let saida = magnet;
+  for (const tr of faltando) saida += '&tr=' + encodeURIComponent(tr);
+  return saida;
 }
 
-module.exports = { TRACKERS, magnetFromHash, appendTrackers, extractAnnounce };
+module.exports = { TRACKERS: TRACKERS, magnetFromHash: magnetFromHash, appendTrackers: appendTrackers, extractAnnounce: extractAnnounce };

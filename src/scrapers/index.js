@@ -1,21 +1,22 @@
 'use strict';
 
 /**
- * Registry de scrapers. Todos rodam EM PARALELO.
- * Use SCRAPERS_ENABLED=torrentio,yts,... no .env para restringir.
+ * Esteira concorrente - somente fontes resilientes (APIs e RSS).
+ * Unico HTML mantido: TorrentGalaxy (por pedido explicito).
  */
 
 const TODOS = [
   require('./torrentio'),
-  require('./yts'),
-  require('./piratebay'),
-  require('./eztv'),
+  require('./knaben'),
+  require('./bitsearch'),
+  require('./torrentscsv'),
   require('./solidtorrents'),
-  require('./torrentgalaxy'),
-  require('./torrent9'),
-  require('./commandotorrents'),
-  require('./lapumia'),
-  require('./x1337')
+  require('./piratebay'),
+  require('./bt4g'),
+  require('./nyaa'),
+  require('./yts'),
+  require('./eztv'),
+  require('./torrentgalaxy')
 ];
 
 function ativos() {
@@ -29,13 +30,13 @@ async function executar(ctx) {
   const tarefas = lista.map(async function (s) {
     const t0 = Date.now();
     if (s.supports && !s.supports(ctx)) {
-      return { nome: s.name, label: s.label, itens: [], ms: 0, erro: null, ignorado: true };
+      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: [], ms: 0, erro: null };
     }
     try {
       const itens = await s.search(ctx);
-      return { nome: s.name, label: s.label, itens: Array.isArray(itens) ? itens : [], ms: Date.now() - t0, erro: null };
+      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: Array.isArray(itens) ? itens : [], ms: Date.now() - t0, erro: null };
     } catch (e) {
-      return { nome: s.name, label: s.label, itens: [], ms: Date.now() - t0, erro: e.message };
+      return { nome: s.name, label: s.label, nacional: !!s.nacional, itens: [], ms: Date.now() - t0, erro: e.message };
     }
   });
   return Promise.all(tarefas);

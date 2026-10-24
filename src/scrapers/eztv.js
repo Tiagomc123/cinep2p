@@ -6,6 +6,7 @@ const trackers = require('../trackers');
 module.exports = {
   name: 'eztv',
   label: 'EZTV',
+  nacional: false,
   supports: function (ctx) { return ctx.tipo === 'tv'; },
   search: async function (ctx) {
     if (!ctx.imdbId) return [];
@@ -30,6 +31,7 @@ module.exports = {
           sizeBytes: Number(t.size_bytes || 0),
           seeders: Number(t.seeds || 0),
           fileIdx: null,
+          imdbConfirmado: true,
           source: 'EZTV'
         };
       });

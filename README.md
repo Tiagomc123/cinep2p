@@ -1,33 +1,35 @@
-# CineP2P 3.0
+# CineP2P 8.0
 
-Catalogo TMDb (PT-BR) + streaming P2P por torrent, com UI mobile-first estilo Netflix.
+## Arquitetura do player
+
+Servidor serve o arquivo BitTorrent BRUTO com `Range: bytes`. Zero CPU,
+zero ffmpeg, sem ffprobe. O video comeca com 1% de buffer.
+
+O audio e resolvido no navegador:
+
+1. Ao iniciar o video, o frontend baixa os primeiros 1 MB e faz o parse do
+   cabecalho MKV em JavaScript (EBML puro).
+2. Identifica as faixas de audio, o codec e o idioma de cada uma.
+3. Se a faixa em portugues nao for a primeira, ou o codec for AC3/EAC3/DTS/
+   TrueHD/PCM (que o navegador nao decodifica), ativa o RESGATE:
+   - segunda conexao HTTP com Range no mesmo stream;
+   - demux MKV em JS (SimpleBlock, lacing Xiph/EBML/fixo, timecodes);
+   - decodificacao via Web Audio API (`decodeAudioData`), com envelope ADTS
+     automatico para AAC;
+   - agendamento dos buffers contra `video.currentTime`, com video mutado.
+
+Resultado: audio em portugues audivel, sem transcode no servidor e sem
+nenhum player externo.
+
+## Filtros
+- `src/validar.js` descarta links de outros filmes (titulo + ano vs IMDb).
+- `src/ranking.js` descarta instaladores, ativadores, ISOs, RAR/ZIP, cracks.
+  Desligue com `FILTRO_INSTALADOR=0`.
 
 ## Rodar
-1. `TMDB_API_KEY=sua_chave` no `.env`
-2. `npm install`
-3. `npm start` -> http://localhost:3000
-4. No celular (mesma rede): `http://IP-DO-PC:3000`
+`npm start` -> http://localhost:3000
 
-## Endpoints
-- `GET /api/home?tipo=movie|tv`
-- `GET /api/filmes/populares | /api/filmes/lancamentos | /api/filmes/top | /api/filmes/genero/:id`
-- `GET /api/buscar?q=`
-- `GET /api/media/:tipo/:id`
-- `GET /api/torrent?titulo=&tituloOriginal=&ano=&imdbId=&tipo=&temporada=&episodio=`
-- `GET /api/play`, `/api/play/status`, `/api/play/stream`, `/api/play/stop`
-
-## Scrapers (paralelos)
-Torrentio, YTS, ThePirateBay, EZTV, SolidTorrents, TorrentGalaxy, Torrent9,
-Commandotorrents, Lapumia, 1337x. Ranking prioriza DUBLADO > PT-BR > DUAL AUDIO
-> seeders > qualidade; dedupe por infoHash.
-
-## Disco
-Cada reproducao usa `cache/<jobId>`. Ao fechar o player (ou sair da pagina) o
-torrent e destruido e a pasta apagada. `CACHE_MODE=keep` mantem os arquivos.
-
-## Capacitor / Cordova
-A pasta `public/` e 100% estatica e sem rotas rigidas. Para empacotar:
-1. `npx cap init` + `npx cap add android`
-2. copie `public/` para o `www/` do projeto Capacitor
-3. edite `public/config.js` com `window.CINEP2P_API_BASE = 'http://SEU_IP:3000'`
-4. `npx cap sync android && npx cap open android`
+## Voltar ao transcode
+`TRANSCODE=auto` (so quando o codec exigir) ou `TRANSCODE=sempre`.
+Nesses modos o ffmpeg entra em acao; sem ele o app continua funcionando
+em modo bruto.

@@ -19,24 +19,17 @@ function isConfigured() {
   return c.apiKey.length >= 8;
 }
 
-function img(pathname, size) {
-  if (!pathname) return null;
-  return IMAGE_BASE + '/' + (size || 'w500') + pathname;
-}
+function img(p, size) { return p ? IMAGE_BASE + '/' + (size || 'w500') + p : null; }
 
 const cache = new Map();
 const TTL = 1000 * 60 * 15;
-
 function cacheGet(k) {
-  const hit = cache.get(k);
-  if (!hit) return null;
-  if (Date.now() > hit.expires) { cache.delete(k); return null; }
-  return hit.value;
+  const h = cache.get(k);
+  if (!h) return null;
+  if (Date.now() > h.expires) { cache.delete(k); return null; }
+  return h.value;
 }
-function cacheSet(k, v) {
-  if (cache.size > 500) cache.clear();
-  cache.set(k, { value: v, expires: Date.now() + TTL });
-}
+function cacheSet(k, v) { if (cache.size > 600) cache.clear(); cache.set(k, { value: v, expires: Date.now() + TTL }); }
 
 async function request(pathname, params) {
   const c = cfg();
@@ -48,24 +41,23 @@ async function request(pathname, params) {
   const url = new URL(BASE + pathname);
   url.searchParams.set('language', c.language);
   if (c.region) url.searchParams.set('region', c.region);
-  if (params) {
-    Object.keys(params).forEach(function (k) {
-      const v = params[k];
-      if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
-    });
-  }
+  if (params) Object.keys(params).forEach(function (k) {
+    const v = params[k];
+    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+  });
+
   const headers = { accept: 'application/json' };
   if (c.bearer.length > 20) headers.authorization = 'Bearer ' + c.bearer;
   else url.searchParams.set('api_key', c.apiKey);
 
-  const key = url.toString();
-  const cached = cacheGet(key);
-  if (cached) return cached;
+  const chave = url.toString();
+  const emCache = cacheGet(chave);
+  if (emCache) return emCache;
 
-  const controller = new AbortController();
-  const timer = setTimeout(function () { controller.abort(); }, 15000);
+  const ctrl = new AbortController();
+  const timer = setTimeout(function () { ctrl.abort(); }, 15000);
   try {
-    const res = await fetch(url, { headers: headers, signal: controller.signal });
+    const res = await fetch(url, { headers: headers, signal: ctrl.signal });
     if (!res.ok) {
       const body = await res.text().catch(function () { return ''; });
       const err = new Error('TMDb respondeu ' + res.status + (body ? ' - ' + body.slice(0, 180) : ''));
@@ -73,31 +65,28 @@ async function request(pathname, params) {
       throw err;
     }
     const data = await res.json();
-    cacheSet(key, data);
+    cacheSet(chave, data);
     return data;
   } catch (e) {
     if (e.name === 'AbortError') throw new Error('TMDb demorou demais (timeout 15s).');
     throw e;
-  } finally {
-    clearTimeout(timer);
-  }
+  } finally { clearTimeout(timer); }
 }
 
 function normalize(item, tipo) {
   if (!item) return null;
   const kind = tipo || (item.media_type === 'tv' || item.first_air_date ? 'tv' : 'movie');
-  const date = item.release_date || item.first_air_date || '';
+  const data = item.release_date || item.first_air_date || '';
   const titulo = item.title || item.name || item.original_title || item.original_name || 'Sem titulo';
   return {
     id: item.id,
     tipo: kind === 'tv' ? 'tv' : 'movie',
     titulo: titulo,
     tituloOriginal: item.original_title || item.original_name || titulo,
-    ano: date ? String(date).slice(0, 4) : '',
+    ano: data ? String(data).slice(0, 4) : '',
     sinopse: item.overview || '',
     nota: typeof item.vote_average === 'number' ? item.vote_average : 0,
     votos: item.vote_count || 0,
-    popularidade: item.popularity || 0,
     poster: img(item.poster_path, 'w500') || img(item.backdrop_path, 'w780'),
     backdrop: img(item.backdrop_path, 'w1280') || img(item.poster_path, 'w780'),
     generos: (item.genre_ids || []).slice()
@@ -105,8 +94,7 @@ function normalize(item, tipo) {
 }
 
 function filtrar(results, kind) {
-  return (results || [])
-    .filter(function (r) { return r && (r.poster_path || r.backdrop_path); })
+  return (results || []).filter(function (r) { return r && (r.poster_path || r.backdrop_path); })
     .map(function (r) { return normalize(r, kind); });
 }
 
@@ -122,10 +110,7 @@ async function discover(tipo, params) {
   return filtrar((data && data.results) || [], kind);
 }
 
-function isoHoje(offsetDias) {
-  const d = new Date(Date.now() + (offsetDias || 0) * 86400000);
-  return d.toISOString().slice(0, 10);
-}
+function isoHoje(offset) { return new Date(Date.now() + (offset || 0) * 86400000).toISOString().slice(0, 10); }
 
 async function lancamentos(tipo) {
   const campo = tipo === 'tv' ? 'first_air_date' : 'primary_release_date';
@@ -136,12 +121,7 @@ async function lancamentos(tipo) {
 }
 
 async function porGenero(tipo, generoId, pagina) {
-  return discover(tipo, {
-    with_genres: generoId,
-    sort_by: 'popularity.desc',
-    'vote_count.gte': 30,
-    page: pagina || 1
-  });
+  return discover(tipo, { with_genres: generoId, sort_by: 'popularity.desc', 'vote_count.gte': 30, page: pagina || 1 });
 }
 
 async function generos(tipo) {
@@ -150,15 +130,20 @@ async function generos(tipo) {
   return ((data && data.genres) || []).map(function (g) { return { id: g.id, nome: g.name }; });
 }
 
+/** IMDb ID via external_ids - chave para o Torrentio funcionar sempre. */
+async function imdbId(tipo, id) {
+  const kind = tipo === 'tv' ? 'tv' : 'movie';
+  const data = await request('/' + kind + '/' + id + '/external_ids');
+  return (data && data.imdb_id) || null;
+}
+
 function pickTrailer(videos) {
   const yt = (videos || []).filter(function (v) { return v.site === 'YouTube' && v.key; });
   if (!yt.length) return null;
   function score(v) {
     let s = 0;
-    if (v.type === 'Trailer') s += 100;
-    else if (v.type === 'Teaser') s += 40;
-    if (v.iso_639_1 === 'pt') s += 30;
-    else if (v.iso_639_1 === 'en') s += 15;
+    if (v.type === 'Trailer') s += 100; else if (v.type === 'Teaser') s += 40;
+    if (v.iso_639_1 === 'pt') s += 30; else if (v.iso_639_1 === 'en') s += 15;
     if (v.official) s += 10;
     return s;
   }
@@ -167,7 +152,7 @@ function pickTrailer(videos) {
 
 async function detalhes(tipo, id) {
   const kind = tipo === 'tv' ? 'tv' : 'movie';
-  const data = await request('/' + kind + '/' + id, { append_to_response: 'videos,external_ids,credits,images' });
+  const data = await request('/' + kind + '/' + id, { append_to_response: 'videos,external_ids,credits' });
   const base = normalize(data, kind);
   const videos = (data.videos && data.videos.results) || [];
   return Object.assign(base, {
@@ -195,6 +180,7 @@ async function buscar(query, tipo) {
 }
 
 module.exports = {
-  isConfigured, request, list, discover, lancamentos, porGenero, generos,
-  detalhes, buscar, normalize, img, cfg
+  isConfigured: isConfigured, request: request, list: list, discover: discover,
+  lancamentos: lancamentos, porGenero: porGenero, generos: generos, imdbId: imdbId,
+  detalhes: detalhes, buscar: buscar, normalize: normalize, img: img, cfg: cfg
 };
