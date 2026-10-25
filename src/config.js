@@ -55,6 +55,7 @@ const config = {
     HTTP_TIMEOUT: numero(process.env.CINE_HTTP_TIMEOUT, 15000),
     HTTP_RETRIES: numero(process.env.CINE_HTTP_RETRIES, 2),
     FONTES_CONCORRENCIA: numero(process.env.CINE_FONTES_CONCORRENCIA, 8),
+    WORKER_CONCORRENCIA: Math.max(1, Math.floor(numero(process.env.CINE_WORKER_CONCORRENCIA, 2))),
 
     APENAS_PTBR: booleano(process.env.CINE_APENAS_PTBR, true),
     FONTES_OFF: lista(process.env.CINE_FONTES_OFF),

@@ -46,7 +46,11 @@ const state = {
   temporada: 1,
   episodio: 1,
   job: null,
+  jobGeneration: 0,
   poll: null,
+  pollSnapshot: null,
+  pollSemProgresso: 0,
+  pollDelay: 700,
   podeTocar: false,
   streamUrl: null,
   buscaTimer: null,
@@ -621,12 +625,14 @@ function abrirPlayer(titulo) {
 }
 
 function fecharPlayer() {
+  state.jobGeneration += 1;
   if (state.job) {
     const jobId = state.job;
     state.job = null;
     fetch(url('/api/play/stop', { jobId: jobId }), { keepalive: true }).catch(function () { });
   }
   clearTimeout(state.poll);
+  resetarProgressoPoll();
   clearTimeout(state.esconderTimer);
   clearTimeout(state.introTimer);
   clearTimeout(state.guardTimer);
@@ -642,6 +648,7 @@ function fecharPlayer() {
 }
 
 async function assistir(media, extra) {
+  const geracao = ++state.jobGeneration;
   const ex = extra || {};
   state.media = media;
   state.temporada = ex.temporada || 1;
@@ -662,23 +669,28 @@ async function assistir(media, extra) {
 
   try {
     const data = await api('/api/torrent', params);
+    if (state.jobGeneration !== geracao) return;
     state.fontes = data.fontes || [];
     state.melhor = data.melhor;
     if (!state.melhor) { erroPlayer('Nenhum torrent encontrado para este titulo.'); return; }
     els.pvFonte.textContent = state.melhor.source + ' - ' +
       (state.melhor.ptbr ? state.melhor.ptbr.audio : '') + ' - ' + state.melhor.seeders + ' seeds';
     iniciarJob(state.melhor);
-  } catch (e) { erroPlayer(e.message); }
+  } catch (e) {
+    if (state.jobGeneration === geracao) erroPlayer(e.message);
+  }
 }
 
 async function iniciarJob(fonte) {
   if (!fonte) return;
+  const geracao = ++state.jobGeneration;
   if (state.job) {
     const antigo = state.job;
     state.job = null;
     fetch(url('/api/play/stop', { jobId: antigo }), { keepalive: true }).catch(function () { });
   }
   clearTimeout(state.poll);
+  resetarProgressoPoll();
   state.podeTocar = false;
   state.legendaAtiva = null;
   state.subs = [];
@@ -697,9 +709,15 @@ async function iniciarJob(fonte) {
     const data = await api('/api/play', {
       magnet: fonte.magnet, fileIdx: fonte.fileIdx, titulo: fonte.title, qualidade: fonte.quality
     });
+    if (state.jobGeneration !== geracao) {
+      fetch(url('/api/play/stop', { jobId: data.jobId }), { keepalive: true }).catch(function () { });
+      return;
+    }
     state.job = data.jobId;
     poll();
-  } catch (e) { erroPlayer(e.message); }
+  } catch (e) {
+    if (state.jobGeneration === geracao) erroPlayer(e.message);
+  }
 }
 
 function proximaFonte() {
@@ -709,7 +727,9 @@ function proximaFonte() {
 }
 
 function erroPlayer(msg, permitirTroca) {
+  state.jobGeneration += 1;
   clearTimeout(state.poll);
+  resetarProgressoPoll();
 
   if (permitirTroca !== false && state.tentativa < 3) {
     const proxima = proximaFonte();
@@ -968,14 +988,54 @@ function atualizarOverlay(s) {
   }
 }
 
-async function poll() {
+function resetarProgressoPoll() {
+  state.pollSnapshot = null;
+  state.pollSemProgresso = 0;
+  state.pollDelay = 700;
+}
+
+function agendarProximoPoll(status) {
   if (!state.job) return;
+  if (state.podeTocar) {
+    resetarProgressoPoll();
+    state.poll = setTimeout(poll, 2000);
+    return;
+  }
+
+  const atual = ['downloaded', 'buffer', 'peers'].map(function (chave) {
+    const valor = Number(status && status[chave]);
+    return Number.isFinite(valor) ? valor : 0;
+  });
+  const anterior = state.pollSnapshot;
+  const houveProgresso = !anterior || atual.some(function (valor, indice) {
+    return valor !== anterior[indice];
+  });
+  state.pollSnapshot = atual;
+
+  if (houveProgresso) {
+    state.pollSemProgresso = 0;
+    state.pollDelay = 700;
+  } else {
+    state.pollSemProgresso += 1;
+    if (state.pollSemProgresso >= 5) {
+      state.pollDelay = Math.min(1800, state.pollDelay + 200);
+    }
+  }
+  state.poll = setTimeout(poll, state.pollDelay);
+}
+
+async function poll() {
+  const jobId = state.job;
+  if (!jobId) return;
   try {
-    const s = await api('/api/play/status', { jobId: state.job });
+    const s = await api('/api/play/status', { jobId: jobId });
+    if (state.job !== jobId) return;
     atualizarOverlay(s);
     if (s.state === 'erro') { erroPlayer(s.message); return; }
-  } catch (e) { erroPlayer(e.message); return; }
-  state.poll = setTimeout(poll, state.podeTocar ? 2000 : 700);
+    agendarProximoPoll(s);
+  } catch (e) {
+    if (state.job === jobId) erroPlayer(e.message);
+  }
 }
 
 /* --------------------------- faixas de audio ----------------------- */
@@ -1305,8 +1365,13 @@ function wire() {
   });
 
   window.addEventListener('pagehide', function () {
-    if (state.job) {
-      const u = url('/api/play/stop', { jobId: state.job });
+    const jobId = state.job;
+    state.jobGeneration += 1;
+    state.job = null;
+    clearTimeout(state.poll);
+    resetarProgressoPoll();
+    if (jobId) {
+      const u = url('/api/play/stop', { jobId: jobId });
       if (navigator.sendBeacon) navigator.sendBeacon(u); else fetch(u, { keepalive: true }).catch(function () { });
     }
   });

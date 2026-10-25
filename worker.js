@@ -12,11 +12,14 @@ const config = require('./src/config');
 const fontes = require('./src/sources');
 const catalogo = require('./src/catalogo');
 const motor = require('./src/torrent/engine');
+const { mapLimit } = require('./src/util/pool');
 const { criar } = require('./src/util/logger');
 
 const log = criar('worker');
 
 const INTERVALO_MS = Number(process.env.CINE_WORKER_INTERVALO_MIN || 360) * 60 * 1000;
+const CONCORRENCIA = config.WORKER_CONCORRENCIA;
+let cicloEmAndamento = false;
 
 const CONSULTAS = {
     filmes: [
@@ -64,12 +67,18 @@ const CONSULTAS = {
 };
 
 async function ciclo() {
+    if (cicloEmAndamento) return;
+    cicloEmAndamento = true;
     const inicio = Date.now();
     log.info('iniciando ciclo de aquecimento do catalogo');
     let total = 0;
 
-    for (const categoria of Object.keys(CONSULTAS)) {
-        for (const termo of CONSULTAS[categoria]) {
+    const consultas = Object.keys(CONSULTAS).flatMap((categoria) =>
+        CONSULTAS[categoria].map((termo) => ({ categoria, termo }))
+    );
+
+    try {
+        await mapLimit(consultas, CONCORRENCIA, async ({ categoria, termo }) => {
             try {
                 const dados = await fontes.buscar(termo, {
                     categoria,
@@ -90,12 +99,14 @@ async function ciclo() {
             } catch (erro) {
                 log.aviso('[' + categoria + '] "' + termo + '" falhou:', erro.message);
             }
-        }
-    }
+        });
 
-    catalogo.gravar();
-    log.info('ciclo concluido em', ((Date.now() - inicio) / 1000).toFixed(1) + 's | itens processados:', total);
-    log.info('resumo do catalogo:', JSON.stringify(catalogo.resumo()));
+        catalogo.gravar();
+        log.info('ciclo concluido em', ((Date.now() - inicio) / 1000).toFixed(1) + 's | itens processados:', total);
+        log.info('resumo do catalogo:', JSON.stringify(catalogo.resumo()));
+    } finally {
+        cicloEmAndamento = false;
+    }
 }
 
 async function testarFontes() {
@@ -122,8 +133,15 @@ async function testarFontes() {
         process.exit(0);
     }
 
-    await ciclo();
-    setInterval(() => {
-        ciclo().catch((e) => log.erro('ciclo falhou:', e.message));
-    }, INTERVALO_MS);
+    async function executarCicloAgendado() {
+        try {
+            await ciclo();
+        } catch (e) {
+            log.erro('ciclo falhou:', e.message);
+        } finally {
+            setTimeout(executarCicloAgendado, INTERVALO_MS);
+        }
+    }
+
+    await executarCicloAgendado();
 })();

@@ -22,14 +22,28 @@ function isConfigured() {
 function img(p, size) { return p ? IMAGE_BASE + '/' + (size || 'w500') + p : null; }
 
 const cache = new Map();
+const requisicoesEmAndamento = new Map();
 const TTL = 1000 * 60 * 15;
+const CACHE_MAX_ENTRADAS = 600;
 function cacheGet(k) {
   const h = cache.get(k);
   if (!h) return null;
   if (Date.now() > h.expires) { cache.delete(k); return null; }
+  cache.delete(k);
+  cache.set(k, h);
   return h.value;
 }
-function cacheSet(k, v) { if (cache.size > 600) cache.clear(); cache.set(k, { value: v, expires: Date.now() + TTL }); }
+function cacheSet(k, v) {
+  const agora = Date.now();
+  for (const [chave, entrada] of cache) {
+    if (agora > entrada.expires) cache.delete(chave);
+  }
+  cache.delete(k);
+  while (cache.size >= CACHE_MAX_ENTRADAS) {
+    cache.delete(cache.keys().next().value);
+  }
+  cache.set(k, { value: v, expires: agora + TTL });
+}
 
 async function request(pathname, params) {
   const c = cfg();
@@ -53,24 +67,34 @@ async function request(pathname, params) {
   const chave = url.toString();
   const emCache = cacheGet(chave);
   if (emCache) return emCache;
+  const emAndamento = requisicoesEmAndamento.get(chave);
+  if (emAndamento) return emAndamento;
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(function () { ctrl.abort(); }, 15000);
+  const requisicao = (async function () {
+    const ctrl = new AbortController();
+    const timer = setTimeout(function () { ctrl.abort(); }, 15000);
+    try {
+      const res = await fetch(url, { headers: headers, signal: ctrl.signal });
+      if (!res.ok) {
+        const body = await res.text().catch(function () { return ''; });
+        const err = new Error('TMDb respondeu ' + res.status + (body ? ' - ' + body.slice(0, 180) : ''));
+        err.status = res.status;
+        throw err;
+      }
+      const data = await res.json();
+      cacheSet(chave, data);
+      return data;
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error('TMDb demorou demais (timeout 15s).');
+      throw e;
+    } finally { clearTimeout(timer); }
+  })();
+  requisicoesEmAndamento.set(chave, requisicao);
   try {
-    const res = await fetch(url, { headers: headers, signal: ctrl.signal });
-    if (!res.ok) {
-      const body = await res.text().catch(function () { return ''; });
-      const err = new Error('TMDb respondeu ' + res.status + (body ? ' - ' + body.slice(0, 180) : ''));
-      err.status = res.status;
-      throw err;
-    }
-    const data = await res.json();
-    cacheSet(chave, data);
-    return data;
-  } catch (e) {
-    if (e.name === 'AbortError') throw new Error('TMDb demorou demais (timeout 15s).');
-    throw e;
-  } finally { clearTimeout(timer); }
+    return await requisicao;
+  } finally {
+    if (requisicoesEmAndamento.get(chave) === requisicao) requisicoesEmAndamento.delete(chave);
+  }
 }
 
 function normalize(item, tipo) {
